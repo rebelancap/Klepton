@@ -448,6 +448,16 @@ int kl_glfb_init(void) {
                         "EXT_color_buffer_half_float=%s\n",
                 strstr(ext, "GL_EXT_color_buffer_float") ? "yes" : "NO",
                 strstr(ext, "GL_EXT_color_buffer_half_float") ? "yes" : "NO");
+
+        // ...and the extensions the description may REPEAT rather than assert
+        // (kl_egl.c): adopted only if this string names them.
+        kl_gl_cap_adopt_backend_extensions(ext);
+        int adopted = kl_gl_cap_adopted_extension_count();
+        fprintf(stderr, "  [glfb] backend extensions adopted: %d%s", adopted,
+                adopted ? " —" : " (none of the candidates are present)");
+        for (int i = 0; i < adopted; i++)
+            fprintf(stderr, " %s", kl_gl_cap_adopted_extension(i));
+        fprintf(stderr, "\n");
     }
 
     // Release it. EGL binds a context to one thread at a time and *refuses* to
@@ -7743,8 +7753,20 @@ static int glfb_state_pname(uint32_t p) {
     return 0;
 }
 
+// The pnames that stop being ours the moment an extension is adopted from the
+// backend. Each is a question ABOUT that extension, so the driver that answered
+// "I have it" is the only thing that can answer "and here is what it costs".
+// Our tables say 0 to all three, and a guest reading a maximum anisotropy of 0
+// turns anisotropy straight back off.
+static int glfb_backend_ext_pname(uint32_t pname) {
+    if (kl_gl_cap_adopted_extension_count() == 0) return 0;
+    return pname == 0x84FF /* MAX_TEXTURE_MAX_ANISOTROPY_EXT */
+        || pname == 0x86A2 /* NUM_COMPRESSED_TEXTURE_FORMATS */
+        || pname == 0x86A3 /* COMPRESSED_TEXTURE_FORMATS     */;
+}
+
 static void klfb_GetIntegerv(uint32_t pname, int32_t *params) {
-    if (glfb_state_pname(pname)) {
+    if (glfb_state_pname(pname) || glfb_backend_ext_pname(pname)) {
         if (g_real_GetIntegerv) g_real_GetIntegerv(pname, params);
         return;
     }
