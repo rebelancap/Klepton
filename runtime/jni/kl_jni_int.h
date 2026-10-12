@@ -327,6 +327,8 @@ int          klj_permission_state(const char *p, const char **why);
 klj_val klj_List_size(void *env, void *self, const klj_val *a, int n);
 klj_val klj_PM_queryIntentActivities(void *env, void *self, const klj_val *a, int n);
 klj_val klj_HandlerThread_start(void *env, void *self, const klj_val *a, int n);
+// The one AssetManager, which org.fmod.FMOD.getAssetManager must hand back.
+klj_val klj_Context_getAssets(void *env, void *self, const klj_val *a, int n);
 klj_val klj_AudioManager_getStreamVolume(void *env, void *self, const klj_val *a, int n);
 klj_val klj_Display_getAppVsyncOffsetNanos(void *env, void *self, const klj_val *a, int n);
 

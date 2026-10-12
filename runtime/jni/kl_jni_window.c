@@ -311,13 +311,20 @@ static klj_val klj_AudioManager_getProperty(void *env, void *self, const klj_val
     const char *k = n > 0 ? klj_str(a[0].l) : "";
     // The keys are the values of AudioManager.PROPERTY_* below; match on the
     // documented strings so the two cannot drift apart.
+    // The strings are FORMATTED from the macros rather than spelled again beside
+    // them: this door hands back text where AudioSystem below hands back an int,
+    // and a literal here is a copy that can drift from the number every other
+    // door reports. Same fact, one source.
+    char buf[24];
     if (strstr(k, "OUTPUT_SAMPLE_RATE")) {
         KLJ_LOG("AudioManager.getProperty(OUTPUT_SAMPLE_RATE) -> %d", KLJ_AUDIO_RATE);
-        return (klj_val){.l = kl_jni_new_string("48000")};
+        snprintf(buf, sizeof buf, "%d", KLJ_AUDIO_RATE);
+        return (klj_val){.l = kl_jni_new_string(buf)};
     }
     if (strstr(k, "OUTPUT_FRAMES_PER_BUFFER")) {
         KLJ_LOG("AudioManager.getProperty(OUTPUT_FRAMES_PER_BUFFER) -> %d", KLJ_AUDIO_FRAMES);
-        return (klj_val){.l = kl_jni_new_string("256")};
+        snprintf(buf, sizeof buf, "%d", KLJ_AUDIO_FRAMES);
+        return (klj_val){.l = kl_jni_new_string(buf)};
     }
     // Android returns null for an unknown property, and FMOD handles that.
     KLJ_LOG("AudioManager.getProperty(\"%s\") -> null (unknown property)", k);

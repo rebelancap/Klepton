@@ -1542,7 +1542,7 @@ static klj_val klj_PlayAssetDelivery_missing(void *env, void *self, const klj_va
     return (klj_val){.j = 1};        // Play Core is absent — see above
 }
 
-static klj_val klj_Context_getAssets(void *env, void *self, const klj_val *a, int n) {
+klj_val klj_Context_getAssets(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *am;
     return klj_singleton("android/content/res/AssetManager", &am);

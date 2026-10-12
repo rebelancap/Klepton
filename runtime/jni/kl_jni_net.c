@@ -267,20 +267,103 @@ static klj_val klj_EOS_LibraryLoader_load(void *env, void *self, const klj_val *
     return (klj_val){.l = NULL};
 }
 
-// The output devices AudioManager knows about. Answered as an empty array, which
-// is the one honest answer available: we do not enumerate host audio hardware, and
-// every field of an AudioDeviceInfo — id, type, sample rates, channel masks —
-// would have to be invented to fill even one entry.
+// The output devices AudioManager knows about.
 //
-// Empty is not a silent zero of the trap-6d kind. Unity uses this list to notice
-// device *changes* (headphones, Bluetooth) and to pick a non-default output; with
-// nothing to choose from it stays on the default path, which is the OpenSL device
-// that already works. If something later needs a populated list, the trace will
-// name the AudioDeviceInfo getter it calls rather than leaving us to guess.
-static klj_val klj_AudioManager_getDevices(void *env, void *self, const klj_val *a, int n) {
+// This was answered as an EMPTY array, on the reasoning that we do not enumerate
+// host audio hardware and every field of an AudioDeviceInfo would have to be
+// invented. Batman: Arkham Shadow (UE4 + Meta XR Audio for Wwise) shows what that
+// costs: it resolves getChannelCounts, getProductName, getSampleRates and
+// isSource, gets the empty list, and then
+//
+//     I/MetaXRAudioWwise: ERROR: OculusEndpointSink failed to get default device
+//                         info: Unspecified error occured
+//
+// and the game is silent. Meta's XR Audio Wwise sink picks its output by walking
+// this list; an empty walk leaves it with no default device, so
+// OculusEndpointSink::Init bails — and because the sink registered itself before
+// it failed, every later retry reports "Attempting to initialize another
+// instance ... Aborting initialization." With no sink there is no output to
+// hear, whatever the soundbanks do.
+//
+// So one entry, describing what the guest is told it is running on everywhere
+// else (Build.MODEL, ovrp_GetSystemProductName): the built-in stereo speakers at
+// the sample rate AudioManager already reports through OUTPUT_SAMPLE_RATE. This
+// is the same correction as InputDevice.getDeviceIds() — an empty list is not
+// the conservative answer when the caller's next move is to pick from it; it is
+// a confidently wrong one. On a Quest the speakers really are an enumerable
+// output device, so reporting one is the truthful answer, not an invented one.
+#define KLJ_AUDIO_DEV_ID       1
+#define KLJ_AUDIO_TYPE_SPEAKER 2      // AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+
+static klj_val klj_AudioDeviceInfo_getChannelCounts(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    KLJ_LOG("AudioManager.getDevices() -> empty (host devices are not enumerated)");
-    return (klj_val){.l = klj_new_array('L', "android/media/AudioDeviceInfo", 0)};
+    static void *arr;
+    if (!arr) {
+        arr = klj_new_array('I', NULL, 1);
+        ((int32_t *)klj_arr(arr)->data)[0] = 2;      // stereo
+        klj_as_object(arr)->pinned = 1;
+    }
+    return (klj_val){.l = arr};
+}
+static klj_val klj_AudioDeviceInfo_getSampleRates(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *arr;
+    if (!arr) {
+        arr = klj_new_array('I', NULL, 1);
+        ((int32_t *)klj_arr(arr)->data)[0] = 48000;  // what OUTPUT_SAMPLE_RATE says
+        klj_as_object(arr)->pinned = 1;
+    }
+    return (klj_val){.l = arr};
+}
+static klj_val klj_AudioDeviceInfo_getProductName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("Oculus Quest")};
+}
+// isSource() is true for INPUTS. This is an output, so it is false — and that
+// matters: a sink that filtered on isSource() and got `true` would skip us and
+// be exactly as deviceless as it was with an empty array.
+static klj_val klj_AudioDeviceInfo_isSource(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+static klj_val klj_AudioDeviceInfo_isSink(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 1};
+}
+static klj_val klj_AudioDeviceInfo_getId(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = KLJ_AUDIO_DEV_ID};
+}
+static klj_val klj_AudioDeviceInfo_getType(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = KLJ_AUDIO_TYPE_SPEAKER};
+}
+
+// GET_DEVICES_INPUTS is 1, GET_DEVICES_OUTPUTS is 2, ALL is 3. We have exactly
+// one device and it is an output, so an inputs-only query still answers empty —
+// inventing a microphone to fill a list nobody asked us for is the mistake this
+// function just came out of, in the other direction.
+#define KLJ_GET_DEVICES_OUTPUTS 2
+
+static klj_val klj_AudioManager_getDevices(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    int flags = (n > 0) ? (int)(int32_t)a[0].j : KLJ_GET_DEVICES_OUTPUTS;
+    if (!(flags & KLJ_GET_DEVICES_OUTPUTS)) {
+        KLJ_LOG("AudioManager.getDevices(0x%x) -> empty (inputs only; we have no capture device)", flags);
+        return (klj_val){.l = klj_new_array('L', "android/media/AudioDeviceInfo", 0)};
+    }
+    // One object, allocated once and pinned: the identity is what a caller keys
+    // a "did the output device change?" comparison on, and a fresh object per
+    // call would read as a hot-plug on every poll.
+    static void *dev;
+    if (!dev) {
+        dev = klj_new_object_data("android/media/AudioDeviceInfo", NULL);
+        klj_as_object(dev)->pinned = 1;
+    }
+    void *arr = klj_new_array('L', "android/media/AudioDeviceInfo", 1);
+    ((void **)klj_arr(arr)->data)[0] = dev;
+    KLJ_LOG("AudioManager.getDevices(0x%x) -> 1 output (built-in speaker, stereo, 48000)", flags);
+    return (klj_val){.l = arr};
 }
 
 // MediaRouter.getSelectedRoute(type). Android always returns a route here — the
@@ -523,6 +606,15 @@ const klj_binding klj_bind_net[] = {
     {"android/content/Context", "getContentResolver", "()Landroid/content/ContentResolver;", klj_Context_getContentResolver},
     {"android/provider/Settings$Secure", "getString", "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;", klj_Settings_Secure_getString},
     {"android/media/AudioManager", "getDevices", "(I)[Landroid/media/AudioDeviceInfo;", klj_AudioManager_getDevices},
+    // The four the Meta XR Audio Wwise sink resolves, plus the two any caller
+    // that got a device will reach for next.
+    {"android/media/AudioDeviceInfo", "getChannelCounts", "()[I", klj_AudioDeviceInfo_getChannelCounts},
+    {"android/media/AudioDeviceInfo", "getSampleRates", "()[I", klj_AudioDeviceInfo_getSampleRates},
+    {"android/media/AudioDeviceInfo", "getProductName", "()Ljava/lang/CharSequence;", klj_AudioDeviceInfo_getProductName},
+    {"android/media/AudioDeviceInfo", "isSource", "()Z", klj_AudioDeviceInfo_isSource},
+    {"android/media/AudioDeviceInfo", "isSink", "()Z", klj_AudioDeviceInfo_isSink},
+    {"android/media/AudioDeviceInfo", "getId", "()I", klj_AudioDeviceInfo_getId},
+    {"android/media/AudioDeviceInfo", "getType", "()I", klj_AudioDeviceInfo_getType},
     {"android/media/MediaRouter", "getSelectedRoute", "(I)Landroid/media/MediaRouter$RouteInfo;", klj_MediaRouter_getSelectedRoute},
     {"java/lang/Thread", "start", "()V", klj_Thread_start},
     // UE4 names its own threads through Java — see klj_Thread_currentThread.

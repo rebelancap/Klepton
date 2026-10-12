@@ -1968,7 +1968,9 @@ static const klj_field g_fields[] = {
     KLJ_FINT("android/content/DialogInterface", "BUTTON_POSITIVE", -1),
     KLJ_FINT("android/content/DialogInterface", "BUTTON_NEGATIVE", -2),
     KLJ_FINT("android/content/DialogInterface", "BUTTON_NEUTRAL",  -3),
+    KLJ_FINT("android/media/AudioManager", "GET_DEVICES_INPUTS",  1),
     KLJ_FINT("android/media/AudioManager", "GET_DEVICES_OUTPUTS", 2),
+    KLJ_FINT("android/media/AudioManager", "GET_DEVICES_ALL",     3),
     KLJ_FINT("android/media/AudioManager", "STREAM_MUSIC", 3),
     // MediaFormat colour constants — Unity's AndroidVideoMedia reads these off
     // the decoded video format to set up the output colour conversion. Values
@@ -1993,6 +1995,54 @@ static const klj_field g_fields[] = {
     KLJ_FINT("android/media/MediaCodecInfo$CodecCapabilities", "COLOR_TI_FormatYUV420PackedSemiPlanar", 0x7F000100),
     KLJ_FINT("android/media/MediaCodecInfo$CodecCapabilities", "COLOR_FormatYUV420PackedSemiPlanar", 39),
     KLJ_FINT("android/media/MediaCodecInfo$CodecCapabilities", "COLOR_FormatYUV420PackedPlanar",     20),
+
+    // AudioDeviceInfo.TYPE_*. A caller that walks getDevices() does not read
+    // getType() for its own sake — it reads it to COMPARE, and a comparison
+    // needs both sides. Batman: Arkham Shadow dies on exactly that shape: one
+    // getDevices(GET_DEVICES_OUTPUTS), one getType() on the device we answer
+    // with, and then a GetStaticFieldID for TYPE_BLUETOOTH_A2DP to compare it
+    // against — which we had no value for, so the whole process aborted for
+    // want of the number 8. The comparison is going to FAIL either way (we
+    // report the built-in speaker), and that is the correct outcome; what was
+    // wrong was dying instead of answering.
+    //
+    // So the whole documented family goes in, not just the one name the trace
+    // happened to reach. These are fixed platform constants, identical on every
+    // Android release that defines them, and a caller classifying an output
+    // typically tests several in a row — adding them one abort at a time would
+    // cost a failed run per constant. Values from AudioDeviceInfo (API 23+,
+    // with the later BLE/eARC additions).
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_UNKNOWN",              0),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BUILTIN_EARPIECE",     1),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BUILTIN_SPEAKER",      2),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_WIRED_HEADSET",        3),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_WIRED_HEADPHONES",     4),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_LINE_ANALOG",          5),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_LINE_DIGITAL",         6),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BLUETOOTH_SCO",        7),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BLUETOOTH_A2DP",       8),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_HDMI",                 9),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_HDMI_ARC",            10),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_USB_DEVICE",          11),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_USB_ACCESSORY",       12),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_DOCK",                13),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_FM",                  14),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BUILTIN_MIC",         15),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_FM_TUNER",            16),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_TV_TUNER",            17),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_TELEPHONY",           18),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_AUX_LINE",            19),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_IP",                  20),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BUS",                 21),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_USB_HEADSET",         22),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_HEARING_AID",         23),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BUILTIN_SPEAKER_SAFE",24),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_REMOTE_SUBMIX",       25),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BLE_HEADSET",         26),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BLE_SPEAKER",         27),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_HDMI_EARC",           29),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BLE_BROADCAST",       30),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_DOCK_ANALOG",         31),
 
     // View.SYSTEM_UI_FLAG_* and the window flag behind them. Real Android
     // values: Unity ORs these together and hands the result straight back to
