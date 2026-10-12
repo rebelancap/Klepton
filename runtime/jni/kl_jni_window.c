@@ -474,23 +474,6 @@ static klj_val klj_Context_unbindService(void *env, void *self, const klj_val *a
     return (klj_val){.l = NULL};
 }
 
-// Google VR sample PermissionHelper (Into the Radius): checkPermission(name)Z
-// and acquirePermissions([name])V. Answered from the same manifest permission
-// model as Context.checkPermission — a boolean here, granted only for what the
-// manifest declares — and acquiring is a no-op (there is no user to prompt).
-static klj_val klj_PermissionHelper_check(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self;
-    const char *p = n > 0 ? klj_str(a[0].l) : "", *why = "";
-    int granted = klj_permission_state(p, &why);
-    KLJ_LOG("PermissionHelper.checkPermission(\"%s\") -> %s%s", p,
-            granted ? "true" : "false", why);
-    return (klj_val){.j = (uint64_t)(granted != 0)};
-}
-static klj_val klj_PermissionHelper_acquire(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
-    KLJ_LOG("PermissionHelper.acquirePermissions(...) — no user to prompt; no-op");
-    return (klj_val){.l = NULL};
-}
 static klj_val klj_Context_checkPermission(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
     // Answered from the SAME manifest model as checkSelfPermission below. It
@@ -772,7 +755,76 @@ static klj_val klj_Activity_requestPermissions(void *env, void *self, const klj_
     return (klj_val){.j = 0};
 }
 
+// com.google.vr.sdk.samples.permission.PermissionHelper — Google's VR sample
+// permission helper, which UE4's Android VR builds embed wholesale (Into the
+// Radius resolves both of its statics during startup, right after the engine
+// has worked out where its files are). Two methods, and they are the same
+// question and the same command Activity.checkSelfPermission /
+// requestPermissions already answer above — so they read the SAME
+// klj_permission_state rather than deciding again. A permission granted through
+// one door and denied through another is precisely the split this file's
+// permission model exists to prevent.
+//
+// checkPermission returns a `boolean` here rather than the PackageManager int
+// the Context spelling uses: true is granted. The helper's own Java is
+// `ContextCompat.checkSelfPermission(...) == PERMISSION_GRANTED`, so this is
+// that comparison, done here.
+static klj_val klj_GvrPermission_check(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *p = n > 0 ? klj_str(a[0].l) : "", *why = "";
+    int granted = klj_permission_state(p ? p : "", &why);
+    KLJ_LOG("PermissionHelper.checkPermission(\"%s\") -> %s%s", p ? p : "",
+            granted ? "true" : "false", why);
+    return (klj_val){.j = granted ? 1u : 0u};
+}
+
+// ...and the ACQUIRE half, which on Android puts up the system dialog. There is
+// nobody here to be asked and no dialog to put up; what the state actually IS
+// was already settled by the manifest model, and checkPermission is where the
+// guest reads it.
+//
+// The answer is still DELIVERED. On Android the real class hands off to a
+// PermissionFragment and the result arrives later at the guest's STATIC NATIVE
+// `onAcquirePermissions(String[] permissions, int[] grantResults)`, which UE4's
+// AndroidPermission plugin registers and which fires
+// UAndroidPermissionCallbackProxy's delegate. A Blueprint that asked and is
+// never answered waits forever — a hang, harder to diagnose than an abort. So
+// the guest's own native is called with the same values checkPermission gives
+// (PackageManager constants: GRANTED 0, DENIED -1). Looked up, never cached
+// (kl_jni_ue4.c's reason: a lookup that beat RegisterNatives would pin NULL);
+// a guest that registered no such native gets the log line and nothing else.
+// Five Nights at Freddy's: Help Wanted 2 asks from Blueprint on its loading
+// path and waits on the delegate.
+#define KLJ_PERMISSION_HELPER "com/google/vr/sdk/samples/permission/PermissionHelper"
+static klj_val klj_GvrPermission_acquire(void *env, void *self, const klj_val *a, int n) {
+    (void)self;
+    klj_array *arr = n > 0 ? klj_arr(a[0].l) : NULL;
+    int len = arr && arr->kind == 'L' ? arr->len : 0;
+    void      *results = klj_new_array('I', NULL, len);
+    klj_array *ra      = klj_arr(results);
+    for (int i = 0; i < len; i++) {
+        const char *p = klj_str(((void **)arr->data)[i]), *why = "";
+        int granted = klj_permission_state(p ? p : "", &why);
+        if (ra && ra->data) ((kl_jint *)ra->data)[i] = granted ? 0 : -1;
+        KLJ_LOG("PermissionHelper.acquirePermissions[%d] \"%s\" -> already %s%s "
+                "(no dialog: there is no user session here to ask, and the state "
+                "is the manifest's)", i, p ? p : "",
+                granted ? "GRANTED" : "DENIED", why);
+    }
+    void (*cb)(void *, void *, void *, void *) = (void (*)(void *, void *, void *, void *))
+        kl_jni_native(KLJ_PERMISSION_HELPER, "onAcquirePermissions", NULL);
+    KLJ_LOG("PermissionHelper.acquirePermissions(%d) -> onAcquirePermissions%s",
+            len, cb ? "" : " — SKIPPED, the guest registered no such native");
+    if (cb) cb(env ? env : kl_jni_env(), kl_jni_class(KLJ_PERMISSION_HELPER),
+               n > 0 ? a[0].l : NULL, results);
+    return (klj_val){.j = 0};
+}
+
 const klj_binding klj_bind_window[] = {
+    {"com/google/vr/sdk/samples/permission/PermissionHelper", "checkPermission",
+     "(Ljava/lang/String;)Z", klj_GvrPermission_check},
+    {"com/google/vr/sdk/samples/permission/PermissionHelper", "acquirePermissions",
+     "([Ljava/lang/String;)V", klj_GvrPermission_acquire},
     // Reached by pressing *Start Pairing*: the shell checks a permission before
     // it opens the socket. Bound on SteamLink rather than on Context because a
     // binding is matched on the full (class, name, signature) triple and this is
@@ -843,10 +895,6 @@ const klj_binding klj_bind_window[] = {
     {"android/view/WindowInsets", "getDisplayCutout", "()Landroid/view/DisplayCutout;", klj_WindowInsets_getDisplayCutout},
     {"android/content/pm/PackageManager", "hasSystemFeature", "(Ljava/lang/String;)Z", klj_PackageManager_hasSystemFeature},
     {"android/content/Context", "checkCallingOrSelfPermission", "(Ljava/lang/String;)I", klj_Context_checkPermission},
-    {"com/google/vr/sdk/samples/permission/PermissionHelper", "checkPermission",
-     "(Ljava/lang/String;)Z", klj_PermissionHelper_check},
-    {"com/google/vr/sdk/samples/permission/PermissionHelper", "acquirePermissions",
-     "([Ljava/lang/String;)V", klj_PermissionHelper_acquire},
     {"android/content/Context", "bindService", "(Landroid/content/Intent;Landroid/content/ServiceConnection;I)Z", klj_Context_bindService},
     {"android/content/Context", "unbindService", "(Landroid/content/ServiceConnection;)V", klj_Context_unbindService},
     {0}

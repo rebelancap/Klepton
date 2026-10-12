@@ -274,6 +274,16 @@ void kl_jni_soft_input_close(int canceled);
 // pass. See the implementation's comment for why a runtime failure here is
 // invisible from everywhere else.
 int  kl_jni_soft_input_selftest(FILE *out);
+// The object model: host-cached jobjects survive a local frame, and every
+// erased spelling of a call answers with the same tagged object. tests/t_jniobj.c.
+int  kl_jni_object_lifetime_selftest(FILE *out);
+
+// The same gate for UE's GameActivity keyboard, which is what answers the four
+// calls above when the guest is an Unreal one — `make uevk`, in `make check`.
+// Same terms: no guest, no window, no headset. It publishes its own natives
+// through the real guest-native resolver seam and drives the real
+// AndroidThunkJava_* bindings. Returns non-zero on pass.
+int  kl_jni_ue_keyboard_selftest(FILE *out);
 
 // Fire the pending Choreographer frame callback, if the guest posted one. There is
 // no vsync source here, so the host's frame pump defines what a frame is. One-shot,

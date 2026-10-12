@@ -301,10 +301,10 @@ static klj_val klj_MediaRouter_getSelectedRoute(void *env, void *self, const klj
 // which is exactly how this presented under KL_PERMISSIVE, as a SIGABRT with no
 // JNI call named because the permissive zero *was* the answer.
 //
-// The value is synthetic and constant: Android's own android_id is a per-device,
-// per-app-signing-key random 64-bit value, so any 16-hex-digit string is a
-// well-formed one. Stable across runs because callers cache it and compare.
-#define KLJ_ANDROID_ID "4b6c6570746f6e01"      /* "Klepton\1" as hex */
+// The value is synthetic and constant, and it lives in kl_jni_int.h as
+// KLJ_ANDROID_ID rather than here, because UE asks the same question through a
+// different door (GameActivity.AndroidThunkJava_GetAndroidId, kl_jni_ue4.c) and
+// the two must not answer differently.
 
 static klj_val klj_Context_getContentResolver(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
@@ -568,5 +568,12 @@ const klj_binding klj_bind_net[] = {
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_KeepScreenOn", "(Z)V", klj_void_noop},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_SetSustainedPerformanceMode", "(Z)V", klj_void_noop},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_DismissSplashScreen", "()V", klj_void_noop},
+    // The other half of the connectivity LISTENER pair whose add is bound in
+    // kl_jni_ue4.c. The Java behind it registers a NetworkCallback whose only
+    // job is to call nativeNetworkChanged when the connection type changes;
+    // nothing about the host's network changes under a guest here, so a
+    // listener that registers and never fires is exactly what that Java would
+    // have produced. The engine's shutdown calls the remover (Pinball FX VR).
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_RemoveNetworkListener", "()V", klj_void_noop},
     {0}
 };

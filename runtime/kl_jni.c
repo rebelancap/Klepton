@@ -1932,6 +1932,31 @@ static klj_val klj_GameActivity_sdkInt(void) {
 
 
 static const klj_field g_fields[] = {
+    // UE4.27's two GameActivity inner classes, whose objects kl_jni_ue4.c hands
+    // back from AndroidThunkJava_GetInputDeviceInfo and
+    // ...LocalNotificationGetLaunchNotification. The engine reads these fields
+    // IMMEDIATELY after the call returns, so binding the methods without the
+    // fields would only move the abort one line down, from "no host
+    // implementation" to "no host value for field" — see the note in
+    // kl_jni_ue4.c.
+    //
+    // InputDeviceInfo: the synthetic Touch pair this runtime presents. Vendor
+    // and product are 0, which is what the real GameActivity fills in when its
+    // own InputDevice lookup fails — and there is no Android InputDevice behind
+    // this one. The name and descriptor are stable strings so the engine's
+    // controller mapping sees one device, not a new one per frame.
+    KLJ_FINT("com/epicgames/ue4/GameActivity$InputDeviceInfo", "vendorId",     0),
+    KLJ_FINT("com/epicgames/ue4/GameActivity$InputDeviceInfo", "productId",    0),
+    KLJ_FINT("com/epicgames/ue4/GameActivity$InputDeviceInfo", "controllerId", 0),
+    KLJ_FSTR("com/epicgames/ue4/GameActivity$InputDeviceInfo", "name",       "Oculus Touch"),
+    KLJ_FSTR("com/epicgames/ue4/GameActivity$InputDeviceInfo", "descriptor", "klepton:touch"),
+    // LaunchNotification: this app was launched from the Home View, never from
+    // a notification. `used` false is what keeps the game instance out of a
+    // notification-handling path with nothing behind it.
+    {.cls = "com/epicgames/ue4/GameActivity$LaunchNotification",
+     .name = "used", .sig = "Z", .ival = 0},
+    KLJ_FSTR("com/epicgames/ue4/GameActivity$LaunchNotification", "event", ""),
+    KLJ_FINT("com/epicgames/ue4/GameActivity$LaunchNotification", "fireDate", 0),
     // Audio. The PROPERTY_* values are the real Android key strings, so the
     // getProperty implementation can match on them rather than on our own names.
     KLJ_FSTR("android/media/AudioManager", "PROPERTY_OUTPUT_SAMPLE_RATE",
