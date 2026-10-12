@@ -211,6 +211,39 @@ static void klj_forget_writes(void *obj);
     return obj;
 }
 
+// "The HOST is keeping this one in a static, and will hand the same pointer
+// back on every later call." That is a lifetime claim, and it has to be made
+// explicit or the object dies under the cache.
+//
+// A binding that caches its answer is doing the right thing — object identity
+// is load-bearing for anything Unity keys a slot on (see the InputDevice
+// comments) — but the object was still allocated inside whatever local frame
+// the FIRST caller happened to have open. PopLocalFrame retires everything that
+// frame recorded, `pinned` excepted; the static keeps pointing at the retired
+// slot, and the NEXT caller is handed a pointer whose magic is zero. It is not
+// a use-after-free — the slot is only quarantined, so the memory still reads
+// fine — it is a jobject the guest can hold and we can no longer recognise, and
+// it surfaces far away as "GetObjectClass on an untagged pointer".
+//
+// That is exactly how Paint the Town Red VR's boot died.
+// `InputDevice.getDeviceIds()` cached its `int[]` in a static; libunity called
+// it three times inside frames that were then popped; Rewired called it a
+// fourth time from C#, got the dead pointer back, and asked GetObjectClass for
+// its class. The exit census is the proof: `android/view/InputDevice x2` was
+// live — getDevice() pins — and there was no live `[I` at all.
+//
+// So: every host-side static that holds a jobject goes through here. It is the
+// same fact klj_singleton already asserts for the objects it makes; this is the
+// form for an object the caller built itself — an array, an object with a
+// payload, or an element stored inside a cached array (which the array does not
+// own: klj_new_array's destructor frees the element BUFFER, and the jobjects in
+// it are retired by their own frames unless they are pinned too).
+ void *klj_host_cache(void *obj) {
+    klj_object *o = klj_as_object(obj);
+    if (o) o->pinned++;
+    return obj;
+}
+
 static klj_native g_natives[KLJ_MAX_NATIVES];
 static unsigned   g_nnatives;
 
@@ -421,12 +454,37 @@ static void *klj_FindClass(void *env, const char *name) {
 // can never resolve. See kl_jni.h.
 void *kl_jni_class(const char *name) { return klj_FindClass(NULL, name); }
 
+// A pointer that is not a LIVE jobject but is nonetheless one of our pool slots
+// is a RETIRED one: klj_retire_object_locked zeroes the magic and leaves
+// everything else standing, and the slot is only quarantined, never unmapped.
+// So the class it last held is still readable, and that is the whole diagnosis.
+static const char *klj_retired_slot(void *p, unsigned *idx) {
+    if (!p) return NULL;
+    char *base = (char *)g_objects, *q = (char *)p;
+    if (q < base || q >= base + sizeof g_objects) return NULL;
+    if ((size_t)(q - base) % sizeof g_objects[0]) return NULL;   // not a slot start
+    klj_object *o = (klj_object *)p;
+    if (idx) *idx = (unsigned)(o - g_objects);
+    return o->cls;
+}
+
  void *klj_GetObjectClass(void *env, void *obj) {
     (void)env;
     klj_object *o = klj_as_object(obj);
     if (!o) {
         KLJ_LOG("GetObjectClass on an untagged pointer %p — every jobject the guest "
                 "holds should have come from us", obj);
+        // ...unless it DID come from us and has since been retired, which is a
+        // different bug with a different fix, and the pool can tell the two
+        // apart: a retired slot is still one of ours, still carries the class
+        // it last held, and only its magic is gone. Saying so turns a bare
+        // pointer into the binding that needs klj_host_cache (or the guest
+        // holding a local ref past its frame).
+        unsigned slot; const char *was = klj_retired_slot(obj, &slot);
+        if (was)
+            KLJ_LOG("  it is our object pool slot %u, class %s, RETIRED — a local "
+                    "frame popped it while something still held the pointer; a "
+                    "host static caching it must go through klj_host_cache", slot, was);
         // The pointer says nothing; the caller says everything. A jobject that
         // did not come from us is almost always a return value of OURS that the
         // guest did not expect to be NULL, and the frame above names which one.
@@ -621,15 +679,15 @@ static const struct { const char *cls, *super; } g_supers[] = {
     {NULL, NULL},
 };
 
-static kl_jint klj_IsInstanceOf(void *env, void *obj, void *clazz) {
-    (void)env;
-    if (!obj) return 1;                       // null is an instance of everything
-    klj_object *o = klj_as_object(obj);
-    if (!o) return 0;
-    const char *want = klj_class_name(clazz);
+// Does `cls` reach `want` by walking superclasses? The one answer behind both
+// IsInstanceOf (which asks it about an object's class) and the assignability
+// tier of klj_find_binding (which asks it about two parameter descriptors).
+// Factored out of IsInstanceOf rather than copied: two walks over g_supers that
+// could disagree is exactly the drift g_supers exists to prevent.
+static int klj_class_is_a(const char *cls, const char *want) {
+    if (!cls || !want) return 0;
     if (strcmp(want, "java/lang/Object") == 0) return 1;
-
-    for (const char *cur = o->cls; cur; ) {
+    for (const char *cur = cls; cur; ) {
         if (strcmp(cur, want) == 0) return 1;
         const char *next = NULL;
         for (int i = 0; g_supers[i].cls; i++)
@@ -637,6 +695,14 @@ static kl_jint klj_IsInstanceOf(void *env, void *obj, void *clazz) {
         cur = next;
     }
     return 0;
+}
+
+static kl_jint klj_IsInstanceOf(void *env, void *obj, void *clazz) {
+    (void)env;
+    if (!obj) return 1;                       // null is an instance of everything
+    klj_object *o = klj_as_object(obj);
+    if (!o) return 0;
+    return klj_class_is_a(o->cls, klj_class_name(clazz)) ? 1 : 0;
 }
 
 // Strings. A jstring never crosses into real Java, so we are free to define the
@@ -787,12 +853,69 @@ static kl_jint klj_UnregisterNatives(void *env, void *clazz) { (void)env; (void)
 
 static kl_jint klj_GetJavaVM(void *env, void **vm) { (void)env; *vm = kl_jni_vm(); return 0; }
 
+// Defined below with the rest of the binding matcher; klj_want needs it to
+// resolve a lookup the guest made without a signature (see there).
+static const klj_binding *klj_resolve_by_name(const char *cls, const char *name,
+                                              int *nmatch);
+
 // The measurement instrument. Every id the guest wants is recorded; in strict
 // mode the first unknown one stops the run, which is the bring-up loop.
 // Permissive mode hands back a synthetic id so a single run
 // collects the whole batch of lookups an init path performs.
  void *klj_want(void *clazz, const char *name, const char *sig, char kind) {
     const char *cls = klj_class_name(clazz);
+    if (!sig) sig = "";
+
+    // ---- the guest asked with NO signature at all ----
+    //
+    // Unity's `AndroidJNIHelper.GetMethodID(jclass, name, signature = "",
+    // isStatic = false)` takes the signature as an OPTIONAL argument. Omit it
+    // and the managed side does not build one: it passes "" through to
+    // `com.unity3d.player.ReflectionHelper.getMethodID`, which on device
+    // resolves the method REFLECTIVELY — `getMethods()` filtered by name — and
+    // returns FromReflectedMethod. The signature is never spelled anywhere.
+    //
+    // bHaptics' Unity wrapper caches its ids both ways in one breath: with an
+    // explicit signature for most of BhapticsManagerWrapper and without one for
+    // five (`stopInt`, `stopAll`, `pingAll`, `isBhapticsUser`, `refreshPairing`),
+    // so the same class arrives spelled both ways in a single boot.
+    //
+    // An empty signature has no return kind (klj_return_kind gives '?') and no
+    // argument list, so it matches no binding and decodes no arguments. The id
+    // is issued happily — a lookup is only a measurement — and the run then dies
+    // at the CALL, on a method the table already implements, which is a
+    // confusing place to land: with `refreshPairing ()V` in the table and the
+    // dex agreeing, Paint the Town Red VR's call still aborted.
+    //
+    // Resolve it the way the device does: by (class, name) alone, and only when
+    // the answer is UNIQUE. Substituting the resolved signature here — before
+    // the id is interned — is what makes the rest of this file need to know
+    // nothing: the return-kind check, klj_decode_args and klj_resolve_binding
+    // all read w->sig and now see the real thing, and a later lookup that DOES
+    // spell the signature interns to the same entry rather than a second one.
+    //
+    // Ambiguity is refused, not guessed: `isPlayingByEventId` is declared twice
+    // (int and String) and picking either would marshal one as the other. A
+    // refusal leaves the empty signature in place, which is exactly today's
+    // behaviour — the call names the method and stops.
+    if ((kind == 'm' || kind == 'M') && !*sig) {
+        int n = 0;
+        const klj_binding *b = klj_resolve_by_name(cls, name, &n);
+        if (b)
+            KLJ_LOG("%s asked for %s.%s with NO signature (Unity's optional-arg "
+                    "spelling); resolved by name to %s",
+                    kind == 'M' ? "GetStaticMethodID" : "GetMethodID",
+                    cls, name, b->sig);
+        else if (n > 1)
+            KLJ_LOG("%s.%s asked with NO signature is AMBIGUOUS: %d bindings share "
+                    "that name — resolving by name would guess which one to "
+                    "marshal, so it is refused", cls, name, n);
+        else
+            KLJ_LOG("%s.%s asked with NO signature and no binding carries that "
+                    "name — nothing to resolve it to", cls, name);
+        if (b) sig = b->sig;
+    }
+
     pthread_mutex_lock(&g_lock);
     for (unsigned i = 0; i < g_nwanted; i++)
         if (g_wanted[i].cls == cls && g_wanted[i].kind == kind &&
@@ -988,17 +1111,124 @@ static int klj_same_args(const char *a, const char *b) {
     return la == lb && klj_sig_eq_n(a, b, la);
 }
 
+// ---- the third tier: a parameter the guest spelled as a SUBCLASS ----
+//
+// The two tiers above compare argument lists character for character, and that
+// is not what Java does. `Class.getMethod(name, argTypes)` resolves by
+// ASSIGNABILITY: a method declared `init(Context)` is the method you get when
+// you ask with an Activity, because an Activity IS a Context.
+//
+// Unity's C# side asks exactly that way. `AndroidJavaClass.CallStatic` builds
+// the signature from the RUNTIME type of the object it was handed, so HARD
+// BULLET's FMOD wrapper asks for
+// `org/fmod/FMOD.init(Lcom.unity3d.player.UnityPlayerGameActivity;)V` where
+// FMOD.java declares `init(Landroid/content/Context;)V`. Nothing is wrong with
+// either spelling; on device the reflective lookup bridges them. Without this
+// tier every such call is a separate abort, and the "fix" is transcribing the
+// same binding once per subclass the guest happens to hold — which is the
+// duplication g_supers already exists to avoid.
+//
+// The relaxation is kept narrow so it cannot become a silent wrong answer:
+//   - arity must match, and the RETURN must match exactly (the tier above
+//     already owns the generic-return case);
+//   - primitives and arrays must match exactly — only `L…;` widens;
+//   - widening is the g_supers walk and nothing else, the same walk
+//     IsAssignableFrom answers with;
+//   - at least one parameter must genuinely differ, so this tier can never
+//     shadow an exact match;
+//   - and the candidate must be UNIQUE. Two bindings both assignable is a real
+//     overload set (`f(Context)` and `f(Activity)`), where picking either is a
+//     guess; that is refused and named rather than resolved by table order.
+static const char *klj_type_end(const char *p) {
+    while (*p == '[') p++;
+    if (*p == 'L') { const char *e = strchr(p, ';'); return e ? e + 1 : NULL; }
+    if (!*p || *p == ')') return NULL;
+    return p + 1;
+}
+
+// `from` fits in a `to` slot. Both are one descriptor, delimited by [ps,pe).
+//
+// One extra rule beyond the g_supers walk: a guest argument spelled EXACTLY
+// `Ljava/lang/Object;` fits any reference slot. That is not Java assignability
+// — Object is not a Handler — it is the ERASED spelling, and it is the same
+// fact the generic-return tier above already accepts on the other side of the
+// parens. Unity's `AndroidJNIHelper.GetSignature(object)` has no type to read
+// when the argument is `null` (or is held in an `object`/`AndroidJavaProxy`
+// variable), so it emits `Ljava/lang/Object;` and the managed caller asks for
+// a method the native caller asks for correctly. Paint the Town Red's Rewired
+// input source does exactly this:
+//
+//     InputManager.registerInputDeviceListener(
+//         Landroid.hardware.input.InputManager$InputDeviceListener;
+//         Ljava/lang/Object;)V          <- the null Handler, erased
+//
+// where libunity, in the same boot, resolved the identical method as
+// `(...;Landroid/os/Handler;)V`. Without this rule every erased-argument call
+// is a separate abort whose only fix is a duplicate table entry per call site.
+// It stays safe for the same reason the tiers above do: an exact match still
+// wins outright, at least one parameter must have widened, and a signature
+// that two bindings both accept is refused as AMBIGUOUS rather than guessed.
+static int klj_type_assignable(const char *from, const char *fe,
+                               const char *to, const char *te) {
+    size_t lf = (size_t)(fe - from), lt = (size_t)(te - to);
+    if (lf == lt && klj_sig_eq_n(from, to, lf)) return 1;
+    // The erased spelling: only ever accepted INTO a reference slot, never into
+    // a primitive one, so an Object can never be marshalled as an int.
+    if (lf == 18 && klj_sig_eq_n(from, "Ljava/lang/Object;", 18) &&
+        (*to == 'L' || *to == '[')) return 1;
+    if (*from != 'L' || *to != 'L') return 0;     // primitive/array: exact only
+    char f[192], t[192];
+    if (lf < 3 || lf >= sizeof f || lt < 3 || lt >= sizeof t) return 0;
+    size_t i;
+    for (i = 0; i < lf - 2; i++) f[i] = from[1 + i] == '.' ? '/' : from[1 + i];
+    f[i] = 0;
+    for (i = 0; i < lt - 2; i++) t[i] = to[1 + i] == '.' ? '/' : to[1 + i];
+    t[i] = 0;
+    return klj_class_is_a(f, t);
+}
+
+// The table declares `tbl`; the guest asked for `guest`. Returns 1 only if the
+// guest's arguments widen into the table's AND something actually widened.
+static int klj_args_assignable(const char *tbl, const char *guest) {
+    const char *a = strchr(tbl, '('), *b = strchr(guest, '(');
+    if (!a || !b) return 0;
+    a++; b++;
+    int widened = 0;
+    while (*a && *a != ')' && *b && *b != ')') {
+        const char *ae = klj_type_end(a), *be = klj_type_end(b);
+        if (!ae || !be) return 0;
+        if (!klj_type_assignable(b, be, a, ae)) return 0;
+        size_t la = (size_t)(ae - a), lb = (size_t)(be - b);
+        if (la != lb || !klj_sig_eq_n(a, b, la)) widened = 1;
+        a = ae; b = be;
+    }
+    if (*a != ')' || *b != ')') return 0;         // different arity
+    if (!widened) return 0;                       // never shadow an exact match
+    // The returns must agree — exactly, or the way the tier above already
+    // accepts them: both references. Java has no return-type overloading, so a
+    // reference return spelled two ways is still one method, and a guest that
+    // erased an ARGUMENT is exactly the guest that erases the RETURN in the
+    // same breath (`AndroidJavaObject.Call<AndroidJavaObject>(name, null)`
+    // erases both ends of the same call). Requiring an exact return here made
+    // that doubly-erased call resolve through neither tier: the loose tier
+    // wants identical arguments, this one wanted an identical return, and the
+    // one call that needs both relaxations at once fell between them.
+    return klj_sig_eq(a, b) || klj_same_args(a, b);
+}
+
 static const klj_binding *klj_find_binding(const char *cls, const char *name,
                                            const char *sig) {
     // Exact wins outright across EVERY family table, so the answer does not
     // depend on which file a class landed in; a loose match is only ever the
     // fallback.
-    const klj_binding *loose = NULL;
+    const klj_binding *loose = NULL, *wide = NULL;
+    int nwide = 0;
     for (const klj_binding *const *t = klj_binding_tables; *t; t++)
         for (const klj_binding *b = *t; b->cls; b++) {
             if (strcmp(b->cls, cls) != 0 || strcmp(b->name, name) != 0) continue;
             if (klj_sig_eq(b->sig, sig)) return b;
             if (!loose && klj_same_args(b->sig, sig)) loose = b;
+            if (klj_args_assignable(b->sig, sig)) { if (!wide) wide = b; nwide++; }
         }
     // Named, once per (method, signature). A loose match is the right answer
     // for the generic-return case it exists for and a SILENT wrong answer for
@@ -1016,7 +1246,28 @@ static const klj_binding *klj_find_binding(const char *cls, const char *name,
                     cls, name, sig, loose->sig);
         }
     }
-    return loose;
+    if (loose) return loose;
+
+    // Named on the same terms and for the same reason: a widened match is the
+    // right answer for the subclass-argument case and a silent wrong one for
+    // anything else, so it goes on the record.
+    if (wide) {
+        if (nwide > 1) {
+            KLJ_LOG("binding %s.%s%s is AMBIGUOUS: %d table entries accept it by "
+                    "assignability — declare the exact signature", cls, name, sig, nwide);
+            return NULL;
+        }
+        static const char *seen[64];
+        static unsigned nseen;
+        unsigned i = 0;
+        for (; i < nseen; i++) if (seen[i] == wide->sig) break;
+        if (i == nseen && nseen < 64) {
+            seen[nseen++] = wide->sig;
+            KLJ_LOG("binding %s.%s matched by ASSIGNABILITY: guest asked %s, "
+                    "table has %s", cls, name, sig, wide->sig);
+        }
+    }
+    return wide;
 }
 
 static const klj_binding *klj_resolve_binding(const char *cls, const char *name,
@@ -1044,6 +1295,55 @@ static const klj_binding *klj_resolve_binding(const char *cls, const char *name,
         cur = next;
     }
     return klj_find_binding("java/lang/Object", name, sig);
+}
+
+// ---- the fourth tier: no signature at all ----
+//
+// Only ever reached from klj_want, for the empty-signature lookup documented
+// there. It is deliberately NOT part of klj_find_binding: a call always has a
+// signature by the time it gets there, and a name-only fallback at call time
+// would paper over a genuine mismatch. Here it is the whole of the information
+// the guest supplied.
+//
+// "Unique" is counted over distinct SIGNATURES, not table rows, so a method
+// deliberately declared in two family tables with the same spelling still
+// resolves; two different spellings is an overload set and is refused.
+static const klj_binding *klj_find_by_name(const char *cls, const char *name,
+                                           int *nmatch) {
+    const klj_binding *first = NULL;
+    const char *seen[16];
+    int n = 0;
+    for (const klj_binding *const *t = klj_binding_tables; *t; t++)
+        for (const klj_binding *b = *t; b->cls; b++) {
+            if (strcmp(b->cls, cls) != 0 || strcmp(b->name, name) != 0) continue;
+            int dup = 0;
+            for (int i = 0; i < n && i < 16; i++)
+                if (klj_sig_eq(seen[i], b->sig)) { dup = 1; break; }
+            if (dup) continue;
+            if (n < 16) seen[n] = b->sig;
+            if (!first) first = b;
+            n++;
+        }
+    *nmatch = n;
+    return n == 1 ? first : NULL;
+}
+
+// The same superclass walk klj_resolve_binding does, and it stops at the first
+// class in the chain that declares the name at all — a subclass that overloads
+// a name shadows the superclass's, exactly as Java resolution does, rather than
+// pooling both into a false ambiguity.
+static const klj_binding *klj_resolve_by_name(const char *cls, const char *name,
+                                              int *nmatch) {
+    for (const char *cur = cls; cur; ) {
+        int n = 0;
+        const klj_binding *b = klj_find_by_name(cur, name, &n);
+        if (n) { *nmatch = n; return b; }
+        const char *next = NULL;
+        for (int i = 0; g_supers[i].cls; i++)
+            if (strcmp(g_supers[i].cls, cur) == 0) { next = g_supers[i].super; break; }
+        cur = next;
+    }
+    return klj_find_by_name("java/lang/Object", name, nmatch);
 }
 
 // Exactly one of `va` / `args` is non-NULL; everything else about a call is
@@ -1449,7 +1749,12 @@ static const char *klj_field_sval(const klj_field *f) {
 // Interned jstrings for constant object fields, parallel to g_fields so the
 // table itself stays const. A static final String read twice is the same object
 // in Java, and some callers do compare identity.
-#define KLJ_MAX_FIELDS 128
+// Sized to sit AHEAD of the table, not behind it: an entry past the end falls
+// to the uncached path, which mints an unpinned jstring per read — the exact
+// use-after-retire the pinning above exists to prevent. The table has already
+// grown past 128 once; 256 is a 2 KB array, so there is no reason to keep it
+// tight enough to be overtaken again.
+#define KLJ_MAX_FIELDS 256
 static void *g_field_cache[KLJ_MAX_FIELDS];
 
 

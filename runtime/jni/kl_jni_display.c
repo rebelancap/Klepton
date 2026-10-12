@@ -142,9 +142,10 @@ static klj_val klj_Display_getSupportedModes(void *env, void *self, const klj_va
     (void)env; (void)self; (void)a; (void)n;
     static void *modes;
     if (!modes) {
-        modes = klj_new_array('L', "android/view/Display$Mode", 1);
+        modes = klj_host_cache(klj_new_array('L', "android/view/Display$Mode", 1));
         void **slot = klj_arr(modes)->data;
-        slot[0] = klj_new_object_data("android/view/Display$Mode", NULL);
+        // The Mode is pinned too — the array holds the pointer, not the object.
+        slot[0] = klj_host_cache(klj_new_object_data("android/view/Display$Mode", NULL));
     }
     return (klj_val){.l = modes};
 }

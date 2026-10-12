@@ -112,6 +112,14 @@ static klj_val klj_InputDevice_getDeviceIds(void *env, void *self, const klj_val
         int32_t *v = klj_arr(ids)->data;
         v[0] = KLJ_INPUT_DEV_LTOUCH;
         v[1] = KLJ_INPUT_DEV_RTOUCH;
+        // Pinned for the same reason getDevice()'s InputDevice objects are.
+        // Unpinned, Paint the Town Red VR's boot aborts: libunity asks for the
+        // ids inside a local frame, the pop retires the array, and the next caller
+        // — Rewired, from C#, through the erased `()Ljava/lang/Object;`
+        // spelling — is handed a pointer we no longer recognise and aborts in
+        // GetObjectClass. A cached answer must outlive the frame it was built
+        // in; that is what klj_host_cache says.
+        klj_host_cache(ids);
     }
     KLJ_LOG("InputDevice.getDeviceIds() -> [%d, %d] (the two Touch controllers)",
             KLJ_INPUT_DEV_LTOUCH, KLJ_INPUT_DEV_RTOUCH);

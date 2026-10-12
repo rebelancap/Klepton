@@ -291,7 +291,7 @@ static klj_val klj_AudioManager_getDevices(void *env, void *self, const klj_val 
 static klj_val klj_MediaRouter_getSelectedRoute(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *route;
-    if (!route) route = kl_jni_new_object("android/media/MediaRouter$RouteInfo");
+    if (!route) route = klj_host_cache(kl_jni_new_object("android/media/MediaRouter$RouteInfo"));
     return (klj_val){.l = route};
 }
 
@@ -309,7 +309,7 @@ static klj_val klj_MediaRouter_getSelectedRoute(void *env, void *self, const klj
 static klj_val klj_Context_getContentResolver(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *resolver;
-    if (!resolver) resolver = kl_jni_new_object("android/content/ContentResolver");
+    if (!resolver) resolver = klj_host_cache(kl_jni_new_object("android/content/ContentResolver"));
     return (klj_val){.l = resolver};
 }
 

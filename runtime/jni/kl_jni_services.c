@@ -965,7 +965,7 @@ static const klj_kv *klj_manifest_metadata(void) {
                     "transcribed <meta-data>, which may not be this guest's",
                     g_assets_dir);
         }
-        bundle = klj_new_object_data("android/os/Bundle", (void *)kv);
+        bundle = klj_host_cache(klj_new_object_data("android/os/Bundle", (void *)kv));
     }
     return (klj_val){.l = bundle};
 }

@@ -140,6 +140,7 @@ const char *klj_class_name(void *clazz);
 void       *klj_class_object(const char *class_name);
 void       *klj_new_object_data(const char *class_name, void *data);
 void       *klj_own(void *obj, void (*destroy)(void *));
+void       *klj_host_cache(void *obj);   // a jobject the host keeps in a static
 const char *klj_str(void *s);
 klj_array  *klj_arr(void *a);
 void       *klj_new_array(char kind, const char *elem_cls, int len);

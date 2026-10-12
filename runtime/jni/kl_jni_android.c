@@ -1137,7 +1137,9 @@ static klj_val klj_Context_getSystemService(void *env, void *self, const klj_val
     static void *cache[sizeof services / sizeof services[0]];
     for (unsigned i = 0; services[i].svc; i++) {
         if (strcmp(services[i].svc, want)) continue;
-        if (!cache[i]) cache[i] = kl_jni_new_object(services[i].cls);
+        // Host-cached: the same service object comes back on every lookup, so
+        // it has to survive the local frame the first lookup happened in.
+        if (!cache[i]) cache[i] = klj_host_cache(kl_jni_new_object(services[i].cls));
         KLJ_LOG("getSystemService(\"%s\") -> %s", want, services[i].cls);
         return (klj_val){.l = cache[i]};
     }
@@ -1238,7 +1240,7 @@ void kl_jni_set_native_lib_dir(const char *dir) { g_native_lib_dir = klj_abspath
 // "no splits" to a caller that checks length.
  klj_val klj_appinfo_splitSourceDirs(void) {
     static void *empty;
-    if (!empty) empty = klj_new_array('L', "java/lang/String", 0);
+    if (!empty) empty = klj_host_cache(klj_new_array('L', "java/lang/String", 0));
     return (klj_val){.l = empty};
 }
 
@@ -1439,8 +1441,11 @@ static klj_val klj_Context_getObbDirs(void *env, void *self, const klj_val *a, i
     (void)env; (void)self; (void)a; (void)n;
     static void *dirs;
     if (!dirs) {
-        dirs = klj_new_array('L', "java/io/File", 1);
-        ((void **)klj_arr(dirs)->data)[0] = klj_new_file(klj_obb_dir());
+        dirs = klj_host_cache(klj_new_array('L', "java/io/File", 1));
+        // The element is pinned separately: an object array owns only its
+        // pointer buffer, so the File inside would otherwise be retired by the
+        // frame it was built in while the cached array kept pointing at it.
+        ((void **)klj_arr(dirs)->data)[0] = klj_host_cache(klj_new_file(klj_obb_dir()));
     }
     return (klj_val){.l = dirs};
 }
