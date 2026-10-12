@@ -1486,6 +1486,12 @@ final class KleptonCompositor {
         }
         NSLog("[cp] render loop ended after \(presented) presented frames, "
               + "\(iterations) iterations, state=\(String(describing: layerRenderer.state))")
+        // The crown press invalidates the layer with NO scenePhase change at
+        // all (measured on device: none fires), and the system then takes
+        // ~30-60 s to background the process — which is when Lifecycle exits.
+        // Go silent the moment the picture is gone, not when the OS gets to
+        // it; the guest may keep rendering until the join below.
+        KleptonAudio.setSilenced(true)
         // Ends the guest's loop and joins it, so its report — which is the
         // lifecycle report, and belongs to the guest's end of the run rather than
         // to this one — has been written before this returns.
