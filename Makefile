@@ -981,6 +981,20 @@ build/t_haptics: tests/t_haptics.c $(RUNTIME) $(RUNTIME_HDRS)
 haptics: build/t_haptics
 	@./build/t_haptics
 
+# The block-seam harness. Models the guest's mixer — a copy-callback in front of
+# an asynchronous producer — so the AAudio path can be measured on the host,
+# where a title's own mixer may stay silent. See tests/t_aaudio.c. Real time, so
+# it takes as many seconds as it is given (20 by default), which is why it is
+# NOT in `check`. It opens the real output device, at +-1 LSB — lit, and
+# inaudible.
+build/t_aaudio: tests/t_aaudio.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_aaudio.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: aaudio
+aaudio: build/t_aaudio
+	@./build/t_aaudio
+
 # ...and the half t_haptics cannot see: whether our implementations agree with
 # the REAL libOVRPlugin.so about which arguments are OUT-parameters. Offline —
 # it disassembles the plugin in the guest tree, runs no guest and needs no
