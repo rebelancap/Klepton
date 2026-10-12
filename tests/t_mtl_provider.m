@@ -469,6 +469,22 @@ unsigned long kl_mtl_count_lit(int eye, int stage, int *out_w, int *out_h) {
     return klmtl_count_lit_tex(texp, slice, out_w, out_h);
 }
 
+// The eye texture's SIZE and its identity, without reading a single texel.
+//
+// The composite audit needs both, and neither is worth a lit-pixel sweep: the
+// size is what the render viewport is a rect OF, and the pointer is what says
+// whether the two eyes are one storage (DoubleWide) or two. Returns the texture
+// pointer, or NULL when there is none for that (eye, stage).
+void *kl_mtl_eye_size(int eye, int stage, int *out_w, int *out_h) {
+    int slice = 0;
+    void *texp = kl_glfb_eye_mtl_texture(eye, stage, &slice);
+    if (!texp) return NULL;
+    id<MTLTexture> t = (__bridge id<MTLTexture>)texp;
+    if (out_w) *out_w = (int)t.width;
+    if (out_h) *out_h = (int)t.height;
+    return texp;
+}
+
 // ...and the same measurement for a non-eye LAYER. This is the whole of the
 // evidence that a quad-only guest's picture reached storage a compositor can
 // sample: the eye table is empty for such a guest, so every eye number is 0 and

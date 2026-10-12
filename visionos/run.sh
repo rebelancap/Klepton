@@ -7,10 +7,15 @@
 # Env overrides:
 #   KLEPTON_TARGET=<name>   which guest — `python3 targets.py --list`
 #   KLEPTON_DEVICE=<udid>   skip device auto-detection
+#   KLEPTON_SIM_UDID=<udid> which booted simulator (default: the first booted one —
+#                           another session's iPhone counts; name yours)
 #   KLEPTON_TEAM=<teamid>   override signing team
 #   KLEPTON_BUNDLE_ID=...   override bundle id
 #   KL_SKIP_STAGE=1         never stage, even on a target that has never had it
 #   KL_STAGE=1              always stage, whatever the stamp says
+#   KL_ANGLE_PREBUILT=1     wrap the ANGLE already in vendor/out, no relink
+#   KL_NO_LAUNCH=1          device only: build, install, stage — then stop.
+#                           The tester launches from the Home View, worn.
 #
 # Everything downstream of the target — the product name, and with it the
 # .xcodeproj, the scheme, the .app and the derived-data directory — comes from
@@ -77,7 +82,14 @@ STAMP_DIR="build/staged"
 # knew only about the APK would skip them on every machine that had ever staged
 # this target — a shell that aborts with `Could not find the Qt
 # platform plugin "virtual"` and a run.sh that says the assets are already
-# there. Bump this whenever stage_assets.sh stages something new.
+# there. Bump this whenever stage_assets.sh stages something NEW.
+#
+# NEW, and not "different". A bump invalidates the stamp and the device path in
+# stage_assets.sh then re-uploads every file unconditionally — there is no
+# per-file diff, so for a loose-pak title that can be tens of GB. Dropping a
+# file from the stage set therefore does NOT earn a bump; delete the file from
+# the live container instead. A container that has never been staged is
+# unaffected either way.
 STAGE_SCHEMA=7
 stage_stamp() {   # <target-key>
   local apk="../$KLT_APK" sig=""
@@ -127,7 +139,7 @@ stage_if_needed() {
 # it, the app never did, and the run took the window path while looking like the
 # compositor had failed to come up. A knob that is set and not delivered is worse
 # than one that does not exist, so the default is now "forward it".
-FORWARD_SKIP="KL_ANGLE_DIR KL_SKIP_STAGE KL_STAGE KL_SKIP_INSTALL KL_LOG_OUT KL_WATCH KL_QUIET KL_KEEP_LONGEST"
+FORWARD_SKIP="KL_ANGLE_DIR KL_ANGLE_PREBUILT KL_SKIP_STAGE KL_STAGE KL_SKIP_INSTALL KL_LOG_OUT KL_WATCH KL_QUIET KL_KEEP_LONGEST KL_NO_LAUNCH"
 FORWARD=""
 for K in $(env | sed -n -e 's/^\(KL_[A-Za-z0-9_]*\)=.*/\1/p' \
                         -e 's/^\(MTL_[A-Za-z0-9_]*\)=.*/\1/p' \
@@ -146,7 +158,23 @@ echo "[1/5] runtime + guest translations ($KLT_NAME)…"
 # Keep the embedded ANGLE current, but only when the checkout is already
 # there: this must not turn `run.sh` into a surprise 12 GB clone. Without it,
 # mkangle.sh below stops and names the bootstrap command instead.
-if [ -d ../vendor/.git ]; then (cd .. && make -s angle-xros angle-xrsim); fi
+# Only THIS run's slice, for the reason XROS_PLATFORMS exists: since the iOS 27
+# SDK became the only one (2026-09-18) the device slice's `angle-ios` relink
+# fails (undefined libSystem symbols against iPhoneOS27.0), and a simulator run
+# has no use for that slice — it stopped every `./run.sh` at step 1.
+# KL_ANGLE_PREBUILT=1 skips the relink and wraps whatever vendor/out/<slice>
+# already holds: the way past the device slice's iOS-27-SDK relink failure for a
+# guest that never draws through ANGLE (a Vulkan one), until that is fixed.
+if [ -d ../vendor/.git ] && [ "${KL_ANGLE_PREBUILT:-0}" != 1 ]; then
+  (cd .. && make -s "angle-$XROS_PLATFORMS")
+elif [ "${KL_ANGLE_PREBUILT:-0}" = 1 ]; then
+  prebuilt_egl="../vendor/out/$XROS_PLATFORMS/libEGL.framework/libEGL"
+  if [ ! -f "$prebuilt_egl" ]; then
+    echo "error: KL_ANGLE_PREBUILT=1 but $prebuilt_egl is missing — run 'make angle-$XROS_PLATFORMS' once, or unset KL_ANGLE_PREBUILT" >&2
+    exit 1
+  fi
+  echo "  ANGLE: prebuilt vendor/out/$XROS_PLATFORMS kept (KL_ANGLE_PREBUILT=1), $(stat -f %Sm "$prebuilt_egl")"
+fi
 ./mkguest.sh | tail -1
 ./mkangle.sh | tail -1
 # ...and the Vulkan renderer, for a guest whose graphics API is not GLES. Unlike
@@ -154,9 +182,10 @@ if [ -d ../vendor/.git ]; then (cd .. && make -s angle-xros angle-xrsim); fi
 # prebuilt — so the script just re-wraps whatever is vendored and says so when
 # nothing is. gen_xcodeproj.py embeds it only if this produced something.
 ./mkmvk.sh | tail -1
+./mkicon.py  | tail -1
 
-echo "[2/5] project…  custom launcher: $([ -n "$DD_SUFFIX" ] && echo "ON (HL*VR name + monogram icon + Boot button)" || echo "off (normal build; set KL_CUSTOM_LAUNCHER=1 to enable)")"
-python3 gen_xcodeproj.py | head -1
+echo "[2/5] project…  custom launcher: $([ -n "$DD_SUFFIX" ] && echo "ON (HL*VR name + Boot button)" || echo "off (normal build; set KL_CUSTOM_LAUNCHER=1 to enable)")"
+KLEPTON_BUILD_MODE="$MODE" python3 gen_xcodeproj.py | grep -E "^(wrote|  device bundle)"
 
 if [ "$MODE" = "device" ]; then
   # Device discovery goes through JSON: device names contain non-breaking
@@ -214,6 +243,18 @@ print(phys[0]["identifier"])
   fi
   # Installing can rotate the data container, so assets are staged *after*.
   stage_if_needed "$DEVID" "$DEVID"
+
+  # KL_NO_LAUNCH: install and stage, then STOP. The tester launches from the Home
+  # View wearing the headset and reports back — a devicectl launch of a worn
+  # title is not the same run (no passthrough hand-off, and the immersive space
+  # opens against a device nobody is looking through). This is the default shape
+  # of a "first device round" here, so it is a knob rather than a hand-run
+  # `devicectl device install app` that would skip the staging step above.
+  if [ -n "${KL_NO_LAUNCH:-}" ]; then
+    echo "[5/5] NOT launching (KL_NO_LAUNCH=1) — installed and staged."
+    echo "      Launch Klepton from the Home View wearing the headset."
+    exit 0
+  fi
 
   echo "[5/5] launching (report also renders on-screen)…"
   # KL_FRAMES carries the app past the initJni gate into the Android lifecycle
@@ -396,20 +437,59 @@ fi
 # nothing — silently, right after "[2/5] project…", before the message below
 # ever prints. Cost a "build crash" report that was really a missing `device`
 # argument on a machine with no simulator booted.
-UDID=$(xcrun simctl list devices booted | grep -o '[0-9A-F-]\{36\}' | head -1 || true)
+UDID="${KLEPTON_SIM_UDID:-$(xcrun simctl list devices booted | grep -o '[0-9A-F-]\{36\}' | head -1 || true)}"
 [ -n "$UDID" ] || { echo "!! no booted visionOS simulator (did you mean ./run.sh device ?)"; exit 1; }
 
 echo "[3/5] building for the simulator…"
+# AD-HOC SIGNED, not unsigned. This used to say CODE_SIGNING_ALLOWED=NO on the
+# reasoning that the simulator has no AMFI to satisfy, and for a long time
+# nothing here noticed — the app's own binary is ad-hoc signed by the LINKER, so
+# it launches either way, and so does every framework clang produces (ANGLE's
+# libEGL reports `adhoc,linker-signed`).
+#
+# What is NOT produced by clang is the guest. `klepton-ld` writes its Mach-Os
+# itself and emits no LC_CODE_SIGNATURE at all, and the vendored MoltenVK
+# arrives unsigned in its tarball. Those reach the process through `dlopen`, and
+# the visionOS 27.0 simulator runtime refuses an unsigned image there:
+#
+#   dlopen(.../libUE4.framework/libUE4, 0x0006): ... (code signature in
+#   <UUID> '.../libUE4' not valid for use in process: Trying to load an
+#   unsigned library)
+#
+# — which is the "translated guest frameworks fail to dlopen under the sim
+# runtime on this machine" trap in PORTING.md, named at last. It read as
+# environmental because the two halves that made it (a build that declines to
+# sign, a loader that requires it) are in different files.
+#
+# The frameworks are already marked CodeSignOnCopy by gen_xcodeproj.py, so all
+# that was ever needed was letting the embed step run: `-` is the ad-hoc
+# identity, Manual keeps automatic signing from going looking for a profile a
+# simulator build has no use for, and the device path is untouched — it signs
+# with the real identity and always did.
 set +e
 xcodebuild -project "$PRODUCT.xcodeproj" -scheme "$PRODUCT" \
   -destination "platform=visionOS Simulator,id=$UDID" \
-  -derivedDataPath "build/dd-sim-$KLT_NAME$DD_SUFFIX" CODE_SIGNING_ALLOWED=NO build 2>&1 \
+  -derivedDataPath "build/dd-sim-$KLT_NAME$DD_SUFFIX" \
+  CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual \
+  CODE_SIGNING_REQUIRED=YES CODE_SIGNING_ALLOWED=YES \
+  PROVISIONING_PROFILE_SPECIFIER="" build 2>&1 \
   | grep -E 'error:|\*\* BUILD'
 BUILD_RC=${PIPESTATUS[0]}
 set -e
 APP="build/dd-sim-$KLT_NAME$DD_SUFFIX/Build/Products/Debug-xrsimulator/$PRODUCT.app"
 [ "$BUILD_RC" = 0 ] || { echo "!! build FAILED (see errors above) — not installing a stale app"; exit 1; }
 [ -f "$APP/Info.plist" ] || { echo "!! no usable .app at $APP"; exit 1; }
+# Ad-hoc sign what Frameworks/ embeds. CODE_SIGNING_ALLOWED=NO also turns off
+# CodeSignOnCopy, and under Xcode 27 nothing else signs the klepton-ld
+# translations or MoltenVK any more (August's simulator bundles came out
+# `Signature=adhoc`; 2026-09-27's came out "not signed at all"). An arm64 page
+# must carry a signature to execute even on the simulator, so every guest dlopen
+# then failed at the first library ("translated dylib present but failed to
+# load"). Ad-hoc is all the simulator asks for; the device build signs for real.
+for fw in "$APP"/Frameworks/*.framework; do
+  codesign --force --sign - --timestamp=none "$fw" >/dev/null 2>&1 \
+    || echo "!! could not ad-hoc sign $fw"
+done
 
 echo "[4/5] installing + staging…"
 xcrun simctl install "$UDID" "$APP"

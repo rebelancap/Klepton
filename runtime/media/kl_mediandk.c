@@ -400,6 +400,105 @@ static int klm_AMediaExtractor_seekTo(void *ex, int64_t us, int mode) {
 }
 
 // ---------------------------------------------------------------------------
+// AMediaDataSource — the guest's OWN reader, handed to the extractor.
+//
+// A weak undefined FUNCTION and a weak undefined DATA symbol are not the same
+// hazard, and Arkham Shadow's cape-glide tutorial is where the difference cost
+// a session. The AMEDIAFORMAT_KEY_* block above is deliberately left NULL for
+// the weak keys because the guest null-tests a key pointer before using it —
+// that is the mechanism weak imports exist for. libunity's AMediaDataSource
+// family is weak for a different reason: it is API 28, and Unity gates the call
+// on Build.VERSION.SDK_INT rather than on the symbol. We answer 29, so the
+// guard passes, and the call goes through a PLT slot holding zero:
+//
+//     14fb2c0: adrp x16, ...; ldr x17, [x16, #0xd38]; br x17     <- x17 = 0
+//
+// which lands as pc=0, EXC_BAD_ACCESS / "Failed to fault in a page with execute
+// permissions", with no frame of ours anywhere in the report and not one line
+// in the log. Twenty launches could not see it. A NULL weak function is only a
+// legal answer when the guest asked the question; when it did not, the honest
+// answer is an object.
+//
+// So this is an object, and a real one: it holds the three callbacks and the
+// userdata exactly as the NDK does, and delete() calls close() before freeing,
+// which is the contract the guest's own cleanup is written against. What it
+// does NOT do is demux — AMediaExtractor_setDataSourceCustom refuses through
+// the same klm_extractor_refuse as setDataSource and setDataSourceFd, because
+// where the bytes come from was never the missing piece. The refusal is what
+// runs the guest's no-video path, and now it runs it instead of a crash.
+typedef ssize_t (*klm_ds_read_at)(void *userdata, off_t offset, void *buf, size_t size);
+typedef ssize_t (*klm_ds_get_size)(void *userdata);
+typedef void    (*klm_ds_close)(void *userdata);
+
+#define KLM_DATASOURCE_MAGIC 0x4b4c4453u   /* 'KLDS' */
+typedef struct {
+    uint32_t        magic;
+    void           *userdata;
+    klm_ds_read_at  read_at;
+    klm_ds_get_size get_size;
+    klm_ds_close    close;
+} klm_datasource;
+
+static klm_datasource *klm_ds(void *src) {
+    klm_datasource *s = src;
+    return (s && s->magic == KLM_DATASOURCE_MAGIC) ? s : NULL;
+}
+
+static void *klm_AMediaDataSource_new(void) {
+    klm_datasource *s = calloc(1, sizeof *s);
+    if (s) s->magic = KLM_DATASOURCE_MAGIC;
+    return s;
+}
+
+static void klm_AMediaDataSource_setUserdata(void *src, void *userdata) {
+    klm_datasource *s = klm_ds(src);
+    if (s) s->userdata = userdata;
+}
+static void klm_AMediaDataSource_setReadAt(void *src, klm_ds_read_at fn) {
+    klm_datasource *s = klm_ds(src);
+    if (s) s->read_at = fn;
+}
+static void klm_AMediaDataSource_setGetSize(void *src, klm_ds_get_size fn) {
+    klm_datasource *s = klm_ds(src);
+    if (s) s->get_size = fn;
+}
+static void klm_AMediaDataSource_setClose(void *src, klm_ds_close fn) {
+    klm_datasource *s = klm_ds(src);
+    if (s) s->close = fn;
+}
+
+// close() before free() is the NDK's own order, and it is the half that
+// matters: the guest's close callback is where it drops the file handle or the
+// bundle reference behind the stream. Freeing without it leaks the guest's
+// resource, silently, once per video it gives up on.
+static void klm_AMediaDataSource_delete(void *src) {
+    klm_datasource *s = klm_ds(src);
+    if (!s) return;
+    if (s->close) s->close(s->userdata);
+    s->magic = 0;
+    free(s);
+}
+
+static int klm_AMediaExtractor_setDataSourceCustom(void *ex, void *src) {
+    klm_extractor *x = klm_ex(ex);
+    if (!x) return AMEDIA_ERROR_INVALID_OBJECT;
+    // Name the size in the refusal when the guest can tell us. getSize is a
+    // guest callback on the guest's own thread, which is where the NDK would
+    // call it from too, and it is the one fact that distinguishes "a video was
+    // wanted" from "a stream we never saw the shape of".
+    klm_datasource *s = klm_ds(src);
+    char what[64];
+    if (s && s->get_size) {
+        ssize_t n = s->get_size(s->userdata);
+        snprintf(what, sizeof what, "(custom data source, %lld bytes)",
+                 (long long)n);
+    } else {
+        snprintf(what, sizeof what, "(custom data source)");
+    }
+    return klm_extractor_refuse(x, what);
+}
+
+// ---------------------------------------------------------------------------
 // AHardwareBuffer — a refcounted handle on one CVPixelBuffer.
 
 typedef struct {
@@ -443,6 +542,64 @@ static void klm_AHardwareBuffer_acquire(void *buf) {
         __atomic_add_fetch(&h->refs, 1, __ATOMIC_RELAXED);
 }
 static void klm_AHardwareBuffer_release(void *buf) { klm_hwbuf_release(buf); }
+
+// AHardwareBuffer_describe — the NDK's AHardwareBuffer_Desc, 40 bytes:
+// width, height, layers, format (u32 each), usage (u64), stride, rfu0 (u32),
+// rfu1 (u64). Answered from the CVPixelBuffer the handle wraps, and only for
+// a handle this file made: a buffer here is a decoded video frame, so its
+// format is one CoreVideo named and its use is being sampled by the GPU.
+//
+// Formats are Android's HAL numbers, which is what AHardwareBuffer formats
+// are: 32RGBA -> R8G8B8A8_UNORM (1), 32BGRA -> HAL_PIXEL_FORMAT_BGRA_8888 (5),
+// the 4:2:0 bi-planar family -> Y8Cb8Cr8_420 (0x23). Anything else, and any
+// handle that is not ours, is described as all zeroes and said once by name:
+// the call returns void, so a zero width is the only refusal it can carry,
+// and it is one every caller already treats as "no buffer".
+typedef struct {
+    uint32_t width, height, layers, format;
+    uint64_t usage;
+    uint32_t stride, rfu0;
+    uint64_t rfu1;
+} klm_ahb_desc;
+
+static void klm_AHardwareBuffer_describe(const void *buf, klm_ahb_desc *d) {
+    if (!d) return;
+    memset(d, 0, sizeof *d);
+    const klm_hwbuf *h = buf;
+    static int said_foreign, said_format;
+    if (!h || h->magic != KLM_HWBUF_MAGIC) {
+        if (!said_foreign++)
+            fprintf(stderr, "  [mediandk] AHardwareBuffer_describe(%p): not a buffer "
+                            "this runtime allocated (the only AHardwareBuffers here "
+                            "are decoded video frames) — described as all zeroes\n", buf);
+        return;
+    }
+    CVPixelBufferRef pb = (CVPixelBufferRef)h->pixels;
+    OSType pf = CVPixelBufferGetPixelFormatType(pb);
+    uint32_t fmt = 0, bpp = 1;
+    switch (pf) {
+    case kCVPixelFormatType_32RGBA: fmt = 1;    bpp = 4; break;
+    case kCVPixelFormatType_32BGRA: fmt = 5;    bpp = 4; break;
+    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+                                    fmt = 0x23; bpp = 1; break;
+    default:
+        if (!said_format++)
+            fprintf(stderr, "  [mediandk] AHardwareBuffer_describe: CoreVideo format "
+                            "'%c%c%c%c' has no AHardwareBuffer equivalent — described "
+                            "as all zeroes\n", (int)(pf >> 24) & 0xff, (int)(pf >> 16) & 0xff,
+                    (int)(pf >> 8) & 0xff, (int)pf & 0xff);
+        return;
+    }
+    d->width  = (uint32_t)CVPixelBufferGetWidth(pb);
+    d->height = (uint32_t)CVPixelBufferGetHeight(pb);
+    d->layers = 1;
+    d->format = fmt;
+    d->usage  = 0x100;          // AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE
+    size_t row = CVPixelBufferIsPlanar(pb) ? CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
+                                           : CVPixelBufferGetBytesPerRow(pb);
+    d->stride = (uint32_t)(row / bpp);   // in PIXELS, as the NDK defines it
+}
 
 // ---------------------------------------------------------------------------
 // AImage — one frame, taken off the reader's queue.
@@ -1144,6 +1301,16 @@ static const struct { const char *name; void *fn; } g_media[] = {
     M("AMediaExtractor_getSampleTime",       klm_AMediaExtractor_getSampleTime),
     M("AMediaExtractor_advance",             klm_AMediaExtractor_advance),
     M("AMediaExtractor_seekTo",              klm_AMediaExtractor_seekTo),
+    M("AMediaExtractor_setDataSourceCustom", klm_AMediaExtractor_setDataSourceCustom),
+
+    // The guest's own reader — see the note by the implementation for why a
+    // weak undefined FUNCTION cannot be left NULL the way a weak key can.
+    M("AMediaDataSource_new",         klm_AMediaDataSource_new),
+    M("AMediaDataSource_delete",      klm_AMediaDataSource_delete),
+    M("AMediaDataSource_setUserdata", klm_AMediaDataSource_setUserdata),
+    M("AMediaDataSource_setReadAt",   klm_AMediaDataSource_setReadAt),
+    M("AMediaDataSource_setGetSize",  klm_AMediaDataSource_setGetSize),
+    M("AMediaDataSource_setClose",    klm_AMediaDataSource_setClose),
 
     M("AImageReader_newWithUsage",       klm_AImageReader_newWithUsage),
     M("AImageReader_setImageListener",   klm_AImageReader_setImageListener),
@@ -1159,6 +1326,7 @@ static const struct { const char *name; void *fn; } g_media[] = {
 
     M("AHardwareBuffer_acquire", klm_AHardwareBuffer_acquire),
     M("AHardwareBuffer_release", klm_AHardwareBuffer_release),
+    M("AHardwareBuffer_describe", klm_AHardwareBuffer_describe),
 
     M("ATrace_beginSection", klm_ATrace_beginSection),
     M("ATrace_endSection",   klm_ATrace_endSection),

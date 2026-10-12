@@ -71,13 +71,18 @@
 			<key>UISceneSessionRoleImmersiveSpaceApplication</key>
 			<array>
 				<dict>
-					<!-- Mixed, matching the app's default (Immersive.mixed).
+					<!-- The DEFAULT target's style, and only its default.
 					     Declaring one style here and selecting another in
 					     SwiftUI is a mismatch worth avoiding: it is not obviously
 					     fatal, but this file's whole reason for existing is that
 					     scene declarations which disagree with the app fail
-					     silently. KL_FULL=1 selects .full at runtime and the
-					     scene accepts both (`in: .mixed, .full`). -->
+					     silently. KL_FULL selects at runtime and the scene
+					     accepts both (`in: .mixed, .full`).
+					     A target that wants the other one says so in
+					     targets.py ("immersion"); gen_xcodeproj.py then rewrites
+					     this key into build/Info-<target>.plist and builds
+					     against that, so this file stays the mixed one and no
+					     other target's build is disturbed. superhot is full. -->
 					<key>UISceneInitialImmersionStyle</key>
 					<string>UIImmersionStyleMixed</string>
 				</dict>

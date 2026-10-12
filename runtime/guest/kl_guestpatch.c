@@ -318,6 +318,107 @@ static const kl_gp_word k_vrc_ospstorm[] = {
 };
 
 // ---------------------------------------------------------------------------
+// superhot-menu-scale — SUPERHOT VR's pause menu stops doubling the render size
+//
+// The game's own code, read out of the APK (libil2cpp.so, Assembly-CSharp):
+// PauseMenuSystem::Update -> SetActive -> DoSetActive's MoveNext (0xdd45fc),
+// whose opening arm is
+//
+//   dd4774  bl   0xdd3420           // PauseMenuSystem::get_BaseResolution
+//   dd4778  fadd s0, s0, s0         // <-- the doubling, and only this
+//
+// while the closing arm sets the base resolution undoubled. Nop the fadd and
+// the menu press stops reconfiguring the eye textures at all, which is what
+// lets the eye cap stay at 4032 through the transition (the phase-14 ladder
+// was measuring this doubling, not the steady state).
+//
+// Measured against superhot/lib/arm64-v8a/libil2cpp.so from the QA APK
+// (51,398,456 bytes, Unity 2018.4.26f1); the expect word is the guard — any
+// other build's libil2cpp is skipped and named, not patched. SUPERHOT's is
+// the only libil2cpp in this tree with fadd s0,s0,s0 at 0xdd4778, so the row
+// is inert for every other target.
+static const kl_gp_word k_sh_menuscale[] = {
+    { 0xdd4778, 0x1e202800, 0xd503201f, "fadd s0, s0, s0 -> nop  (menu opens at gameplay resolution)" },
+};
+
+// ---------------------------------------------------------------------------
+// Half-Life 2 VR (HL2VR-Standalone-0.92, libsourcevr.so). The eye buffer is
+// sized as `vr_eye_scale` percent of a hardcoded Quest 3 2064x2208, read from
+// SharedPreferences "mod" — and then WHITELISTED: 50, 75, 100 or 114, anything
+// else becomes 100 (launch #14, 2026-08-26: mod.xml said 200, the log said
+// `100% of Quest 3 native`). The runtime max it prints is 10240x8214, so the
+// clamp is the launcher's idea of a Quest's budget, not the runtime's. On this
+// device the game peaks at 2.2 GB of 8.2 and is smooth at 100%, so take the
+// value as written:
+//
+//   0xecc8  mov w8, #50
+//   0xeccc  cmp w0, #75
+//   0xecd8  ccmp w0, w8, #4, ne          ; == 50 ?
+//   0xece0  ccmp w0, w23, #4, ne         ; == 100 ?
+//   0xecec  ccmp w0, w8(=114), #4, ne    ; == 114 ?
+//   0xecf0  csel w8, w0, w23, eq         -> mov w8, w0   ; any percent
+//   0xecf8  str w8, [x19, #0x1e4]
+//
+// KL_SRCENG_EYE_SCALE (kl_sdl.c) picks the number; this row lets it through.
+static const kl_gp_word k_hl2vr_eyescale[] = {
+    { 0xecf0, 0x1a970008, 0x2a0003e8, "csel w8, w0, w23, eq -> mov w8, w0 (vr_eye_scale unclamped)" },
+};
+
+// ---------------------------------------------------------------------------
+// hl2vr-togl-maxtexture — the eye render target stops being halved to 2064x2208
+//
+// Round 14 unclamped `vr_eye_scale` and launch #15 sized everything downstream
+// of libsourcevr correctly: `Eye resolution: 200% of Quest 3 native 2064x2208
+// -> 4128x4416`, `[xr] swapchain 4128x4416` twice, `Source render targets
+// retained: ... size=4128x4416`. And the tester saw the game as a small doubled
+// SQUARE in the bottom-left of each eye, because the picture inside that
+// swapchain was still 2064x2208. The log says so in libsourcevr's own words:
+//
+//   Source pixels sample 0: fbo=42 ... viewport=0,0 2064x2208
+//   Eye 0 ... source target bound=1 texture=114 ... 2064x2208 active=2064x2208
+//
+// libsourcevr creates its eye colour/depth targets itself, at 0xcfd0/0xd00c,
+// with RenderTargetSizeMode RT_SIZE_LITERAL (8) and w/h read from its own
+// fields 0x1d4/0x1d8 — the 4128x4416 it just computed. So the request was
+// right and the ANSWER was halved, which is Source's material system doing
+// what it always does with a texture bigger than the device can hold:
+//
+//   while (w > maxTextureWidth || h > maxTextureHeight) { w >>= 1; h >>= 1; }
+//
+// and togl reports the device's limit as a hardcoded 4096. 4128 is 32 pixels
+// over it, so one halving takes 4128x4416 to exactly 2064x2208 — the number in
+// the log, to the pixel, on both axes.
+//
+// The limit is not a computed value and not a GL query: it is three DWORDs of
+// .rodata that IDirect3D9::GetDeviceCaps copies straight into D3DCAPS9 at
+// libtogl.so 0x35e00 (`ldr q0, [x8, #0xe00]` at 0x79db4, the only reference to
+// the blob in the image):
+//
+//   0x35e00  0x04000400                 ; the field before MaxTextureWidth
+//   0x35e04  0x00001000  = 4096         ; MaxTextureWidth   -> 8192
+//   0x35e08  0x00001000  = 4096         ; MaxTextureHeight  -> 8192
+//   0x35e0c  0x00000400  = 1024         ; MaxVolumeExtent, left alone
+//
+// (The first three DWORDs of the struct are 1, 0, 0x20000000 = D3DDEVTYPE_HAL,
+// adapter 0, D3DCAPS2_DYNAMICTEXTURES, which is how the layout is anchored.)
+// 8192 is the smallest power of two that admits 4128x4416, and it is well
+// inside what ANGLE-Metal actually allows (16384). Two rows are the change;
+// the third and fourth are fingerprint only — they rewrite the words they
+// already hold, so a togl built with different caps is skipped by name rather
+// than corrupted.
+//
+// The cost to watch: the cap is global, so any ART texture over 4096 that was
+// being halved now uploads whole. HL2's own art is 2048 or less and the remix
+// pack is 4096, so nothing should move; `[hb] peak` in launch #16 is the check.
+// `KL_GUEST_PATCH_OFF=hl2vr-togl-maxtexture` is the A/B.
+static const kl_gp_word k_hl2vr_maxtex[] = {
+    { 0x35e00, 0x04000400, 0x04000400, "D3DCAPS9 field before MaxTextureWidth (fingerprint only)" },
+    { 0x35e04, 0x00001000, 0x00002000, "D3DCAPS9.MaxTextureWidth  4096 -> 8192" },
+    { 0x35e08, 0x00001000, 0x00002000, "D3DCAPS9.MaxTextureHeight 4096 -> 8192" },
+    { 0x35e0c, 0x00000400, 0x00000400, "D3DCAPS9.MaxVolumeExtent 1024 (fingerprint only)" },
+};
+
+// ---------------------------------------------------------------------------
 // Liminal (`LiminalSdk.dll` inside libil2cpp.so, Unity 2019.1.10f1 / Oculus
 // Utilities 1.40).
 //
@@ -449,6 +550,15 @@ static const kl_gp_word k_hl2_matqueue_allow[] = {
 };
 
 static const kl_gp_patch k_patches[] = {
+    { "hl2vr-togl-maxtexture", "libtogl.so",
+      "the eye render target keeps the size it was created with instead of being halved past togl's 4096 cap",
+      k_hl2vr_maxtex, sizeof k_hl2vr_maxtex / sizeof *k_hl2vr_maxtex },
+    { "hl2vr-eye-scale", "libsourcevr.so",
+      "vr_eye_scale is taken as written instead of whitelisted to 50/75/100/114",
+      k_hl2vr_eyescale, sizeof k_hl2vr_eyescale / sizeof *k_hl2vr_eyescale },
+    { "superhot-menu-scale", "libil2cpp.so",
+      "the pause menu stops doubling XRSettings.eyeTextureResolutionScale",
+      k_sh_menuscale, sizeof k_sh_menuscale / sizeof *k_sh_menuscale },
     // DISABLED: "hl2-multiview-force2" forced libtogl to generate a MULTIVIEW shader
     // variant for every world shader — Strategy A (make ANGLE-Metal multiview work),
     // which never got past "no usable vertex shader variant". We now commit to

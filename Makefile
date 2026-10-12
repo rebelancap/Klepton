@@ -15,8 +15,11 @@ RUNTIME_INC := -Iruntime -Iruntime/jni -Iruntime/libc -Iruntime/gfx -Iruntime/xr
 CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(RUNTIME_INC)
 # VideoToolbox/CoreMedia/CoreVideo are the video decoder (kl_vtdec.c), and they
 # are in the base LDLIBS rather than on one target because kl_vtdec is in
-# RUNTIME_SHIP — everything that links the runtime needs them.
-LDLIBS  := -lz -framework AudioToolbox \
+# RUNTIME_SHIP — everything that links the runtime needs them. -liconv serves
+# the guest's iconv_open/iconv/iconv_close (the Alyx jailbreak's SDL core imports
+# them); it is a system library on macOS and visionOS alike. CoreAudio is the
+# mic-capture path's device query (kl_audio.c, TARGET_OS_OSX only).
+LDLIBS  := -lz -liconv -framework AudioToolbox -framework CoreAudio \
            -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
            -framework CoreFoundation -framework AVFoundation -framework Foundation
 # The host/ship split is a source-list boundary, not a runtime getenv.
@@ -42,22 +45,25 @@ RUNTIME_JNI := runtime/kl_jni.c \
            runtime/jni/kl_jni_net.c runtime/jni/kl_jni_softinput.c \
            runtime/jni/kl_jni_services.c runtime/jni/kl_jni_io.c \
            runtime/jni/kl_jni_prefs.c runtime/jni/kl_jni_sdl.c \
-           runtime/jni/kl_jni_ue4.c runtime/jni/kl_jni_electra.c runtime/jni/kl_jni_fmod.c runtime/jni/kl_jni_jkxr.c
+           runtime/jni/kl_jni_ue4.c runtime/jni/kl_jni_electra.c runtime/jni/kl_jni_fmod.c runtime/jni/kl_jni_jkxr.c \
+           runtime/jni/kl_jni_haptics.c
 
 RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runtime/libc/kl_shim.c runtime/libc/kl_va.c \
            runtime/libc/kl_va_handlers.c runtime/libc/kl_va_thunks.S \
-           runtime/libc/kl_libc.c runtime/libc/kl_libc_slink.c runtime/libc/kl_pthread.c runtime/kl_dl.c \
+           runtime/libc/kl_libc.c runtime/libc/kl_libc_slink.c runtime/libc/kl_glibc.c runtime/libc/kl_pthread.c runtime/kl_dl.c \
            runtime/guest/kl_ndk.c runtime/kl_x18.c runtime/kl_target.c \
+           runtime/kl_tls.c runtime/kl_tls_thunk.S \
            $(RUNTIME_JNI) \
            runtime/gfx/kl_egl.c runtime/media/kl_opensl.c runtime/media/kl_audio.c runtime/xr/kl_ovrp.c \
            runtime/xr/kl_ovrp_sret.S runtime/gfx/kl_reproject.c runtime/gfx/kl_present.c \
-           runtime/xr/kl_ovrplat.c runtime/xr/kl_openxr.c runtime/media/kl_mediandk.c runtime/media/kl_vtdec.c runtime/media/kl_avdec.m \
+           runtime/xr/kl_ovrplat.c runtime/xr/kl_openxr.c runtime/xr/kl_openvr.c runtime/xr/kl_openvr_input.c runtime/xr/kl_openvr_manifest.c \
+           runtime/media/kl_mediandk.c runtime/media/kl_vtdec.c runtime/media/kl_avdec.m \
            runtime/gfx/kl_vulkan.c \
            runtime/guest/kl_nativeactivity.c runtime/guest/kl_slink.c runtime/guest/kl_ue4.c runtime/guest/kl_obbmap.c \
            runtime/guest/kl_jkxr.c runtime/guest/kl_native.c runtime/guest/kl_sdl2.c \
-           runtime/guest/kl_gles3jni.c runtime/guest/kl_driver.c \
+           runtime/guest/kl_gles3jni.c runtime/guest/kl_driver.c runtime/guest/kl_sdl.c \
            runtime/media/kl_aaudio.c runtime/media/kl_mediaplayer.c \
-           runtime/gfx/kl_glfb.c runtime/gfx/kl_cvmtl.m runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
+           runtime/gfx/kl_glfb.c runtime/gfx/kl_cvmtl.m runtime/gfx/kl_perf.m runtime/gfx/kl_fove.m runtime/gfx/kl_shc.m runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
            runtime/guest/kl_mono.c \
            runtime/guest/kl_il2cpp.c runtime/kl_fault.c runtime/guest/kl_guestpatch.c \
            runtime/guest/kl_guestpoke.c runtime/kl_cacerts.c runtime/media/kl_phonon_hrtf.S \
@@ -80,12 +86,14 @@ RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
 # that measured a build nobody has.
 # kl_phonon_hrtf.S .incbins the SOFA blob, so the data file is a prerequisite
 # of everything too — same missed-FAILURE argument as the generated tables.
-RUNTIME_ALL_HDRS := $(wildcard runtime/*.h) $(wildcard runtime/*/*.h)
+# The .inc files are #included source (kl_vulkan_upstream.inc), so they rebuild
+# their includer the same way.
+RUNTIME_ALL_HDRS := $(wildcard runtime/*.h) $(wildcard runtime/*/*.h) $(wildcard runtime/*/*.inc)
 RUNTIME_HDRS := $(RUNTIME_ALL_HDRS) $(wildcard tests/*.h) \
                 runtime/data/phonon_hrtf_cipic_124.sofa \
                 runtime/data/kl_menu_font.ttf
 
-.PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest
+.PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest jniobj sysv tgkill openvr
 all: build/t_opus
 
 build/t_opus: tests/t_opus.c $(RUNTIME) $(RUNTIME_HDRS)
@@ -158,7 +166,7 @@ LIBS ?= $(TARGET)/lib/arm64-v8a
 # LIBS at another Unity title just works.
 #
 # A `.so` IS NOT NECESSARILY AN ELF, and the discovery has to say so.
-# Some code injections ship config files this way.
+# Some third-party libraries ship non-ELF data files this way.
 guest_elf_libs = $(shell for f in $(1)/*.so; do \
                    head -c4 "$$f" 2>/dev/null | grep -q ELF && echo "$$f"; done)
 GUEST_SOS = $(basename $(notdir $(call guest_elf_libs,$(LIBS))))
@@ -347,6 +355,18 @@ build/t_xrspace: tests/t_xrspace.c $(RUNTIME) $(RUNTIME_HDRS)
 xrspace: build/t_xrspace
 	./build/t_xrspace
 
+# The pose-boundary gate — one head pose per guest frame cycle, and the anchor
+# filed for reprojection equal to it. Round 23: launch #21 measured 1.70 poses
+# per guest frame in gameplay (1.00 in the smooth menu), because Unity's render
+# and sim threads number the same frame differently and the boundary keyed on
+# that number. Seconds; in `make check`.
+build/t_posebound: tests/t_posebound.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_posebound.c $(RUNTIME) $(LDLIBS)
+
+posebound: build/t_posebound
+	./build/t_posebound
+
 # The OpenXR action-surface gate — the same argument as xrspace above,
 # one API family across. A binding decoded to the wrong bit, two hands combined
 # the wrong way, a stale press surviving a controller being put down, an action
@@ -360,6 +380,47 @@ build/t_xrinput: tests/t_xrinput.c $(RUNTIME) $(RUNTIME_HDRS)
 
 xrinput: build/t_xrinput
 	./build/t_xrinput
+
+# The OpenVR runtime gate: kl_openvr's vtables called the way libvr.so calls
+# them (this in x0, slot N), over kl_openxr's real headless session — slot
+# counts, the x8 struct returns, unwidened bools, events at the guest's size,
+# the mailbox, IVRInput over a fixture manifest, and every stub logging its own
+# slot. No guest, no headset; a second, in `make check`.
+build/t_openvr: tests/t_openvr.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_openvr.c $(RUNTIME) $(LDLIBS)
+
+openvr: build/t_openvr
+	./build/t_openvr
+
+# The floor gate. ARKit's world origin sits at the device's own start pose — at
+# EYE level — and every guest that asks for a FloorLevel tracking origin reads
+# the poses we serve as though y=0 were the ground. Pinball FX VR switched
+# origins when its lobby loaded and its camera went into the floor; the same
+# three log lines end on ovrp_GetUserEyeHeight2, which is the number it needed
+# to place that camera and which was an unimplemented name. The fix is two
+# halves of ONE height, and the failure mode when they drift is a correct-looking
+# picture a metre and a half out — which no host boot and no build ever sees.
+# No guest, no headset; milliseconds, in `make check`.
+build/t_ovrpfloor: tests/t_ovrpfloor.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_ovrpfloor.c $(RUNTIME) $(LDLIBS)
+
+ovrpfloor: build/t_ovrpfloor
+	./build/t_ovrpfloor
+
+# Round 16: a platform request that answered 0 and queued no completion was
+# never retired by the guest, and Pinball FX's Exit Table waits for exactly that
+# to drain — forever. Gates the contract a declared-up platform creates: every
+# request id handed out is retired by a message carrying it, the refusal is
+# reported as an error that carries no payload of any kind, and the platform-DOWN
+# path is unchanged. See tests/t_ovrplat.c. No guest, no headset; microseconds.
+build/t_ovrplat: tests/t_ovrplat.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_ovrplat.c $(RUNTIME) $(LDLIBS)
+
+ovrplat: build/t_ovrplat
+	./build/t_ovrplat
 
 # The on-screen keyboard. A guest that wants text hands the job to the platform
 # and waits; here a FRONTEND is the platform, and every way that seam can be
@@ -375,6 +436,33 @@ build/t_softinput: tests/t_softinput.c $(RUNTIME) $(RUNTIME_HDRS)
 softinput: build/t_softinput
 	./build/t_softinput
 
+# The JNI object model: a jobject a binding caches in a host static must outlive
+# the local frame it was built in, and every spelling Unity's C# produces for a
+# call — return erased to Object, argument erased to Object, or both — must
+# resolve to the one binding and answer with the same tagged object. Both halves
+# were boots that aborted hundreds of lines from the binding at fault (see
+# kl_jni.c's kl_jni_object_lifetime_selftest). No guest, no window, no headset;
+# milliseconds, in `make check`.
+build/t_jniobj: tests/t_jniobj.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_jniobj.c $(RUNTIME) $(LDLIBS)
+
+jniobj: build/t_jniobj
+	./build/t_jniobj
+
+# UE's virtual keyboard — the same gate for the other engine's keyboard. Its
+# failure mode is worse than the soft input's: Pinball FX VR ABORTED on the
+# missing AndroidThunkJava_ShowVirtualKeyboardInput, and the obvious fix (a
+# no-op) trades the abort for an editor the engine holds open forever, which
+# produces no crash, no log line and no .ips. No guest, no window, no headset;
+# milliseconds, in `make check`.
+build/t_uevk: tests/t_uevk.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_uevk.c $(RUNTIME) $(LDLIBS)
+
+uevk: build/t_uevk
+	./build/t_uevk
+
 build/t_variadic: tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME) $(LDLIBS)
@@ -389,6 +477,15 @@ vatest: build/t_variadic
 # Objective-C because it has to *create* MTLTextures. Host-only and diagnostic —
 # named here and never in RUNTIME_SHIP, which is why the shipping runtime stays
 # plain C and takes an opaque texture pointer.
+# QuakeQuest's front door. No viewer and no Metal provider, unlike m_boot: this
+# target's job is to reach OpenXR and stop, and nothing on that path presents a
+# frame. That is also why it needs neither SDL3 nor the Metal frameworks — keep
+# it that way, so a broken SDL install cannot block the OpenXR work.
+build/m_quake: mains/m_quake.c $(RUNTIME) runtime/klepton.h runtime/kl_jni.h \
+               runtime/xr/kl_openxr.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ mains/m_quake.c $(RUNTIME) $(LDLIBS)
+
 build/m_boot: mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c \
               runtime/gfx/kl_view_mtl.m $(RUNTIME_HDRS)
 	@mkdir -p build
@@ -435,6 +532,14 @@ build/t_x18: tests/t_x18.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_x18.c runtime/kl_x18.c runtime/kl_env.c
 
+# klepton-ld's SPLIT veneer placement (two pools, per-slice choice, halving that
+# keeps odd-word tails instruction-aligned) on a synthetic sparse library wider
+# than two `b` windows — no host tree carries one (Deadpool's libUE4 is the real
+# case). Also run by `make check`.
+.PHONY: ldsplit
+ldsplit: build/klepton-ld
+	python3 tests/t_ld_split.py build/klepton-ld build/ldsplit
+
 x18: build/t_x18
 	python3 tools/check_x18.py build/t_x18 $(foreach f,$(GUEST_LIBS),$(LIBS)/$(f).so)
 
@@ -459,6 +564,81 @@ build/t_bcast: tests/t_bcast.c $(RUNTIME) $(RUNTIME_HDRS)
 
 bcast: build/t_bcast
 	./build/t_bcast
+
+# The semaphore slot table — the ~80-second fuse under every worn session.
+# The shims bind through the guest symbol table rather than a header, so the
+# test declares the handful it drives and links the runtime for the rest.
+build/t_sem: tests/t_sem.c $(RUNTIME) runtime/klepton.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_sem.c $(RUNTIME) $(LDLIBS)
+
+sem: build/t_sem
+	./build/t_sem
+
+# SysV IPC emulated in the glibc personality (visionOS has none: SIGSYS); the
+# same tables answer a bionic guest's sem*/shm* (kl_sysv_lookup).
+build/t_sysv: tests/t_sysv.c $(RUNTIME) runtime/libc/kl_glibc.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_sysv.c $(RUNTIME) $(LDLIBS)
+
+sysv: build/t_sysv
+	./build/t_sysv
+
+# tgkill/tkill(tid, 0) liveness probes answered by the raw-syscall door (Alyx's
+# libvideo reclaims a "dead" thread's state on a refusal — round N11).
+# The Unity `Loading:` banner parser behind KL_TRIM_ON_LOAD (HARD BULLET launch 3).
+build/t_trimload: tests/t_trimload.c $(RUNTIME) runtime/klepton.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_trimload.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: trimload
+trimload: build/t_trimload
+	./build/t_trimload
+
+build/t_tgkill: tests/t_tgkill.c $(RUNTIME)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_tgkill.c $(RUNTIME) $(LDLIBS)
+
+tgkill: build/t_tgkill
+	./build/t_tgkill
+
+# The foveation tests (kl_fove.m, docs/FOVEATION.md): profile maths and tables,
+# plus GPU self-tests that skip themselves without a Metal device.
+build/t_fove: tests/t_fove.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_fove.c $(RUNTIME) $(LDLIBS)
+
+# kl_shc's record file under kills: torn tails at every byte,
+# short magic, lying lengths. File I/O only; milliseconds.
+build/t_shc: tests/t_shc.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_shc.c $(RUNTIME) $(LDLIBS)
+
+# The MUTEX slot table — t_sem's twin, one table over. Same shape of bug (a
+# destroy that returned the slot to nobody), and the same reason for a gate:
+# when this one filled, the guest froze at 100% CPU with no crash and no log.
+build/t_mtx: tests/t_mtx.c $(RUNTIME) runtime/klepton.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_mtx.c $(RUNTIME) $(LDLIBS)
+
+mtx: build/t_mtx
+	./build/t_mtx
+
+# The TLSDESC resolver on its own: no guest, no image, just the descriptor and
+# the register contract. It links the two TLS files alone because that is the
+# whole subsystem — nothing else in the runtime is involved in answering one.
+build/t_tls: tests/t_tls.c tests/t_tls_call.S runtime/kl_tls.c runtime/kl_tls_thunk.S runtime/kl_tls.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Iruntime -o $@ tests/t_tls.c tests/t_tls_call.S runtime/kl_tls.c runtime/kl_tls_thunk.S
+
+# The x18 mrs/ldr race, manufactured so the recovery can be checked somewhere
+# other than a headset. Needs the real handler, so it links the runtime.
+build/t_x18race: tests/t_x18race.c $(RUNTIME) runtime/kl_x18.h runtime/kl_fault.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_x18race.c $(RUNTIME) $(LDLIBS)
+
+x18race: build/t_x18race
+	./build/t_x18race
 
 # ...and the preemptive version of the same question: what OTHER system
 # registers do these guests touch, and which of them may EL0 not execute?
@@ -540,24 +720,58 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps
+check: build/t_opus build/t_variadic build/t_tls build/t_load build/t_il2cpp build/m_boot build/t_audio build/t_haptics build/t_hevc build/t_xrspace build/t_posebound build/t_xrinput build/t_openvr build/t_softinput build/t_jniobj build/t_ctr build/t_bcast build/t_fault build/t_glcaps build/t_sem build/t_x18race build/t_mtx build/t_sysv build/t_tgkill build/t_fove build/t_shc build/klepton-ld build/t_trimload build/t_ovrpfloor build/t_uevk build/t_ovrplat
 	@echo "=== variadic ABI ===" && ./build/t_variadic
+	@./build/t_tls > build/tls.log 2>&1 || { cat build/tls.log; exit 1; }
+	@head -1 build/tls.log && tail -1 build/tls.log
+	@./build/t_sem > build/sem.log 2>&1 || { cat build/sem.log; exit 1; }
+	@grep -E '=== semaphore|highest slot' build/sem.log && tail -1 build/sem.log
+	@./build/t_sysv > build/sysv.log 2>&1 || { cat build/sysv.log; exit 1; }
+	@grep -E '=== SysV' build/sysv.log && tail -1 build/sysv.log
+	@./build/t_tgkill > build/tgkill.log 2>&1 || { cat build/tgkill.log; exit 1; }
+	@grep -E '=== tgkill' build/tgkill.log && tail -1 build/tgkill.log
+	@./build/t_trimload > build/trimload.log 2>&1 || { cat build/trimload.log; exit 1; }
+	@head -1 build/trimload.log && tail -1 build/trimload.log
+	@./build/t_fove > build/fove.log 2>&1 || { cat build/fove.log; exit 1; }
+	@head -1 build/fove.log && tail -1 build/fove.log
+	@./build/t_shc > build/shc.log 2>&1 || { cat build/shc.log; exit 1; }
+	@head -1 build/shc.log && tail -1 build/shc.log
+	@./build/t_mtx > build/mtx.log 2>&1 || { cat build/mtx.log; exit 1; }
+	@grep -E 'mutex slot table|counter ' build/mtx.log && tail -1 build/mtx.log
+	@./build/t_x18race > build/x18race.log 2>&1 || { cat build/x18race.log; exit 1; }
+	@grep -E '=== x18 mrs' build/x18race.log && tail -1 build/x18race.log
+	@python3 tests/t_ld_split.py build/klepton-ld build/ldsplit > build/ldsplit.log 2>&1 || { cat build/ldsplit.log; exit 1; }
+	@echo "=== klepton-ld SPLIT placement (synthetic 300 MB library) ===" && tail -1 build/ldsplit.log
 	@echo "=== crash reporter ===" && ./build/t_fault
 	@echo "=== GL limits vs ANGLE ===" && ./build/t_glcaps vendor/out/Debug
 	@./build/t_hevc > build/hevc.log 2>&1 || { cat build/hevc.log; exit 1; }
 	@grep -E '=== HEVC|30 access units' build/hevc.log && tail -1 build/hevc.log
 	@./build/t_xrspace > build/xrspace.log 2>&1 || { cat build/xrspace.log; exit 1; }
 	@head -2 build/xrspace.log && tail -1 build/xrspace.log
+	@./build/t_posebound > build/posebound.log 2>&1 || { cat build/posebound.log; exit 1; }
+	@grep -E '=== one pose per guest frame' build/posebound.log && tail -1 build/posebound.log
 	@./build/t_xrinput > build/xrinput.log 2>&1 || { cat build/xrinput.log; exit 1; }
 	@grep -E '=== OpenXR actions' build/xrinput.log && tail -1 build/xrinput.log
+	@./build/t_openvr > build/openvr.log 2>&1 || { cat build/openvr.log; exit 1; }
+	@grep -E '=== OpenVR runtime' build/openvr.log && tail -1 build/openvr.log
+	@./build/t_ovrpfloor > build/ovrpfloor.log 2>&1 || { cat build/ovrpfloor.log; exit 1; }
+	@head -1 build/ovrpfloor.log && tail -1 build/ovrpfloor.log
+	@./build/t_ovrplat > build/ovrplat.log 2>&1 || { cat build/ovrplat.log; exit 1; }
+	@grep -E 'retires every request|EVERY refused request' build/ovrplat.log && tail -1 build/ovrplat.log
 	@./build/t_softinput > build/softinput.log 2>&1 || { cat build/softinput.log; exit 1; }
 	@head -1 build/softinput.log && tail -1 build/softinput.log
+	@./build/t_jniobj > build/jniobj.log 2>&1 || { cat build/jniobj.log; exit 1; }
+	@head -1 build/jniobj.log && tail -1 build/jniobj.log
+	@./build/t_uevk > build/uevk.log 2>&1 || { cat build/uevk.log; exit 1; }
+	@head -1 build/uevk.log && tail -1 build/uevk.log
 	@./build/t_ctr > build/ctr.log 2>&1 || { cat build/ctr.log; exit 1; }
 	@head -2 build/ctr.log && tail -1 build/ctr.log
 	@./build/t_bcast > build/bcast.log 2>&1 || { cat build/bcast.log; exit 1; }
 	@head -1 build/bcast.log && tail -1 build/bcast.log
 	@./build/t_haptics > build/haptics.log 2>&1 || { cat build/haptics.log; exit 1; }
 	@head -3 build/haptics.log && tail -1 build/haptics.log
+	@./build/t_audio > build/audio.log 2>&1 || { cat build/audio.log; exit 1; }
+	@grep -E '=== audio|RMS error|PCM_EX 48000/2/32 float' build/audio.log && tail -1 build/audio.log
 	@$(MAKE) -s ovrpabi
 # The opus roundtrip is the one gate here that RUNS guest code rather than
 # inspecting it, so it is worth keeping wherever it exists — but libunityopus.so
@@ -803,14 +1017,14 @@ build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
 # a function nothing calls yet.
 build/xros/libklepton.dylib: build/xros/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) -arch arm64 \
-	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
+	   -dynamiclib -o $@ -Wl,-all_load $< -lz -liconv -framework AudioToolbox \
 	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
 	   -framework CoreFoundation -framework AVFoundation -framework Foundation \
 	   -install_name @rpath/libklepton.dylib
 
 build/xrsim/libklepton.dylib: build/xrsim/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) -arch arm64 \
-	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
+	   -dynamiclib -o $@ -Wl,-all_load $< -lz -liconv -framework AudioToolbox \
 	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
 	   -framework CoreFoundation -framework AVFoundation -framework Foundation \
 	   -install_name @rpath/libklepton.dylib
@@ -959,6 +1173,17 @@ reproject: build/t_reproject
 # OVRPlugin entry points AS THE GUEST RESOLVES THEM (through kl_ovrp_sym, so
 # the struct returns go through the real sret thunk), the queue behind them,
 # and the pulses a frontend pulls. Fast and deterministic; part of `check`.
+# The guest's sample format. A float32 guest played as int16 is half-speed
+# static in one ear, and the [sl] log line it produced was indistinguishable
+# from a correct int16 player's — so the gate has to be a test, not a read.
+build/t_audio: tests/t_audio.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_audio.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: audio
+audio: build/t_audio
+	@./build/t_audio
+
 build/t_haptics: tests/t_haptics.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_haptics.c $(RUNTIME) $(LDLIBS)
@@ -966,6 +1191,20 @@ build/t_haptics: tests/t_haptics.c $(RUNTIME) $(RUNTIME_HDRS)
 .PHONY: haptics
 haptics: build/t_haptics
 	@./build/t_haptics
+
+# The block-seam harness. Models the guest's mixer — a copy-callback in front of
+# an asynchronous producer — so the audio path can be measured on host, which is
+# what r15, r16 and r17 each paid a worn launch for: Tetris Effect's own mixer
+# stays silent in the host lab. See tests/t_aaudio.c. Real time, so it takes as
+# many seconds as it is given (20 by default), which is why it is NOT in
+# `check`. It opens the real output device, at +-1 LSB — lit, and inaudible.
+build/t_aaudio: tests/t_aaudio.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_aaudio.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: aaudio
+aaudio: build/t_aaudio
+	@./build/t_aaudio
 
 # ...and the half t_haptics cannot see: whether our implementations agree with
 # the REAL libOVRPlugin.so about which arguments are OUT-parameters. Offline —

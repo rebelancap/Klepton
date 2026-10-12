@@ -23,6 +23,54 @@ kl_image *kl_load_dylib(const char *path);
 // translation exists, else the ELF. Lets the boot chain run mixed while some
 // libraries are still untranslatable. Every guest-library load goes through it.
 kl_image *kl_load_auto(const char *path);
+// A GLIBC guest's translated dylib (the Alyx payload, linked with no host): the
+// same load, with imports bound in glibc's order — the glibc personality first,
+// then interposes, the other glibc images, the kept bionic ones, and a replaced
+// soname's runtime module. See sym_value_glibc in kl_image.c.
+kl_image *kl_load_dylib_glibc(const char *path);
+// Map a translation and read its symbol table WITHOUT relocating anything: a
+// replaced library's real file (libopenvr_api, libsteam_api, libSDL2), kept so
+// its export list can name what belongs to it. Never register it, never call
+// into it — its GOT is unrelocated.
+kl_image *kl_map_dylib_unbound(const char *path);
+// ...and the other half: relocate an image it mapped (glibc mode). 0, or -1
+// with kl_error(). Mapping a closure first and binding it second is glibc's own
+// order — it is what lets a NEEDED cycle bind both ways.
+int         kl_bind_mapped(kl_image *img);
+// The file an undefined import's symbol version names (`x@GLIBC_2.34` ->
+// "libc.so.6"); NULL when the import is unversioned.
+const char *kl_import_version_file(const kl_image *img, const char *name);
+int         kl_image_is_glibc(const kl_image *img);
+const char *kl_image_soname(const kl_image *img);           // DT_SONAME or NULL
+const char *const *kl_image_needed(const kl_image *img, unsigned *count);
+// The TP offset of the image's static TLS block (R_AARCH64_TLS_TPREL64), 0 if none.
+int64_t     kl_image_static_tls(const kl_image *img);
+// Every import a glibc image binds, as it binds (one call per relocation of an
+// UNDEFINED symbol): `provider` is "glibc", "interpose", the providing image's
+// soname, a replaced soname's module (kl_glibc_claim_sym), or NULL when
+// unresolved. For the native door's
+// census; NULL (the default) costs nothing.
+typedef void (*kl_bind_observer)(kl_image *img, const char *name, const char *provider,
+                                 uint64_t value, int weak);
+void kl_set_bind_observer(kl_bind_observer fn);
+// The lookup scope for a glibc image's name (both its imports and, through
+// symbol preemption, its own default-visibility definitions): the first
+// definition, and the providing image's label in `who`. Unset, every
+// registered glibc image in load order; the native Alyx door installs ld.so's
+// scopes (global, then the image's dlopen group).
+typedef void *(*kl_glibc_scope_fn)(kl_image *img, const char *name, const char **who);
+void kl_set_glibc_scope(kl_glibc_scope_fn fn);
+// ...and the last word on a STRONG import nothing answered: a named stand-in
+// (or NULL for the ordinary unresolved stub that aborts by name).
+typedef void *(*kl_glibc_unresolved_fn)(kl_image *img, const char *name, const char **who);
+void kl_set_glibc_unresolved(kl_glibc_unresolved_fn fn);
+// DT_INIT and DT_INIT_ARRAY, for a loader that runs them itself (glibc order,
+// with argc/argv/envp). Either may be NULL/0.
+void kl_image_initializers(const kl_image *img, void (**init)(void),
+                           void (***array)(void), size_t *count);
+int  kl_image_symbolic(const kl_image *img);      // DT_SYMBOLIC / DF_SYMBOLIC
+// The registered interposer for `name`, or NULL.
+void *kl_interpose_lookup(const char *name);
 
 // Could kl_load_auto load a guest library at `path`? Ask this — never
 // stat(path) — whenever answering an existence question about a guest library on
@@ -57,7 +105,20 @@ size_t     kl_span(kl_image *img);
 // Stats, for tests and the load gate.
 typedef struct {
     unsigned relative, abs64, glob_dat, jump_slot;   // relocations applied
+    // R_AARCH64_TLSDESC descriptors pointed at our resolver (S0.1b). Counted
+    // apart from the others because it is the one relocation that installs a
+    // CALL rather than an address: every access to that variable, forever,
+    // goes through runtime/kl_tls_thunk.S.
+    unsigned tlsdesc;
+    unsigned tprel;                                  // R_AARCH64_TLS_TPREL64 (static TLS)
+    // glibc mode: relocations against a DEFINED STB_GNU_UNIQUE symbol that bound
+    // to an earlier image's definition rather than this image's own copy.
+    unsigned unique_shared;
+    // glibc mode: relocations against a symbol the image DEFINES that bound to
+    // an earlier definition in the lookup scope (ld.so's symbol preemption).
+    unsigned preempted;
     unsigned tls_rewrites;                           // mrs tpidr_el0 -> tpidrro_el0
+    unsigned tp_writes;                              // msr tpidr_el0, xN -> nop
     // ...and TLS sites the data test refused. Counted apart from
     // x18_data_words because the two mean opposite things: a refused x18 site
     // costs nothing, a refused TLS site leaves the guest reading a register the
@@ -99,15 +160,23 @@ const char *const *kl_weak_imports(kl_image *img, unsigned *count);
 // ---- shim ----
 // Resolve a bionic/NDK import by name. Returns NULL if unimplemented.
 void *kl_shim_lookup(const char *name);
+// A raw process_vm_readv on this process (kl_libc.c) hands each copied chunk
+// to this filter (remote address, local copy, length). One door at a time.
+void  kl_set_selfread_filter(void (*fn)(const void *remote, void *local, size_t n));
 // Install the bionic stack-guard canary into Darwin TSD slot 5 for this thread.
 // Must be called on every thread that will execute guest code.
 void  kl_thread_init(void);
+// Run `fn` at the end of every later kl_thread_init (idempotent per fn; 4 max).
+void  kl_thread_init_hook(void (*fn)(void));
 // Restore default fatal-signal disposition and flush stdio. Call before abort()
 // in any diagnostic path: the guest installs handlers that expect a Linux
 // ucontext_t, and they swallow our abort and hang instead of dying.
 void  kl_fatal_prepare(void);
 // Map a guest FILE* (an offset into our fake bionic __sF block) to a host stream.
 FILE *kl_host_file(void *guest);
+// A second guest FILE * vocabulary (kl_glibc.c's glibc-shaped streams): `fn`
+// maps a pointer it made to its host stream and answers NULL for any other.
+void  kl_host_file_resolver(FILE *(*fn)(void *guest));
 
 // Build a code stub that tail-calls `handler` with `name` in x0, so whatever the
 // guest reached for names itself instead of arriving as one anonymous abort.
@@ -127,9 +196,41 @@ kl_image *kl_find_image(const char *soname);
 kl_image *kl_load_recursive(const char *path);
 // Read a file's DT_NEEDED sonames without loading it (kl_image.c).
 int       kl_list_needed(const char *path, char names[][128], int max);
+// ...and DT_SONAME / DT_RUNPATH (DT_RPATH when no RUNPATH) beside it; either
+// buffer may be NULL, `cap` is each one's size. Returns the NEEDED count, -1 if
+// the file cannot be read.
+int       kl_list_dynamic(const char *path, char names[][128], int max,
+                          char *soname, char *runpath, size_t cap);
+
+// Every guest library the bundle's translations carry, as .so names. The device
+// half of "list the guest libdir": with translations embedded, the ELF tree is
+// not in the bundle at all, so a guest whose library set is the WHOLE directory
+// (rather than a named chain) has nothing to enumerate. Returns the count.
+unsigned  kl_list_translations(char names[][64], unsigned max);
+// The file that backs a guest library path, when the bundle carries it as a
+// translation. Existence questions asked ON the guest's behalf go through
+// kl_can_load; this is for the ones that need the file itself. Returns 1 and
+// fills `out` on a hit, 0 otherwise.
+int       kl_library_file(const char *path, char *out, size_t cap);
 // Search every registered guest image for an export (kl_dl.c); used by the
 // loader's import binding after the shim misses.
 void     *kl_guest_sym_global(const char *name);
+// The same search restricted to glibc images (glibc=1) or bionic ones (0), in
+// registration order; `soname_out` names the image that answered.
+void     *kl_guest_sym_ordered(const char *name, int glibc, const char **soname_out);
+// A glibc image's DT_NEEDED soname that a runtime module REPLACES (kl_dl.c's
+// claims table): the module's owner label, or NULL when nothing claims it.
+const char *kl_glibc_soname_claim(const char *soname);
+// ...and that module's answer for `name`, for the claims that have a module
+// (libvulkan -> kl_vulkan, libopenxr_loader -> kl_openxr, libopenvr_api ->
+// kl_openvr, and whatever a port provides). `who_out` is
+// the module's owner label on a hit.
+void     *kl_glibc_claim_sym(const char *soname, const char *name, const char **who_out);
+// A port's own module for a claimed soname (hla: kl_steamapi for
+// libsteam_api.so, its kept SDL2 for libSDL2*): `owner` relabels the row when
+// non-NULL. Before the images that need it are bound. -1 when no row claims it.
+int       kl_glibc_claim_provide(const char *soname, const char *owner,
+                                 void *(*sym)(const char *));
 // The image's program headers, as mapped. Every guest lib's first PT_LOAD maps
 // file offset 0 at vaddr 0, so the phdr array is live at base + e_phoff and the
 // load bias is simply the base. This is what dl_iterate_phdr hands the guest's
@@ -151,6 +252,9 @@ void kl_dl_report_images(FILE *f);
 // it; returns `path` unchanged otherwise. Every guest file entry point goes
 // through this — Unity reads its CPU and memory configuration out of procfs.
 const char *kl_guest_path(const char *path, char *buf, size_t cap);
+// What the synthetic /proc/self/exe names (a symlink to a guest path). A door
+// that knows the guest's executable says so; unset, the entry is absent.
+void kl_proc_set_exe(const char *guest_path);
 // Register the APK -> unpacked-tree mapping for raw "<apk>/assets/..." opens
 // (split assets). See the implementation comment in kl_libc.c.
 void kl_guest_path_map(const char *apk, const char *unpacked_dir);
@@ -174,6 +278,22 @@ void kl_madv_report(void);
 void kl_mem_pressure_init(void);
 void kl_mem_pressure_poll(void);
 void kl_mem_pressure_fire(const char *why);
+// Trim before a scene load (KL_TRIM_ON_LOAD=1). Unity logs `Loading:<scene>`
+// when a scene load starts, and on HARD BULLET the next scene is loaded on top
+// of the old one (+700-750 MB within a second — round 26's Vulkan OOM) — far
+// too fast for the edge-triggered OS pressure door. kl_mem_scene_load is called
+// by the guest-log funnel on whatever guest thread logged the banner and only
+// RECORDS the request; kl_mem_pressure_poll (the thread the trim door is
+// already knocked from) delivers it, so the guest is never re-entered from
+// inside its own __android_log_print.
+void kl_mem_scene_load(const char *scene);
+// KL_TRIM_ON_LOAD read once (default 0); the log doors format a Unity line
+// for kl_mem_log_banner only when it is on.
+int  kl_mem_trim_on_load(void);
+void kl_mem_log_banner(const char *tag, const char *msg);
+// `Loading:<scene>` parser (trailing newline/whitespace stripped): 0 = not a
+// banner, 1 = named load, 2 = bare end marker. Unit-tested by t_trimload.
+int kl_unity_load_banner(const char *msg, char *scene, size_t n);
 void kl_mem_report(void);
 
 // The budget and what is left of it, for the other doors a guest asks the same
@@ -189,6 +309,12 @@ int kl_errno_from_linux(int e);
 
 // KL_TRACE_FS reporting for guest file operations (see kl_libc.c).
 void kl_fs_trace_open(const char *path, int flags, int fd);
+// The inverse of kl_guest_path: a host path in the guest's own spelling, for
+// the one libc call that hands a path back OUT (getcwd).
+const char *kl_host_path_as_guest(const char *host, char *buf, size_t cap);
+// The guest's own spelling of its working directory, remembered at chdir so
+// getcwd can hand back what the guest asked for rather than the host's layout.
+void kl_guest_cwd_note(const char *guest_path);
 
 // A diagnostic's view of the guest's file operations, so RUNTIME_SHIP does not
 // have to know that RUNTIME_DIAG exists. NULL unless something installs one;
@@ -231,6 +357,10 @@ void kl_shim_set_guest_gl(kl_image *img);
 // mutex and from where it was locked. Called from t_boot's fault handler so
 // a hang names the contested mutex's owner, not just its waiters.
 void kl_pthread_report(FILE *out);
+// Guest (Linux) signal number / sigset -> Darwin. One swapped pair,
+// SIGUSR2 <-> SIGSYS; everything else passes through. See kl_libc.c.
+int      kl_sig_to_darwin(int linux_sig);
+uint64_t kl_sigmask_to_darwin(uint64_t linux_mask);
 
 // XR_KHR_android_thread_settings (kl_pthread.c): raise a guest-flagged
 // scheduling-critical thread to USER_INTERACTIVE QoS so a streaming guest's

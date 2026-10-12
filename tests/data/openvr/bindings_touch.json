@@ -1,0 +1,39 @@
+{
+  "controller_type": "oculus_touch",
+  "bindings": {
+    "/actions/default": {
+      "poses": [
+        { "output": "/actions/default/in/handposeleft", "path": "/user/hand/left/pose/raw" },
+        { "output": "/actions/default/in/handposeright", "path": "/user/hand/right/pose/raw" }
+      ],
+      "haptics": [
+        { "output": "/actions/default/in/hapticvibration", "path": "/user/hand/left/output/haptic" },
+        { "output": "/actions/default/in/hapticvibration", "path": "/user/hand/right/output/haptic" }
+      ],
+      "sources": [
+        { "path": "/user/hand/right/input/trigger", "mode": "trigger",
+          "inputs": { "pull": { "output": "/actions/default/in/triggerpull" },
+                      "click": { "output": "/actions/default/in/fire" } },
+          "parameters": { "click_activate_threshold": "0.8", "click_deactivate_threshold": "0.7" } }
+      ]
+    },
+    "/actions/move": {
+      "sources": [
+        { "path": "/user/hand/left/input/joystick", "mode": "joystick",
+          "inputs": { "position": { "output": "/actions/move/in/move" } },
+          "parameters": { "deadzone_pct": "10", "maxzone_pct": "90" } },
+        { "path": "/user/hand/right/input/a", "mode": "button",
+          "inputs": { "click": { "output": "/actions/move/in/jump" } } },
+        { "path": "/user/hand/right/input/joystick", "mode": "dpad",
+          "inputs": { "west": { "output": "/actions/move/in/turnleft" } },
+          "parameters": { "sub_mode": "touch", "deadzone_pct": "50" } }
+      ]
+    },
+    "/actions/dev": {
+      "sources": [
+        { "path": "/user/hand/left/input/y", "mode": "button",
+          "inputs": { "click": { "output": "/actions/dev/in/togglemenu" } } }
+      ]
+    }
+  }
+}

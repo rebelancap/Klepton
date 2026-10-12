@@ -526,6 +526,20 @@ static klj_val klj_Context_registerReceiver(void *env, void *self, const klj_val
     return (klj_val){.l = obj};
 }
 
+// ...and the other half of the pair, per the family rule: registerReceiver
+// above keeps nothing (nothing here broadcasts), so there is nothing to remove.
+// Bound because a guest that registers on resume unregisters on pause, and an
+// unimplemented call is fatal here. (gorn2-pre-fove-cross-1009 e9f13909 — the
+// one binding of that commit driver did not already carry.)
+static klj_val klj_Context_unregisterReceiver(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("Context.unregisterReceiver() — nothing was ever registered to "
+                "unregister");
+    return (klj_val){.j = 0};
+}
+
 // Intent.getIntExtra(key, default). Only the battery Intent above carries any,
 // and only the three libunity actually reads; everything else gets the caller's
 // own default, which is exactly what Android returns for an absent extra.
@@ -830,6 +844,133 @@ static klj_val klj_List_get(void *env, void *self, const klj_val *a, int n) {
     int         i = n > 0 ? (int)a[0].j : -1;
     if (!l || i < 0 || i >= l->count) return (klj_val){.l = NULL};
     return (klj_val){.l = l->items[i]};
+}
+
+// ---- a mutable java/util/HashMap ----
+// The List above is a view over contents WE chose. A HashMap is the opposite
+// case: the guest constructs an empty one and fills it — a crash reporter's tag
+// bag, an analytics context map — so this one needs storage of its own. Linear
+// scan over a growable vector of pairs, in the shape klj_pref_set already uses
+// for the same job: at the handful of entries these maps carry, hashing buys
+// nothing measurable and costs a second structure to keep coherent.
+//
+// Deliberately NOT bound to the java/util/Map family in kl_jni_prefs.c. That
+// one is a read-only view over a klj_pref_set, and it reads `data` without a
+// type check — passing a HashMap into Map.entrySet() would walk our pairs as
+// preferences. A guest that needs Map-typed access to one of these gets an
+// honest abort instead of a misread, and that seam can be built when something
+// actually asks for it.
+typedef struct { void *key, *val; } klj_map_pair;
+typedef struct { klj_map_pair *v; unsigned n, cap; } klj_map;
+
+static void klj_map_free(void *p) {
+    klj_map *m = p;
+    if (!m) return;
+    free(m->v);
+    free(m);
+}
+// The destructor doubles as the type tag, the way klj_locale_of does it: a
+// HashMap method reached on some other object's `data` returns empty rather
+// than reinterpreting whatever payload is there.
+static klj_map *klj_map_of(void *self) {
+    klj_object *o = klj_as_object(self);
+    return (o && o->destroy == klj_map_free) ? (klj_map *)o->data : NULL;
+}
+
+// A real equals(), not identity. The keys that arrive here are Strings, and two
+// distinct jstrings spelling the same text ARE one key in Java — comparing by
+// pointer would silently give the map two entries under that name and make
+// get() miss the one just put. Everything else falls back to identity, which is
+// exactly what java/lang/Object.equals does.
+static int klj_map_eq(void *a, void *b) {
+    if (a == b) return 1;
+    klj_object *x = klj_as_object(a), *y = klj_as_object(b);
+    if (!x || !y) return 0;
+    if (strcmp(x->cls, KLJ_CLASS_STRING) || strcmp(y->cls, KLJ_CLASS_STRING)) return 0;
+    return x->data && y->data && strcmp(x->data, y->data) == 0;
+}
+static klj_map_pair *klj_map_find(klj_map *m, void *key) {
+    for (unsigned i = 0; m && i < m->n; i++)
+        if (klj_map_eq(m->v[i].key, key)) return &m->v[i];
+    return NULL;
+}
+
+// HashMap(int) and HashMap(int,float) are the same map — initial capacity and
+// load factor are performance hints with nothing observable behind them, so all
+// three constructors land here. klj_class_name(clazz) rather than a literal, so
+// a sibling class that wants the same behaviour can bind this unchanged.
+static klj_val klj_HashMap_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    void       *obj = kl_jni_new_object(klj_class_name(clazz));
+    klj_object *o   = klj_as_object(obj);
+    o->data    = calloc(1, sizeof(klj_map));
+    o->destroy = klj_map_free;
+    return (klj_val){.l = obj};
+}
+
+// Stored keys and values are PINNED. A Java HashMap holds a strong reference,
+// and the jobjects arriving at put() are ordinarily locals — without the pin
+// the next PopLocalFrame retires them and a later get() hands back a pointer
+// whose magic is zero, which surfaces far away as "GetObjectClass on an
+// untagged pointer" (the failure klj_host_cache documents). Nothing here ever
+// unpins: a displaced value is handed straight back to the guest as put()'s
+// return, so dropping the map's pin at that moment is the one thing that could
+// retire an object the guest is about to read. These maps are small and live
+// for the process, so the retained slots are not worth the hazard.
+static klj_val klj_HashMap_put(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_map *m = klj_map_of(self);
+    if (!m || n < 2) return (klj_val){.l = NULL};
+    klj_map_pair *p = klj_map_find(m, a[0].l);
+    if (p) {
+        void *old = p->val;
+        p->val = klj_host_cache(a[1].l);
+        return (klj_val){.l = old};
+    }
+    if (m->n == m->cap) {
+        m->cap = m->cap ? m->cap * 2 : 8;
+        m->v   = realloc(m->v, m->cap * sizeof *m->v);
+    }
+    m->v[m->n].key = klj_host_cache(a[0].l);
+    m->v[m->n].val = klj_host_cache(a[1].l);
+    m->n++;
+    return (klj_val){.l = NULL};
+}
+static klj_val klj_HashMap_get(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_map_pair *p = n > 0 ? klj_map_find(klj_map_of(self), a[0].l) : NULL;
+    return (klj_val){.l = p ? p->val : NULL};
+}
+static klj_val klj_HashMap_containsKey(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    return (klj_val){.j = n > 0 && klj_map_find(klj_map_of(self), a[0].l) != NULL};
+}
+// Shift rather than swap-with-last: a LinkedHashMap binding this would need
+// insertion order, and at these sizes the memmove is free either way.
+static klj_val klj_HashMap_remove(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_map      *m = klj_map_of(self);
+    klj_map_pair *p = n > 0 ? klj_map_find(m, a[0].l) : NULL;
+    if (!p) return (klj_val){.l = NULL};
+    void     *old = p->val;
+    unsigned  i   = (unsigned)(p - m->v);
+    memmove(&m->v[i], &m->v[i + 1], (m->n - i - 1) * sizeof *m->v);
+    m->n--;
+    return (klj_val){.l = old};
+}
+static klj_val klj_HashMap_size(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_map *m = klj_map_of(self);
+    return (klj_val){.j = m ? m->n : 0};
+}
+static klj_val klj_HashMap_isEmpty(void *env, void *self, const klj_val *a, int n) {
+    return (klj_val){.j = klj_HashMap_size(env, self, a, n).j == 0};
+}
+static klj_val klj_HashMap_clear(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_map *m = klj_map_of(self);
+    if (m) m->n = 0;
+    return (klj_val){0};
 }
 
 // Unity asks whether its *own* activity is registered under the VR category —
@@ -1137,7 +1278,9 @@ static klj_val klj_Context_getSystemService(void *env, void *self, const klj_val
     static void *cache[sizeof services / sizeof services[0]];
     for (unsigned i = 0; services[i].svc; i++) {
         if (strcmp(services[i].svc, want)) continue;
-        if (!cache[i]) cache[i] = kl_jni_new_object(services[i].cls);
+        // Host-cached: the same service object comes back on every lookup, so
+        // it has to survive the local frame the first lookup happened in.
+        if (!cache[i]) cache[i] = klj_host_cache(kl_jni_new_object(services[i].cls));
         KLJ_LOG("getSystemService(\"%s\") -> %s", want, services[i].cls);
         return (klj_val){.l = cache[i]};
     }
@@ -1213,14 +1356,23 @@ const char *kl_jni_files_dir(void) {
 
     // The APK itself. Unity opens this as a zip to read streaming assets, so it has
 // to be a real file — the unpacked tree under beatsaber/ is not a substitute.
- const char *g_apk_path = "beatsaber.apk";
+ // The host default is beatsaber.apk; KL_APK points a host run at another
+// title's APK (visionOS sets the path explicitly via kl_app.c).
+const char *g_apk_path;
 void kl_jni_set_apk_path(const char *path) { g_apk_path = klj_abspath(path); }
-const char *kl_jni_apk_path(void) { return g_apk_path; }
+static const char *klj_apk_path(void) {
+    if (!g_apk_path) {
+        const char *env = kl_env_str("KL_APK", NULL);
+        g_apk_path = klj_abspath(env && *env ? env : "beatsaber.apk");
+    }
+    return g_apk_path;
+}
+const char *kl_jni_apk_path(void) { return klj_apk_path(); }
 
 static klj_val klj_Context_getPackageCodePath(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    KLJ_LOG("getPackageCodePath() -> %s", g_apk_path);
-    return (klj_val){.l = kl_jni_new_string(g_apk_path)};
+    KLJ_LOG("getPackageCodePath() -> %s", klj_apk_path());
+    return (klj_val){.l = kl_jni_new_string(klj_apk_path())};
 }
 
 // Where the guest's own .so files live. Unity reads this to dlopen further
@@ -1230,7 +1382,7 @@ void kl_jni_set_native_lib_dir(const char *dir) { g_native_lib_dir = klj_abspath
 
 // ApplicationInfo is a plain data holder — Unity reads its fields directly
 // rather than calling accessors, so these are field getters, not methods.
- klj_val klj_appinfo_sourceDir(void)     { return (klj_val){.l = kl_jni_new_string(g_apk_path)}; }
+ klj_val klj_appinfo_sourceDir(void)     { return (klj_val){.l = kl_jni_new_string(klj_apk_path())}; }
  klj_val klj_appinfo_nativeLibraryDir(void) { return (klj_val){.l = kl_jni_new_string(g_native_lib_dir)}; }
  klj_val klj_appinfo_dataDir(void)       { return (klj_val){.l = kl_jni_new_string(kl_jni_files_dir())}; }
 // This APK is not a split install, so there are no additional source dirs. An
@@ -1238,7 +1390,7 @@ void kl_jni_set_native_lib_dir(const char *dir) { g_native_lib_dir = klj_abspath
 // "no splits" to a caller that checks length.
  klj_val klj_appinfo_splitSourceDirs(void) {
     static void *empty;
-    if (!empty) empty = klj_new_array('L', "java/lang/String", 0);
+    if (!empty) empty = klj_host_cache(klj_new_array('L', "java/lang/String", 0));
     return (klj_val){.l = empty};
 }
 
@@ -1417,15 +1569,22 @@ const char *kl_jni_obb_dir(void) {
     static char path[1024];
     if (!*path) {
         // The active target's own obb field, pushed in by whoever configured
-        // the run. Only if nobody did — which does not happen on either the
-        // device or host boot paths — fall back to resolving KL_TARGET, and
-        // finally to "obb". The fallback used to be the ONLY path and was
-        // wrong on device: KL_TARGET is unset there, so a UE4 guest's
-        // Android/obb/<package> collapsed to the default "obb". See
-        // kl_jni_set_obb_rel.
+        // the run (kl_jni_set_obb_rel). Only if nobody did, fall back to the
+        // CURRENT target's row, then to "obb".
+        //
+        // kl_target_CURRENT, not kl_target_resolve(NULL). They differ in exactly
+        // the case that matters: resolve(NULL) reads the KL_TARGET environment
+        // variable and falls back to the table DEFAULT, and a Home-View launch
+        // has no environment at all. For the Unity guests that is the same
+        // string ("obb") and nothing showed; for a UE4 guest it is not, and the
+        // census ran against an empty <files>/obb while the game data sat in
+        // <files>/Android/obb/<package>/. The app sets the active target from
+        // its BUILD-TIME default before any of this runs (kl_app.c's
+        // kl_target_use), so kl_target_current() is right with or without an
+        // environment.
         const char *rel = g_obb_rel;
         if (!*rel) {
-            const kl_target *t = kl_target_resolve(NULL);
+            const kl_target *t = kl_target_current();
             rel = t && t->obb && *t->obb ? t->obb : "obb";
         }
         snprintf(path, sizeof path, "%s/%s", kl_jni_files_dir(), rel);
@@ -1439,8 +1598,11 @@ static klj_val klj_Context_getObbDirs(void *env, void *self, const klj_val *a, i
     (void)env; (void)self; (void)a; (void)n;
     static void *dirs;
     if (!dirs) {
-        dirs = klj_new_array('L', "java/io/File", 1);
-        ((void **)klj_arr(dirs)->data)[0] = klj_new_file(klj_obb_dir());
+        dirs = klj_host_cache(klj_new_array('L', "java/io/File", 1));
+        // The element is pinned separately: an object array owns only its
+        // pointer buffer, so the File inside would otherwise be retired by the
+        // frame it was built in while the cached array kept pointing at it.
+        ((void **)klj_arr(dirs)->data)[0] = klj_host_cache(klj_new_file(klj_obb_dir()));
     }
     return (klj_val){.l = dirs};
 }
@@ -1449,76 +1611,7 @@ static klj_val klj_Context_getObbDir(void *env, void *self, const klj_val *a, in
     return (klj_val){.l = klj_new_file(klj_obb_dir())};
 }
 
-// java/util/HashMap — a real (small, linear) map. Guests build one and hand it
-// to a subsystem that reads it back (Into the Radius populates one right after
-// SentryBridgeJava.init), so a no-op put that drops the entry is not enough: the
-// value has to come back out. Keys are compared by string content when both are
-// Java strings (the common case — tag maps, config maps) and by identity
-// otherwise.
-typedef struct { void *k, *v; } klj_map_pair;
-typedef struct { klj_map_pair *e; unsigned n, cap; } klj_map;
-
-static int klj_map_key_eq(void *a, void *b) {
-    if (a == b) return 1;
-    const char *sa = a ? klj_str(a) : NULL, *sb = b ? klj_str(b) : NULL;
-    if (sa && sb) return strcmp(sa, sb) == 0;
-    return 0;
-}
-static klj_map *klj_map_of(void *self) {
-    klj_object *o = klj_as_object(self);
-    return o ? o->data : NULL;
-}
-static klj_val klj_HashMap_init(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)a; (void)n;
-    if (self) klj_as_object(self)->data = calloc(1, sizeof(klj_map));
-    return (klj_val){.l = self};
-}
-static klj_val klj_HashMap_put(void *env, void *self, const klj_val *a, int n) {
-    (void)env;
-    klj_map *m = klj_map_of(self);
-    if (!m || n < 2) return (klj_val){.l = NULL};
-    for (unsigned i = 0; i < m->n; i++)
-        if (klj_map_key_eq(m->e[i].k, a[0].l)) {
-            void *old = m->e[i].v; m->e[i].v = a[1].l;
-            return (klj_val){.l = old};
-        }
-    if (m->n == m->cap) {
-        m->cap = m->cap ? m->cap * 2 : 8;
-        m->e = realloc(m->e, m->cap * sizeof *m->e);
-    }
-    m->e[m->n].k = a[0].l; m->e[m->n].v = a[1].l; m->n++;
-    return (klj_val){.l = NULL};
-}
-static klj_val klj_HashMap_get(void *env, void *self, const klj_val *a, int n) {
-    (void)env;
-    klj_map *m = klj_map_of(self);
-    if (m && n >= 1)
-        for (unsigned i = 0; i < m->n; i++)
-            if (klj_map_key_eq(m->e[i].k, a[0].l)) return (klj_val){.l = m->e[i].v};
-    return (klj_val){.l = NULL};
-}
-static klj_val klj_HashMap_containsKey(void *env, void *self, const klj_val *a, int n) {
-    (void)env;
-    klj_map *m = klj_map_of(self);
-    if (m && n >= 1)
-        for (unsigned i = 0; i < m->n; i++)
-            if (klj_map_key_eq(m->e[i].k, a[0].l)) return (klj_val){.j = 1};
-    return (klj_val){.j = 0};
-}
-static klj_val klj_HashMap_size(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)a; (void)n;
-    klj_map *m = klj_map_of(self);
-    return (klj_val){.j = m ? (int)m->n : 0};
-}
-
 const klj_binding klj_bind_android[] = {
-    {"java/util/HashMap", "<init>", "()V", klj_HashMap_init},
-    {"java/util/HashMap", "put",
-     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", klj_HashMap_put},
-    {"java/util/HashMap", "get",
-     "(Ljava/lang/Object;)Ljava/lang/Object;", klj_HashMap_get},
-    {"java/util/HashMap", "containsKey", "(Ljava/lang/Object;)Z", klj_HashMap_containsKey},
-    {"java/util/HashMap", "size", "()I", klj_HashMap_size},
 // ICU's time zones, which is where Mono's TimeZoneInfo looks on Android.
     {"android/icu/util/TimeZone", "getDefault", "()Ljava/lang/Object;", klj_TimeZone_getDefault},
     {"android/icu/util/TimeZone", "getID", "()Ljava/lang/String;", klj_TimeZone_getID},
@@ -1545,10 +1638,32 @@ const klj_binding klj_bind_android[] = {
     {"com/vrchat/android/plugin/Info", "getVersionName", "()Ljava/lang/String;", klj_VRCInfo_getVersionName},
     {"android/media/AudioManager", "isStreamMute", "(I)Z", klj_false},
     {"android/media/AudioManager", "isMicrophoneMute", "()Z", klj_false},
+    // isMusicActive() — "is anything playing on STREAM_MUSIC right now", which
+    // apps ask before ducking or before starting their own music. False: this
+    // host has no other Android app to be playing, and the guest's own output
+    // goes to CoreAudio rather than through an Android stream this could see.
+    // UE4 asks it on its way out (FAndroidMisc's audio teardown).
+    {"android/media/AudioManager", "isMusicActive", "()Z", klj_false},
+    // ...and the routing predicates beside it, asked in the same sweep. There is
+    // no Bluetooth SCO link, no wired headset and no A2DP sink on this host —
+    // kl_jni already answers HeadsetReceiver.stateChanged(0) for the same reason
+    // — so false is the truth for all three, not a placeholder.
+    {"android/media/AudioManager", "isBluetoothScoOn", "()Z", klj_false},
+    {"android/media/AudioManager", "isBluetoothA2dpOn", "()Z", klj_false},
+    {"android/media/AudioManager", "isWiredHeadsetOn", "()Z", klj_false},
+    {"android/media/AudioManager", "isSpeakerphoneOn", "()Z", klj_false},
     {"java/lang/ClassLoader", "findLibrary", "(Ljava/lang/String;)Ljava/lang/String;", klj_ClassLoader_findLibrary},
 
     {"android/app/Activity",   "getIntent",  "()Landroid/content/Intent;", klj_Activity_getIntent},
     {"android/app/Activity",   "getApplicationContext", "()Landroid/content/Context;",
+     klj_Activity_getApplicationContext},
+    // The same singleton reached from the Application and from a Context that
+    // was handed round — libEOSSDK.so arrives via ActivityThread and asks the
+    // Application for it, which is the standard route for a native library
+    // that was never given an Activity.
+    {"android/app/Application", "getApplicationContext", "()Landroid/content/Context;",
+     klj_Activity_getApplicationContext},
+    {"android/content/Context", "getApplicationContext", "()Landroid/content/Context;",
      klj_Activity_getApplicationContext},
     {"android/util/DisplayMetrics", "<init>", "()V", klj_generic_init},
     // Unity's ReflectionHelper spells every reference return as Object, so it asks
@@ -1592,6 +1707,8 @@ const klj_binding klj_bind_android[] = {
     {"android/content/Context", "registerReceiver",
      "(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;I)Landroid/content/Intent;",
      klj_Context_registerReceiver},
+    {"android/content/Context", "unregisterReceiver",
+     "(Landroid/content/BroadcastReceiver;)V", klj_Context_unregisterReceiver},
     // The in-headset UI panel — see the WebView block above for why every one
     // of these is accepted and none of them produces a pixel.
     {"android/webkit/WebView", "<init>", "(Landroid/content/Context;)V", klj_WebView_init},
@@ -1673,6 +1790,21 @@ const klj_binding klj_bind_android[] = {
     {"java/util/List", "size",    "()I",                 klj_List_size},
     {"java/util/List", "isEmpty", "()Z",                 klj_List_isEmpty},
     {"java/util/List", "get",  "(I)Ljava/lang/Object;",  klj_List_get},
+
+    {"java/util/HashMap", "<init>", "()V",   klj_HashMap_init},
+    {"java/util/HashMap", "<init>", "(I)V",  klj_HashMap_init},
+    {"java/util/HashMap", "<init>", "(IF)V", klj_HashMap_init},
+    {"java/util/HashMap", "put",
+     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", klj_HashMap_put},
+    {"java/util/HashMap", "get",
+     "(Ljava/lang/Object;)Ljava/lang/Object;", klj_HashMap_get},
+    {"java/util/HashMap", "remove",
+     "(Ljava/lang/Object;)Ljava/lang/Object;", klj_HashMap_remove},
+    {"java/util/HashMap", "containsKey",
+     "(Ljava/lang/Object;)Z", klj_HashMap_containsKey},
+    {"java/util/HashMap", "size",    "()I", klj_HashMap_size},
+    {"java/util/HashMap", "isEmpty", "()Z", klj_HashMap_isEmpty},
+    {"java/util/HashMap", "clear",   "()V", klj_HashMap_clear},
     // No screensaver policy is set, no other app is playing audio, and no
     // InputDevice with a gamepad source is presented — controllers reach this
     // guest through the XR seam, not through android.view.InputDevice.

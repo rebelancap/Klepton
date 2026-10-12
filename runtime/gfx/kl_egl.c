@@ -89,14 +89,23 @@ typedef void *EGLDisplay, *EGLSurface, *EGLContext, *EGLConfig;
 // Opaque handles the guest only ever compares and passes back. Distinct
 // addresses, so a mismatched one is a wrong pointer rather than a silent alias.
 static struct { int initialised; } g_display;
-// The configs we admit to having. Depth is per-config and not a constant, and
-// that is not a detail: libvrlink_scene enumerates with eglGetConfigs and
-// filters the list ITSELF, insisting on RGBA8888 + ES3 + WINDOW|PBUFFER + a
-// depth of EXACTLY 16. With one depth-24 answer for every config it matched
-// nothing, took its no-config branch, and android_main returned before its
-// first GL call — no error, no log, just a thread that was there and then was
-// not. A device that offers only depth-24 configs is an unusual device; every
-// real GLES driver offers both.
+// The configs we admit to having. Depth AND stencil are per-config, and the
+// third and fourth entries are why.
+//
+// libvrlink_scene enumerates with eglGetConfigs and filters the list ITSELF,
+// insisting on RGBA8888 + ES3 + WINDOW|PBUFFER + a depth of EXACTLY 16. With
+// one depth-24 answer for every config it matched nothing, took its no-config
+// branch, and android_main returned before its first GL call — no error, no
+// log, just a thread that was there and then was not.
+//
+// The Oculus mobile sample's selection loop — which QuakeQuest inherits, and
+// which every engine descended from VrCubeWorld shares — does the opposite: it
+// wants EGL_DEPTH_SIZE 0 and EGL_STENCIL_SIZE 0 and matches each attribute
+// **exactly**, because it renders into its own framebuffer with its own depth
+// attachment and wants nothing wasted on the window surface. With only 24/8
+// configs on offer that loop matched nothing and eglCreateContext was handed
+// a NULL config — which surfaced three layers later as a crash inside ANGLE
+// (glGenTextures from xrCreateSwapchain, faulting in ANGLE's own std::vector).
 //
 // STENCIL is per-config for the same reason, and the guest that forced it is
 // JKXR: the Oculus VrCubeWorld sample its front end is built from filters for
@@ -123,6 +132,8 @@ static struct { int id, es_bits, samples, depth, stencil; } g_configs[] = {
 #define NCONFIGS ((int)(sizeof g_configs / sizeof g_configs[0]))
 
 typedef struct { int32_t w, h; int pbuffer; void *xr_swapchain; } kl_egl_surface;
+// config_id: which of g_configs the context was created with, recorded so
+// eglQueryContext(EGL_CONFIG_ID) can answer it — see QueryContext.
 typedef struct { int client_version; int config_id; } kl_egl_context;
 
 static kl_egl_surface g_surfaces[8];
@@ -289,6 +300,25 @@ void kl_egl_set_gles_version(int major, int minor) {
     g_es_major = major; g_es_minor = minor;
 }
 
+// KL_GL_ES_VERSION=3.0 (or 3.1, 3.2, 2.0) overrides the described level for a
+// run. The claim is not cosmetic — a guest picks its shader dialect AND its
+// vertex-setup API from it — so it needs to be movable without a rebuild when a
+// title's failure is suspected to be an overstatement.
+static void klgl_es_version_env(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    const char *v = getenv("KL_GL_ES_VERSION");
+    if (!v || !*v) return;
+    int maj = 0, min = 0;
+    if (sscanf(v, "%d.%d", &maj, &min) == 2 && maj >= 2 && maj <= 3 &&
+        min >= 0 && min <= 2) {
+        g_es_major = maj; g_es_minor = min;
+        fprintf(stderr, "  [gl] described GLES level forced to %d.%d "
+                        "(KL_GL_ES_VERSION)\n", maj, min);
+    }
+}
+
 // The extensions advertised here. Naming one is a promise and a broken promise
 // fails far from its cause — but an EMPTY list is its own broken promise to a
 // guest that reads capabilities from the string instead of from the version.
@@ -310,11 +340,44 @@ void kl_egl_set_gles_version(int major, int minor) {
 static const char *const g_gl_extensions[] = {
     "GL_EXT_color_buffer_float",
     "GL_EXT_color_buffer_half_float",
-    // Apple GPUs decode ASTC natively and kl_glfb uploads the ASTC LDR block
-    // formats, so advertise it — UE4 reads this to decide whether to load its
-    // ASTC-cooked textures (without it, it reports "Unsupported Texture Format:
-    // ASTC / Supported: ETC2" and then dies uploading the assets it does have).
+    // ASTC LDR, which qualifies under exactly the same rule and for the same
+    // reason: it is CORE in ES 3.2 — the level we already claim in GL_VERSION —
+    // so naming it states nothing new, and the backend really does provide it
+    // (kl_glfb prints "compressed: KHR_texture_compression_astc_ldr=yes" at
+    // context creation, measured against the vendored ANGLE on Metal; Apple
+    // GPUs decode ASTC in hardware).
+    //
+    // The omission was found by Tetris Effect and is NOT title-specific: every
+    // Quest title cooks ASTC, and UE4's Android RHI sets `bSupportsASTC` from
+    // this STRING and not from the ES level. Finding nothing, it puts up its own
+    // "Unsupported Texture Format — Cooked Flavors: ASTC / Supported: ETC2"
+    // message box and then goes looking for an ETC2 pak the APK never shipped.
+    // Nothing in that chain mentions an extension, which is the same shape of
+    // failure the two float entries above were added for.
+    //
+    // ETC2 deliberately has NO entry beside it: it is core in ES 3.0 with no
+    // extension name of its own on a real driver either, and UE4 reads it off
+    // the version. A name here that no driver publishes would be the invention
+    // this list exists to avoid.
     "GL_KHR_texture_compression_astc_ldr",
+    // Vertex array objects, which qualify under the same rule again — CORE in
+    // ES 3.0, so at the 3.2 we claim in GL_VERSION this states nothing new, and
+    // ANGLE really does carry the OES entry points (they are aliases of the
+    // core ones).
+    //
+    // **The omission was a NULL function pointer inside the guest, and it is a
+    // glad-loader hazard rather than a title quirk.** Simpsons Hit & Run's
+    // Pure3D layer is bound with glad, and glad fills `glad_glBindVertexArrayOES`
+    // only when this string names the extension — but `pglContext::EndPrims`
+    // calls it with no null test, so an unnamed extension is not a slower path,
+    // it is `blr xzr`: `fault: signal 11 at 0x0, pc <host>+0x0`, lr inside
+    // `pglContext::EndPrims+0x30`, one instruction before
+    // `glBindBuffer(GL_ARRAY_BUFFER, 0)`. The relocation at the call site names
+    // the symbol outright (`glad_glBindVertexArrayOES`), which is how it was
+    // read rather than guessed. Any glad-bound guest has the same shape.
+    "GL_OES_vertex_array_object",
+    // ...and the OES spelling of the same ASTC capability, which some loaders
+    // read instead of the KHR one.
     "GL_OES_texture_compression_astc",
     // Framebuffer blit + multisample. These are CORE in GLES 3 (glBlitFramebuffer,
     // glRenderbufferStorageMultisample) and fully backed by ANGLE, but Source's
@@ -345,6 +408,114 @@ static const char *const g_gl_extensions[] = {
     "GL_OVR_multiview2",
 };
 
+// ...and a SECOND list, which the rule above admits by a different door: not
+// "core at the level we claim", but "the backend in this process told us, this
+// run, that it has it". Nothing here is named unless ANGLE's own
+// glGetString(GL_EXTENSIONS) named it first (kl_gl_cap_adopt_backend_extensions,
+// called from kl_glfb once the real context exists), so a promise made here is
+// one ANGLE has already made to us.
+//
+// **Why this list exists: srceng was decompressing every texture on the CPU.**
+// hl2vr ships a 4.9 GB Alyx-remix pack whose VTFs are DXT1 and DXT5 — a census
+// of the first archive found 566 textures, 370 DXT1 and 196 DXT5, and not one
+// ETC2 or ASTC. libtogl asks for GL_EXT_texture_compression_s3tc /
+// _dxt1 / GL_ANGLE_texture_compression_dxt3 / _dxt5 by name and, finding an
+// extension string with neither in it (launch #9's engine.log: `GL_EXTENSIONS=
+// "GL_EXT_color_buffer_float GL_EXT_color_buffer_half_float"`), takes
+// materialsystem's CPU path and uploads RGBA8888. That is 8x the bytes for a
+// DXT1 texture and 4x for a DXT5 one, and it is why a MENU cost 5,452 MB at
+// mat_picmip 0 and why NEW GAME hit the 8,191 MB ceiling.
+//
+// GL_EXT_texture_filter_anisotropic is here for the other half of the tester's
+// "grainy": videoconfig_android.cfg asks for mat_forceaniso 1, which is
+// anisotropy OFF, and a floor seen at a grazing angle — most of an HL2 frame —
+// is then sampled from a mip chosen for its worst axis. It costs no memory at
+// all; it is a sampler parameter.
+static const char *const g_gl_ext_candidates[] = {
+    "GL_EXT_texture_compression_s3tc",
+    "GL_EXT_texture_compression_dxt1",
+    "GL_ANGLE_texture_compression_dxt3",
+    "GL_ANGLE_texture_compression_dxt5",
+    "GL_EXT_texture_filter_anisotropic",
+    // BGRA uploads, and the reason it is in the ADOPTED list rather than the
+    // asserted one: BGRA is not core at any GLES level, so this runtime may
+    // only repeat it when the backend has already said it.
+    //
+    // **Every texture in Simpsons Hit & Run was rejected without it.**
+    // pglTexture::SetGLState builds the pair from two different places: the
+    // internalformat comes from a table indexed by the Pure3D texture format
+    // (entries 5 and 6 — the 32- and 24-bit BGRA ones — are GL_BGRA_EXT
+    // outright), while the FORMAT argument is a csel on a flag glad sets from
+    // this extension's presence: present -> GL_BGRA_EXT, absent -> GL_RGBA. So
+    // an unnamed extension does not select a fallback path here, it selects a
+    // MIXED pair, and GL_BGRA_EXT with GL_RGBA is invalid in every GLES
+    // profile:
+    //
+    //   [glfb] glTexImage2D(ifmt=0x80e1, 32x32, fmt=0x1908, type=0x1401) -> err 0x502
+    //
+    // ...hundreds of times, and every one of them is a texture that stayed at
+    // its zeroed contents. Launch #2 drew the front-end geometry correctly with
+    // every textured quad sampling pure black. Adreno evidently tolerates the
+    // mixed pair, which is why the port ships it.
+    "GL_EXT_texture_format_BGRA8888",
+};
+#define KL_GL_EXT_CANDIDATES \
+    ((int)(sizeof g_gl_ext_candidates / sizeof g_gl_ext_candidates[0]))
+
+static const char *g_gl_ext_adopted[KL_GL_EXT_CANDIDATES];
+static int g_gl_ext_adopted_n = 0;
+
+// Called once, from kl_glfb, with whatever the real driver answers. A name the
+// driver does not carry is simply not adopted — there is no override, because
+// the failure mode this guards against (the guest uploads DXT blocks to a
+// driver that cannot decode them) is a black world, not a slow one.
+void kl_gl_cap_adopt_backend_extensions(const char *backend_ext) {
+    g_gl_ext_adopted_n = 0;
+    if (!backend_ext) backend_ext = "";
+    // The A/B back to the pre-round-9 description, which is also the escape
+    // hatch if a guest turns out to mishandle a capability it now has.
+    if (kl_env_on("KL_GL_NO_BACKEND_EXT", 0)) {
+        fprintf(stderr, "  [gl] KL_GL_NO_BACKEND_EXT=1 — adopting nothing from "
+                        "the backend (the CPU-decompress description)\n");
+        return;
+    }
+    for (int i = 0; i < KL_GL_EXT_CANDIDATES; i++) {
+        const char *name = g_gl_ext_candidates[i];
+        size_t len = strlen(name);
+        // Whole-token match: "..._dxt1" is a prefix of nothing here, but
+        // "..._s3tc" IS a prefix of "..._s3tc_srgb" in some drivers, and
+        // strstr alone would adopt the shorter name off the longer one.
+        const char *p = backend_ext;
+        int have = 0;
+        while ((p = strstr(p, name)) != NULL) {
+            char after = p[len];
+            char before = (p == backend_ext) ? ' ' : p[-1];
+            if ((after == 0 || after == ' ') && before == ' ') { have = 1; break; }
+            p += len;
+        }
+        if (have) g_gl_ext_adopted[g_gl_ext_adopted_n++] = name;
+    }
+}
+
+// "Can this backend take DXT blocks", which is a question about four names and
+// not one. ANGLE-on-Metal is the reason it has to be: on an M-series Mac it
+// advertises GL_EXT_texture_compression_dxt1 and the two GL_ANGLE_ names for
+// DXT3/DXT5 and does NOT advertise the umbrella GL_EXT_texture_compression_s3tc
+// — the same BC1/BC2/BC3 capability, spelled per format. libtogl accepts either
+// spelling, so keying this on s3tc alone would report "no compression" on a
+// device that has all of it.
+int kl_gl_cap_backend_has_dxt(void) {
+    for (int i = 0; i < g_gl_ext_adopted_n; i++)
+        if (strstr(g_gl_ext_adopted[i], "texture_compression_"))
+            return 1;
+    return 0;
+}
+
+int kl_gl_cap_adopted_extension_count(void) { return g_gl_ext_adopted_n; }
+const char *kl_gl_cap_adopted_extension(int i) {
+    return (i >= 0 && i < g_gl_ext_adopted_n) ? g_gl_ext_adopted[i] : NULL;
+}
+
 // Which targets actually render with GLES single-pass multiview. Advertise the
 // extension ONLY to these; a non-multiview engine (cs1/Xash, hl1/lambda1vr) that
 // saw it might take a multiview path it can't back. The ones here NEED it: hiding
@@ -368,16 +539,26 @@ static int klgl_want_multiview(void) {
 // (kl_egl_set_gles_version) and has always run against an empty list; the
 // argument above is an ES 3.2 argument and does not carry over, so that target
 // stays exactly as it was rather than being changed by a fix it did not need.
-static int klgl_ext_count(void) {
+static int klgl_ext_base_count(void) {
     if (g_es_major < 3) return 0;
     int n = (int)(sizeof g_gl_extensions / sizeof g_gl_extensions[0]);
     // Hide the two trailing OVR_multiview entries from targets that don't use it.
     if (!klgl_want_multiview()) n -= 2;
     return n;
 }
+static int klgl_ext_count(void) {
+    int n = klgl_ext_base_count();
+    return n ? n + g_gl_ext_adopted_n : 0;
+}
+static const char *klgl_ext_at(int i) {
+    int base = klgl_ext_base_count();
+    if (i < 0 || i >= base + g_gl_ext_adopted_n) return NULL;
+    return i < base ? g_gl_extensions[i] : g_gl_ext_adopted[i - base];
+}
 
 static const char *klgl_GetString(uint32_t name) {
-    static char ver[64], glsl[64], exts[256];
+    static char ver[64], glsl[64], exts[512];
+    klgl_es_version_env();
     switch (name) {
     case GL_VENDOR:     return "Klepton";
     case GL_RENDERER:   return "Klepton GLES";
@@ -397,7 +578,7 @@ static const char *klgl_GetString(uint32_t name) {
         exts[0] = 0;
         for (int i = 0; i < n; i++) {
             if (i) strlcat(exts, " ", sizeof exts);
-            strlcat(exts, g_gl_extensions[i], sizeof exts);
+            strlcat(exts, klgl_ext_at(i), sizeof exts);
         }
         return exts;
     }
@@ -408,7 +589,7 @@ static const char *klgl_GetString(uint32_t name) {
 
 static const char *klgl_GetStringi(uint32_t name, uint32_t index) {
     if (name == GL_EXTENSIONS && (int)index < klgl_ext_count())
-        return g_gl_extensions[index];
+        return klgl_ext_at((int)index);
     return "";           // consistent with GL_NUM_EXTENSIONS
 }
 
@@ -447,28 +628,10 @@ static const struct { uint32_t pname; int32_t value; } g_gl_int[] = {
     {0x88FF /* MAX_ARRAY_TEXTURE_LAYERS    */, 2048},
     {0x84E8 /* MAX_RENDERBUFFER_SIZE       */, 16384},
     {0x8869 /* MAX_VERTEX_ATTRIBS          */, 16},
-    // ---- texture units: three numbers that must agree ----------------------
-    //
-    // Unity's own "Invalid texture unit!" check reads the cap it was told HERE,
-    // not ANGLE's, and then binds anyway — so these answers, the vendored
-    // ANGLE's `kMaxGLSamplerBindings`, and its front-end
-    // `IMPLEMENTATION_MAX_ES31_ACTIVE_TEXTURES` clamp have to state one number.
-    // Per-stage stays 32 because ANGLE's front end clamps
-    // `maxShaderTextureImageUnits` to 32 regardless, and promising more than
-    // the driver will accept is a bind that silently does nothing.
-    //
-    // **Combined is 96 because 64 was measured to be too few.** A Unity 2019.4
-    // title assigns sampler units up to 67 on one post-processing program
-    // (`glUniform1i(loc, 64..67)`, GL_INVALID_VALUE against a limit of 64) from
-    // unit numbers its Android build baked in, where the driver's limit is
-    // higher — it never queries and cannot be made to adapt. The refusal is not
-    // where it hurts: the engine believes the unit was set, indexes its own
-    // unbounded GL state cache with it, and writes through the function-pointer
-    // table it dispatches every GL call through, so the process dies in an
-    // unrelated subsystem thousands of frames later.
-    {0x8872 /* MAX_TEXTURE_IMAGE_UNITS          */, 32},
-    {0x8B4D /* MAX_COMBINED_TEXTURE_IMAGE_UNITS */, 96},
-    {0x8B4C /* MAX_VERTEX_TEXTURE_IMAGE_UNITS   */, 32},
+    // The three texture-unit caps are NOT here — see g_tex_units below. They are
+    // the only rows in this description that a real driver overrules, because
+    // they are the only ones where being generous is not a description at all
+    // but a buffer overrun inside the guest.
     {0x8DFB /* MAX_VERTEX_UNIFORM_VECTORS  */, 256},
     {0x8DFD /* MAX_FRAGMENT_UNIFORM_VECTORS*/, 224},
     {0x8DFC /* MAX_VARYING_VECTORS         */, 15},
@@ -482,7 +645,12 @@ static const struct { uint32_t pname; int32_t value; } g_gl_int[] = {
     {0x8A2B /* MAX_VERTEX_UNIFORM_BLOCKS   */, 12},
     {0x8A2F /* MAX_COMBINED_UNIFORM_BLOCKS */, 24},
     {0x8A34 /* UNIFORM_BUFFER_OFFSET_ALIGNMENT */, 256},
-    {0x87FE /* NUM_PROGRAM_BINARY_FORMATS  */, 0},
+    // One program binary format, and it is ours — see "Program binaries" below.
+    // Zero here contradicts glGetProgramBinary working at all, and a guest that
+    // reads the count before deciding to use the cache must get the same answer
+    // the retrieval path gives.
+    {0x87FE /* NUM_PROGRAM_BINARY_FORMATS  */, 1},
+    {0x87FF /* PROGRAM_BINARY_FORMATS      */, (int32_t)0x4B4C4750 /* 'KLGP' */},
     {0x8DF9 /* NUM_SHADER_BINARY_FORMATS   */, 0},
     {0x86A2 /* NUM_COMPRESSED_TEXTURE_FORMATS */, 0},
     {0x9122 /* MAX_VERTEX_OUTPUT_COMPONENTS*/, 64},
@@ -500,12 +668,61 @@ static const struct { uint32_t pname; int32_t value; } g_gl_int[] = {
     {0x80A9 /* SAMPLES        */, 0},
 };
 
+// ---------------------------------------------------------------------------
+// Texture-unit caps.
+//
+// These used to be three literals in the table above, kept in step BY HAND with
+// the vendored ANGLE's mtl::kMaxShaderSamplers. They drifted, and the drift was
+// the bug: Beat Saber 1.40 binds samplers at units 64..72, ANGLE's combined
+// ceiling was exactly 64, every glUniform1i above it took GL_INVALID_VALUE, and
+// Unity — which had already sized its texture-unit cache from the number WE
+// advertised — kept indexing by unit anyway and ran off the end of it into
+// level-load string data. A SIGBUS, from two copies of one integer.
+//
+// The literals below are the FALLBACK, for the null renderer where there is no
+// driver to ask. Under a real driver kl_glfb calls
+// kl_gl_cap_adopt_texture_units() with what ANGLE reports and these are
+// replaced, so the advertised number cannot be larger than what will be
+// enforced no matter what the vendored constant is set to.
+//
+// Keep them equal to the vendored ANGLE anyway, so the null-renderer path is
+// not describing a different machine:
+//   per stage  = mtl::kMaxShaderSamplers          (mtl_common.h)
+//   combined   = mtl::kMaxGLSamplerBindings       (deliberately NOT 2 x that —
+//                per-stage Metal slots are assigned sequentially per shader)
+// currently 32 / 96. Raising ANGLE's also needs gl::IMPLEMENTATION_MAX_SHADER_-
+// TEXTURES and gl::IMPLEMENTATION_MAX_ES31_ACTIVE_TEXTURES (Constants.h), which
+// clamp the backend's numbers away silently otherwise; DisplayMtl.mm carries
+// static_asserts that turn that into a build failure.
+#define KL_ANGLE_MAX_SHADER_SAMPLERS      32
+#define KL_ANGLE_MAX_GL_SAMPLER_BINDINGS  96
+
+static int32_t g_tex_units_per_stage = KL_ANGLE_MAX_SHADER_SAMPLERS;
+static int32_t g_tex_units_combined  = KL_ANGLE_MAX_GL_SAMPLER_BINDINGS;
+
+void kl_gl_cap_adopt_texture_units(int32_t per_stage, int32_t combined) {
+    if (per_stage <= 0 || combined <= 0) return;
+    if (per_stage == g_tex_units_per_stage && combined == g_tex_units_combined)
+        return;
+    fprintf(stderr, "  [gl] texture units adopted from the driver: "
+                    "per-stage %d -> %d, combined %d -> %d%s\n",
+            g_tex_units_per_stage, per_stage, g_tex_units_combined, combined,
+            combined < g_tex_units_combined
+                ? "  (SHRINK — the description was promising units the driver rejects)"
+                : "");
+    g_tex_units_per_stage = per_stage;
+    g_tex_units_combined  = combined;
+}
+
+int32_t kl_gl_cap_max_combined_texture_units(void) { return g_tex_units_combined; }
+
 // The capability probe behind klgl_GetIntegerv, exported for kl_glfb: 1 when
 // the pname is one of ours (and *params written), 0 when it is not — no
 // print, no zero. Under the reference renderer the miss goes to ANGLE, which
 // owns the dynamic state (READ_BUFFER & co.) this table never described.
 int kl_gl_cap_integerv(uint32_t pname, int32_t *params) {
     if (!params) return 1;
+    klgl_es_version_env();
     if (pname == GL_MAJOR_VERSION) { params[0] = g_es_major; return 1; }
     if (pname == GL_MINOR_VERSION) { params[0] = g_es_minor; return 1; }
     // Answered from the list rather than from the table below, for the same
@@ -513,15 +730,30 @@ int kl_gl_cap_integerv(uint32_t pname, int32_t *params) {
     // glGetStringi will hand out makes the guest read past the end or stop
     // short, and either one is silent.
     if (pname == GL_NUM_EXTENSIONS) { params[0] = klgl_ext_count(); return 1; }
+    // The compressed-format pair is described as EMPTY in the table below, which
+    // was true while the list named no compression extension. Once one is
+    // adopted from the backend it is not: a guest that reads "s3tc, and zero
+    // compressed formats" has been told two different things, and which one it
+    // believes decides whether it uploads blocks or pixels. Hand both questions
+    // to ANGLE, which owns the real answer.
+    if ((pname == 0x86A2 /* NUM_COMPRESSED_TEXTURE_FORMATS */ ||
+         pname == 0x86A3 /* COMPRESSED_TEXTURE_FORMATS     */) &&
+        g_gl_ext_adopted_n > 0)
+        return 0;
+    // The texture-unit caps, asked and answered from the adopted values rather
+    // than the table: Unity's own "Invalid texture unit" check reads a cap it
+    // computed at device init from these very answers — say what it was told.
+    if (pname == 0x8872 /* MAX_TEXTURE_IMAGE_UNITS        */ ||
+        pname == 0x8B4C /* MAX_VERTEX_TEXTURE_IMAGE_UNITS */ ||
+        pname == 0x8B4D /* MAX_COMBINED_TEXTURE_IMAGE_UNITS */) {
+        params[0] = (pname == 0x8B4D) ? g_tex_units_combined
+                                      : g_tex_units_per_stage;
+        fprintf(stderr, "  [gl] glGetIntegerv(0x%x) -> %d\n", pname, params[0]);
+        return 1;
+    }
     for (size_t i = 0; i < sizeof g_gl_int / sizeof g_gl_int[0]; i++)
         if (g_gl_int[i].pname == pname) {
             params[0] = g_gl_int[i].value;
-            // The texture-unit caps, asked and answered: Unity's own
-            // "Invalid texture unit" check reads a cap it computed at device
-            // init — confirm what it was told.
-            if (pname == 0x8872 || pname == 0x8B4D || pname == 0x8B4C)
-                fprintf(stderr, "  [gl] glGetIntegerv(0x%x) -> %d\n",
-                        pname, params[0]);
             return 1;
         }
     if (pname == 0x0D3A) {                       // MAX_VIEWPORT_DIMS: two values
@@ -655,8 +887,8 @@ int kl_gl_cap_integer64v(uint32_t pname, int64_t *data) {
     if (!data) return 1;
     switch (pname) {
     case 0x9111 /* MAX_SERVER_WAIT_TIMEOUT */: data[0] = 0; return 1;
-    case 0x821B /* MAJOR_VERSION */: data[0] = 3; return 1;
-    case 0x821C /* MINOR_VERSION */: data[0] = 2; return 1;
+    case 0x821B /* MAJOR_VERSION */: klgl_es_version_env(); data[0] = g_es_major; return 1;
+    case 0x821C /* MINOR_VERSION */: klgl_es_version_env(); data[0] = g_es_minor; return 1;
     }
     return 0;
 }
@@ -726,6 +958,80 @@ static void klgl_gen(int32_t n, uint32_t *names) {
 static void klgl_delete(int32_t n, const uint32_t *names) { (void)n; (void)names; }
 static uint8_t klgl_is(uint32_t name) { return name && name < g_gl_name; }
 
+// glEnable / glDisable / glIsEnabled on the null driver.
+//
+// The first two are state setters over state this driver does not model, so they
+// belong with the no-ops — but glIsEnabled READS that state and hands the guest
+// something it acts on, which is why it was one of the entry points deliberately
+// left to abort by name. UE4.26's OpenGL RHI is what finally called it (Tetris
+// Effect asks during its GL feature probe, before it has enabled anything).
+//
+// The answer is not invented: the caps the guest itself set are RECORDED here,
+// and anything it never touched reports the GLES default, which the spec fixes —
+// every capability starts disabled except GL_DITHER. So this driver answers
+// exactly what the guest did, and nothing else. A small ring is enough because a
+// guest only asks about caps it also sets; a cap we have never seen falls
+// through to the default, which is the same answer the real driver gives.
+#define KLGL_DITHER 0x0BD0
+#define KLGL_CAPS   32
+static struct { uint32_t cap; uint8_t on; } g_gl_caps[KLGL_CAPS];
+static unsigned g_gl_ncaps;
+
+static void klgl_set_cap(uint32_t cap, uint8_t on) {
+    for (unsigned i = 0; i < g_gl_ncaps; i++)
+        if (g_gl_caps[i].cap == cap) { g_gl_caps[i].on = on; return; }
+    if (g_gl_ncaps < KLGL_CAPS) {
+        g_gl_caps[g_gl_ncaps].cap = cap;
+        g_gl_caps[g_gl_ncaps].on  = on;
+        g_gl_ncaps++;
+    }
+}
+static void klgl_Enable(uint32_t cap)  { klgl_set_cap(cap, 1); }
+static void klgl_Disable(uint32_t cap) { klgl_set_cap(cap, 0); }
+static uint8_t klgl_IsEnabled(uint32_t cap) {
+    for (unsigned i = 0; i < g_gl_ncaps; i++)
+        if (g_gl_caps[i].cap == cap) return g_gl_caps[i].on;
+    return cap == KLGL_DITHER;             // the one GLES enables by default
+}
+
+// glGetShaderPrecisionFormat(shadertype, precisiontype, GLint range[2],
+// GLint *precision) — two out-parameters, so it cannot be a no-op: a guest that
+// reads back {0,0}/0 concludes the precision qualifier it asked about does not
+// exist. UE4's OpenGL RHI asks for all six as part of its feature probe.
+//
+// The numbers are the ES 3.x spec's own MINIMUM guarantees for a conformant
+// implementation, which is exactly the register this whole capability set is
+// written in (see the GL_VERSION note above): highp float is IEEE single, so
+// (127, 127, 23); mediump/lowp float are half, (15, 15, 10); the integer
+// precisions have zero fractional bits by definition and differ only in range.
+// The shader type does not change any of them — ES requires the same minima in
+// both stages, and this driver compiles nothing, so a per-stage difference here
+// would be a distinction with nothing behind it.
+#define KLGL_LOW_FLOAT    0x8DF0
+#define KLGL_MEDIUM_FLOAT 0x8DF1
+#define KLGL_HIGH_FLOAT   0x8DF2
+#define KLGL_LOW_INT      0x8DF3
+#define KLGL_MEDIUM_INT   0x8DF4
+#define KLGL_HIGH_INT     0x8DF5
+static void klgl_GetShaderPrecisionFormat(uint32_t shadertype, uint32_t prectype,
+                                          int32_t *range, int32_t *precision) {
+    (void)shadertype;
+    int32_t lo = 0, hi = 0, p = 0;
+    switch (prectype) {
+    case KLGL_HIGH_FLOAT:   lo = 127; hi = 127; p = 23; break;
+    case KLGL_MEDIUM_FLOAT: case KLGL_LOW_FLOAT: lo = 15; hi = 15; p = 10; break;
+    case KLGL_HIGH_INT:     lo = 31;  hi = 31;  p = 0;  break;
+    case KLGL_MEDIUM_INT:   lo = 15;  hi = 15;  p = 0;  break;
+    case KLGL_LOW_INT:      lo = 7;   hi = 7;   p = 0;  break;
+    default:
+        fprintf(stderr, "  [gl] glGetShaderPrecisionFormat: unhandled precision "
+                        "type 0x%x\n", prectype);
+        break;
+    }
+    if (range) { range[0] = lo; range[1] = hi; }
+    if (precision) *precision = p;
+}
+
 static uint32_t klgl_CreateShader(uint32_t type) {
     (void)type;
     return g_gl_name++;
@@ -739,10 +1045,19 @@ static uint32_t klgl_CreateProgram(void) { return g_gl_name++; }
 // `length` per glMapBufferRange instead is overrun within a second — xzone
 // malloc reports the freelist corruption at the NEXT map, so the crash site is
 // klgl_MapBufferRange and the corruptor is the previous mapping's write.
-#define KL_GL_MAX_BUFFERS 4096
+//
+// The table GROWS rather than being capped, and glDeleteBuffers really removes
+// entries. It used to be a fixed 4096 with a no-op delete, which is a slow fuse:
+// UE4.26 streams its cooked textures through GL_PIXEL_UNPACK_BUFFER and churns a
+// buffer per upload, so the table filled during Tetris Effect's first frame,
+// klgl_buf started answering NULL for perfectly live names, glMapBufferRange
+// handed that NULL back, and the RHI thread memmove()d 1936 bytes to address 0 —
+// a SIGSEGV whose entire stack is inside libUE4's RHI command execution and
+// mentions no buffer, no GL call, and nothing of ours.
 #define KL_GL_MAX_BINDINGS 16
-static struct { uint32_t name; uint8_t *data; size_t size; } g_gl_bufs[KL_GL_MAX_BUFFERS];
-static unsigned g_gl_nbufs;
+typedef struct { uint32_t name; uint8_t *data; size_t size; } kl_gl_buffer;
+static kl_gl_buffer *g_gl_bufs;
+static unsigned g_gl_nbufs, g_gl_bufcap;
 static struct { uint32_t target, name; } g_gl_binds[KL_GL_MAX_BINDINGS];
 static unsigned g_gl_nbinds;
 
@@ -760,18 +1075,45 @@ static void klgl_BindBuffer(uint32_t target, uint32_t name) {
         g_gl_nbinds++;
     }
 }
-static typeof(g_gl_bufs[0]) *klgl_buf(uint32_t name) {
+static kl_gl_buffer *klgl_buf(uint32_t name) {
     for (unsigned i = 0; i < g_gl_nbufs; i++)
         if (g_gl_bufs[i].name == name) return &g_gl_bufs[i];
-    if (!name || g_gl_nbufs == KL_GL_MAX_BUFFERS) return NULL;
-    g_gl_bufs[g_gl_nbufs].name = name;
+    if (!name) return NULL;
+    if (g_gl_nbufs == g_gl_bufcap) {
+        unsigned cap = g_gl_bufcap ? g_gl_bufcap * 2 : 256;
+        kl_gl_buffer *p = realloc(g_gl_bufs, cap * sizeof *p);
+        if (!p) return NULL;
+        g_gl_bufs = p;
+        g_gl_bufcap = cap;
+    }
+    g_gl_bufs[g_gl_nbufs] = (kl_gl_buffer){ .name = name };
     g_gl_nbufs++;
     return &g_gl_bufs[g_gl_nbufs - 1];
+}
+
+// glDeleteBuffers, which is the only delete in the family that owns host
+// storage. Freeing it is what keeps the table bounded by the guest's LIVE set
+// instead of by everything it has ever created; unbinding the name is required
+// by the GLES spec (a deleted buffer's bindings revert to 0) and is what stops a
+// later map from landing in a recycled record.
+static void klgl_DeleteBuffers(int32_t n, const uint32_t *names) {
+    for (int32_t k = 0; k < n && names; k++) {
+        uint32_t name = names[k];
+        if (!name) continue;
+        for (unsigned i = 0; i < g_gl_nbinds; i++)
+            if (g_gl_binds[i].name == name) g_gl_binds[i].name = 0;
+        for (unsigned i = 0; i < g_gl_nbufs; i++)
+            if (g_gl_bufs[i].name == name) {
+                free(g_gl_bufs[i].data);
+                g_gl_bufs[i] = g_gl_bufs[--g_gl_nbufs];
+                break;
+            }
+    }
 }
 static void klgl_BufferData(uint32_t target, intptr_t size, const void *data,
                             uint32_t usage) {
     (void)usage;
-    typeof(g_gl_bufs[0]) *b = klgl_buf(klgl_bound(target));
+    kl_gl_buffer *b = klgl_buf(klgl_bound(target));
     if (!b || size <= 0) return;
     uint8_t *p = realloc(b->data, (size_t)size);
     if (!p) return;
@@ -781,7 +1123,7 @@ static void klgl_BufferData(uint32_t target, intptr_t size, const void *data,
 }
 static void klgl_BufferSubData(uint32_t target, intptr_t offset, intptr_t size,
                                const void *data) {
-    typeof(g_gl_bufs[0]) *b = klgl_buf(klgl_bound(target));
+    kl_gl_buffer *b = klgl_buf(klgl_bound(target));
     if (!b || !b->data || !data || offset < 0 || size < 0 ||
         (size_t)(offset + size) > b->size) return;
     memcpy(b->data + offset, data, (size_t)size);
@@ -789,8 +1131,17 @@ static void klgl_BufferSubData(uint32_t target, intptr_t offset, intptr_t size,
 static void *klgl_MapBufferRange(uint32_t target, intptr_t offset,
                                  intptr_t length, uint32_t access) {
     (void)access;
-    typeof(g_gl_bufs[0]) *b = klgl_buf(klgl_bound(target));
-    if (!b || offset < 0 || length <= 0) return NULL;
+    kl_gl_buffer *b = klgl_buf(klgl_bound(target));
+    if (!b || offset < 0 || length <= 0) {
+        // A NULL from here is a pointer the guest will write THROUGH without
+        // checking — UE4's GL RHI memcpy()s into the result of its buffer lock
+        // on the RHI thread, so the fault lands in memmove with a NULL
+        // destination and a stack that names none of this. Say so at the source.
+        fprintf(stderr, "  [gl] glMapBufferRange(target %#x, offset %lld, length "
+                        "%lld) -> NULL (bound buffer %u)\n", target,
+                (long long)offset, (long long)length, klgl_bound(target));
+        return NULL;
+    }
     if ((size_t)(offset + length) > b->size) {      // mapped before any data
         uint8_t *p = realloc(b->data, (size_t)(offset + length));
         if (!p) return NULL;
@@ -840,10 +1191,97 @@ static void klgl_GetShaderiv(uint32_t s, uint32_t pname, int32_t *p) {
     if (!p) return;
     *p = (pname == GL_COMPILE_STATUS) ? 1 : 0;
 }
+// ---- Program binaries ----
+//
+// GL_PROGRAM_BINARY_LENGTH is not a capability question, it is a promise: a
+// driver that answers zero here is saying "this linked program has no
+// retrievable binary", and UE4.26 treats that as UNREACHABLE rather than as a
+// missing feature. `FOpenGLProgramBinaryCache::AddUniqueGLProgramToBinaryCache`
+// (libUE4 +0x9f16b1c in this APK) asks glGetProgramiv(GL_PROGRAM_BINARY_LENGTH),
+// and on `length < 1` calls `LowLevelFatalErrorHandler("AppendProgramBinaryFile
+// Binary program returned 0 bytes!")` -> FDebug::ProcessFatalError -> a Fatal
+// UE_LOG -> `FAndroidErrorOutputDevice::Serialize` -> `AndroidThunkCpp_ForceQuit`
+// -> `System.exit(0)`. That — not any entitlement or ownership gate — is why
+// Tetris Effect asked to quit once per linked program from its first tick.
+//
+// So the null driver produces a REAL binary: a small self-describing blob in a
+// format of our own, which glProgramBinary recognises on the way back in. The
+// blob has no shader code in it because there is no compiler here; what it
+// carries is the identity of the program it came from, which is exactly what is
+// needed to tell "the cache we wrote" apart from "a cache some other driver
+// wrote". A foreign or stale blob is REFUSED — the program's link status goes
+// to 0 and UE4 falls back to compiling from source, which is the behaviour a
+// real driver has when a cached binary is rejected (the ES spec requires a
+// program binary to be rejected whenever the implementation cannot use it).
+// Silently accepting one would leave the guest drawing with a program that
+// never linked.
+#define GL_PROGRAM_BINARY_LENGTH        0x8741
+#define GL_NUM_PROGRAM_BINARY_FORMATS   0x87FE
+#define GL_PROGRAM_BINARY_FORMATS       0x87FF
+#define KLGL_BINARY_FORMAT              0x4B4C4750u   /* 'KLGP' */
+static const char KLGL_BINARY_MAGIC[8] = {'K','L','G','L','P','R','O','G'};
+#define KLGL_BINARY_SIZE (int32_t)(sizeof(KLGL_BINARY_MAGIC) + sizeof(uint32_t))
+
+// The programs whose last glProgramBinary was refused. Small and rarely
+// populated: a run either has a cache this driver wrote (nothing lands here) or
+// one it did not (everything does, once, and UE4 recompiles).
+static uint32_t *g_gl_prog_bad; static unsigned g_gl_nprog_bad, g_gl_prog_bad_cap;
+static int klgl_prog_is_bad(uint32_t prog) {
+    for (unsigned i = 0; i < g_gl_nprog_bad; i++) if (g_gl_prog_bad[i] == prog) return 1;
+    return 0;
+}
+static void klgl_prog_set_bad(uint32_t prog, int bad) {
+    for (unsigned i = 0; i < g_gl_nprog_bad; i++) {
+        if (g_gl_prog_bad[i] != prog) continue;
+        if (!bad) g_gl_prog_bad[i] = g_gl_prog_bad[--g_gl_nprog_bad];
+        return;
+    }
+    if (!bad) return;
+    if (g_gl_nprog_bad == g_gl_prog_bad_cap) {
+        unsigned cap = g_gl_prog_bad_cap ? g_gl_prog_bad_cap * 2 : 64;
+        uint32_t *n = realloc(g_gl_prog_bad, cap * sizeof(*n));
+        if (!n) return;
+        g_gl_prog_bad = n; g_gl_prog_bad_cap = cap;
+    }
+    g_gl_prog_bad[g_gl_nprog_bad++] = prog;
+}
+
+static void klgl_GetProgramBinary(uint32_t prog, int32_t bufSize, int32_t *length,
+                                  uint32_t *binaryFormat, void *binary) {
+    // GL_INVALID_OPERATION territory on a real driver; here just refuse to write.
+    if (bufSize < KLGL_BINARY_SIZE || !binary) { if (length) *length = 0; return; }
+    unsigned char *b = (unsigned char *)binary;
+    memcpy(b, KLGL_BINARY_MAGIC, sizeof(KLGL_BINARY_MAGIC));
+    memcpy(b + sizeof(KLGL_BINARY_MAGIC), &prog, sizeof(prog));
+    if (binaryFormat) *binaryFormat = KLGL_BINARY_FORMAT;
+    if (length) *length = KLGL_BINARY_SIZE;
+}
+
+static void klgl_ProgramBinary(uint32_t prog, uint32_t binaryFormat,
+                               const void *binary, int32_t length) {
+    int ok = binaryFormat == KLGL_BINARY_FORMAT && binary && length == KLGL_BINARY_SIZE
+             && memcmp(binary, KLGL_BINARY_MAGIC, sizeof(KLGL_BINARY_MAGIC)) == 0;
+    if (!ok) {
+        static int said;
+        if (said < 4) {
+            said++;
+            fprintf(stderr, "  [gl] glProgramBinary(program %u, format 0x%x, %d bytes)"
+                            " REFUSED — not a binary this driver produced. Link status"
+                            " goes to 0 so the guest recompiles from source.\n",
+                    prog, binaryFormat, length);
+        }
+    }
+    klgl_prog_set_bad(prog, !ok);
+}
+
 static void klgl_GetProgramiv(uint32_t prog, uint32_t pname, int32_t *p) {
-    (void)prog;
     if (!p) return;
-    *p = (pname == GL_LINK_STATUS) ? 1 : 0;
+    switch (pname) {
+    case GL_LINK_STATUS:          *p = klgl_prog_is_bad(prog) ? 0 : 1; break;
+    // Answered for a linked program only, which is the only state UE4 asks in.
+    case GL_PROGRAM_BINARY_LENGTH: *p = klgl_prog_is_bad(prog) ? 0 : KLGL_BINARY_SIZE; break;
+    default:                      *p = 0; break;
+    }
 }
 static void klgl_GetInfoLog(uint32_t obj, int32_t bufSize, int32_t *length, char *log) {
     (void)obj;
@@ -1039,6 +1477,7 @@ static const struct { const char *name; void *fn; } g_gl_impl[] = {
     {"glGetProgramResourceiv", (void *)klgl_GetProgramResourceiv},
     {"glGetProgramResourceName", (void *)klgl_GetProgramResourceName},
     {"glGetTexParameteriv", (void *)klgl_GetTexParameteriv},
+    {"glGetShaderPrecisionFormat", (void *)klgl_GetShaderPrecisionFormat},
     {"glTexSubImage2D",  (void *)klgl_TexSubImage2D},
     {"glFenceSync",      (void *)klgl_FenceSync},
     {"glClientWaitSync", (void *)klgl_ClientWaitSync},
@@ -1053,7 +1492,7 @@ static const struct { const char *name; void *fn; } g_gl_impl[] = {
     {"glGenQueries", (void *)klgl_gen},
     {"glGenTransformFeedbacks", (void *)klgl_gen},
     {"glGenProgramPipelines", (void *)klgl_gen},
-    {"glDeleteBuffers", (void *)klgl_delete},
+    {"glDeleteBuffers", (void *)klgl_DeleteBuffers},
     {"glDeleteTextures", (void *)klgl_delete},
     {"glDeleteFramebuffers", (void *)klgl_delete},
     {"glDeleteRenderbuffers", (void *)klgl_delete},
@@ -1062,6 +1501,9 @@ static const struct { const char *name; void *fn; } g_gl_impl[] = {
     {"glDeleteQueries", (void *)klgl_delete},
     {"glDeleteTransformFeedbacks", (void *)klgl_delete},
     {"glDeleteProgramPipelines", (void *)klgl_delete},
+    {"glEnable",    (void *)klgl_Enable},
+    {"glDisable",   (void *)klgl_Disable},
+    {"glIsEnabled", (void *)klgl_IsEnabled},
     {"glIsBuffer", (void *)klgl_is},
     {"glIsTexture", (void *)klgl_is},
     {"glIsFramebuffer", (void *)klgl_is},
@@ -1076,6 +1518,8 @@ static const struct { const char *name; void *fn; } g_gl_impl[] = {
     {"glShaderSource",  (void *)klgl_ShaderSource},
     {"glGetShaderiv",   (void *)klgl_GetShaderiv},
     {"glGetProgramiv",  (void *)klgl_GetProgramiv},
+    {"glGetProgramBinary", (void *)klgl_GetProgramBinary},
+    {"glProgramBinary",    (void *)klgl_ProgramBinary},
     {"glGetShaderInfoLog",  (void *)klgl_GetInfoLog},
     {"glGetProgramInfoLog", (void *)klgl_GetInfoLog},
     {"glGetUniformLocation", (void *)klgl_GetLocation},
@@ -1107,7 +1551,21 @@ static const struct { const char *name; void *fn; } g_gl_impl[] = {
 // recorded, rather than a guess baked in ahead of the trace.
 static const char *const g_gl_void[] = {
     // per-fragment and rasteriser state
-    "glEnable", "glDisable", "glCullFace", "glFrontFace", "glDepthFunc", "glDepthMask",
+    // glEnable/glDisable are NOT here any more — they have real handlers above,
+    // because glIsEnabled needs to read back what they set. The INDEXED forms
+    // stay here: they set per-draw-buffer state that nothing reads back (the
+    // guest has not asked glIsEnabledi), and a shared cap table with no index
+    // would be a wrong answer rather than a missing one.
+    "glEnablei", "glDisablei",
+    "glCullFace", "glFrontFace", "glDepthFunc", "glDepthMask", "glDepthRangef",
+    // The NON-separate twins of the four separate forms already below. They
+    // arrived together, from one guest: Simpsons Hit & Run is a 2003 fixed-
+    // function renderer ported forward, so it sets the whole pipeline through
+    // the unsuffixed GLES 2 spellings where the Unity and Unreal guests here
+    // only ever used the separate ones. Same class exactly — void, no
+    // out-parameter, state this driver does not model.
+    "glStencilFunc", "glStencilOp", "glStencilMaskSeparate", "glBlendFunc",
+    "glBlendColor", "glLineWidth", "glSampleCoverage",
     "glColorMask", "glColorMaski", "glStencilMask", "glStencilFuncSeparate",
     "glStencilOpSeparate", "glPolygonOffset", "glScissor", "glViewport", "glPixelStorei",
     // glPolygonMode is desktop-GL only (no GLES equivalent); gl4es passes it
@@ -1147,9 +1605,16 @@ static const char *const g_gl_void[] = {
     // shaders and programs
     "glCompileShader", "glAttachShader", "glDetachShader", "glDeleteShader",
     "glLinkProgram", "glUseProgram", "glValidateProgram", "glDeleteProgram",
-    "glBindAttribLocation", "glProgramParameteri", "glProgramBinary",
+    "glBindAttribLocation", "glProgramParameteri",   // glProgramBinary has a real impl
     "glTransformFeedbackVaryings",
     // uniforms — the values are handed to a program that will never run
+    // The SCALAR spellings, which arrived with Simpsons Hit & Run for the same
+    // reason the unsuffixed blend/stencil setters did: a hand-written GL 2
+    // renderer sets uniforms one value at a time where a modern engine's
+    // shader system always uploads a vector.
+    "glUniform1f", "glUniform2f", "glUniform3f", "glUniform4f",
+    "glUniform2i", "glUniform3i", "glUniform4i",
+    "glUniformMatrix2fv",
     "glUniform1i", "glUniform1fv", "glUniform2fv", "glUniform3fv", "glUniform4fv",
     "glUniform1iv", "glUniform2iv", "glUniform3iv", "glUniform4iv",
     "glUniform1uiv", "glUniform2uiv", "glUniform3uiv", "glUniform4uiv",
@@ -1166,6 +1631,13 @@ static const char *const g_gl_void[] = {
     "glBindVertexArray", "glVertexAttribPointer", "glVertexAttribIPointer",
     "glEnableVertexAttribArray", "glDisableVertexAttribArray",
     "glVertexAttrib4f", "glVertexAttrib4fv",
+    // ...and the ES 3.1 SEPARATE-FORMAT spelling of the same state, which UE4.26
+    // uses instead of glVertexAttribPointer wherever it has vertex-array objects
+    // (format, binding and buffer are three calls there rather than one). Same
+    // class exactly: void, no out-parameter, describing a layout for draws that
+    // do not happen on this driver.
+    "glVertexAttribFormat", "glVertexAttribIFormat", "glVertexAttribBinding",
+    "glBindVertexBuffer", "glVertexBindingDivisor", "glVertexAttribDivisor",
     // the draws — the calls this whole milestone exists to reach
     "glDrawArrays", "glDrawArraysInstanced", "glDrawArraysIndirect",
     "glDrawElements", "glDrawElementsInstanced", "glDrawElementsBaseVertex",
@@ -1180,6 +1652,14 @@ static const char *const g_gl_void[] = {
     // debug output
     "glDebugMessageCallback", "glDebugMessageControl", "glDebugMessageInsert",
     "glObjectLabel", "glPushDebugGroup", "glPopDebugGroup",
+    // ...and the KHR-suffixed spellings of the same three. UE4's OpenGL RHI
+    // resolves the extension names rather than the ES 3.2 core ones (it still
+    // supports ES 3.1 devices where only KHR_debug exists), so they are separate
+    // dlsyms and separate names here. Same class exactly: void, no
+    // out-parameter, and a driver that emits no debug messages has nothing to
+    // report through the callback it is handed.
+    "glDebugMessageCallbackKHR", "glDebugMessageControlKHR",
+    "glDebugMessageInsertKHR",
 };
 
 static int gl_is_void(const char *name) {
@@ -1233,16 +1713,46 @@ static unsigned klegl_Terminate(EGLDisplay dpy) {
     (void)dpy; g_display.initialised = 0; return EGL_TRUE;
 }
 
-// EGL_EXTENSIONS names exactly the three extensions this runtime implements
-// entry points for, and nothing else. Every name here is a promise, and Unity
-// branches hard on this string — advertising one we do not serve buys a failure
-// much further from its cause, which is why the list is the implemented set
-// rather than a plausible one:
+// EGL_EXTENSIONS names exactly the four extensions this runtime implements
+// entry points for (or, for the fourth, the ATTRIBUTES of), and nothing else.
+// Every name here is a promise, and Unity branches hard on this string —
+// advertising one we do not serve buys a failure much further from its cause,
+// which is why the list is the implemented set rather than a plausible one:
 //
 //   EGL_KHR_image_base                    eglCreateImageKHR / eglDestroyImageKHR
 //   EGL_ANDROID_image_native_buffer       ...and EGL_NATIVE_BUFFER_ANDROID, the
 //                                         only image target we accept
 //   EGL_ANDROID_get_native_client_buffer  eglGetNativeClientBufferANDROID
+//   EGL_KHR_create_context                no new entry point at all — it is the
+//                                         eglCreateContext ATTRIBUTE set, and
+//                                         the one that matters
+//                                         (EGL_CONTEXT_MAJOR_VERSION_KHR) is
+//                                         token 0x3098, the very same number as
+//                                         EGL_CONTEXT_CLIENT_VERSION, which
+//                                         klegl_CreateContext has always read.
+//                                         See the paragraph below.
+//
+// **Why EGL_KHR_create_context is not optional, and what its absence looked
+// like.** SDL2's SDL_EGL_CreateContext will not ask for a GLES 3 context on a
+// display that does not advertise it — it refuses BEFORE calling
+// eglCreateContext at all, with "Could not create EGL context (context
+// attributes are not supported)". The Simpsons Hit & Run VR guest asks for
+// GLES 3, so on launch #1 it got no context, and the failure did not look like
+// a context failure for one line afterwards: the game printed
+// `OpenGL - Vendor: Klepton ... OpenGL ES 3.2 Klepton` (our GL entry points do
+// not need a guest context to answer), created its OpenXR session with
+// `context 0x0`, reached FOCUSED, and submitted 2064x2208 stereo layers for
+// minutes — into swapchain textures nothing had ever drawn to, because
+// klegl_MakeCurrent is what hands kl_glfb the ANGLE context and it was never
+// called. The tells, three lines apart in the boot log:
+//
+//   [egl] t… eglGetCurrentContext -> 0x0 <- libmain.so+0x4fdfc4
+//   [glfb] t… glGenFramebuffers -> 0 (ctx 0x0)     (GL returns 0 with no context)
+//
+// ...and an all-black immersive space with no crash and no complaint.
+//
+// hl2vr, the other SDL guest, never hit it: srceng asks for GLES 2, which is
+// the branch SDL takes without the extension.
 //
 // The empty string is NOT the safe answer, legal as it is: AVPro Video's
 // OpenGLESPlayerRenderer::setupEglContext strdup()s this string and walks it
@@ -1259,7 +1769,8 @@ static const char *klegl_extensions(void) {
     if (!s) s = kl_env_str("KL_EGL_EXTENSIONS",
                            "EGL_KHR_image_base "
                            "EGL_ANDROID_image_native_buffer "
-                           "EGL_ANDROID_get_native_client_buffer");
+                           "EGL_ANDROID_get_native_client_buffer "
+                           "EGL_KHR_create_context");
     return s;
 }
 
@@ -1475,16 +1986,28 @@ static EGLContext klegl_CreateContext(EGLDisplay dpy, EGLConfig cfg,
     if (g_nctx >= sizeof g_contexts / sizeof g_contexts[0]) return NULL;
     kl_egl_context *c = &g_contexts[g_nctx++];
     c->client_version = 2;
-    // Remember which config this context was created against so eglQueryContext
-    // can answer EGL_CONFIG_ID with an id that round-trips through eglGetConfigs
-    // + eglGetConfigAttrib. HL2Q3VR's XR-graphics-binding matches the two to find
-    // the EGLConfig for XrGraphicsBindingOpenGLESAndroidKHR; without a real id it
-    // finds no config and refuses the session.
-    c->config_id = cfg ? ((const typeof(g_configs[0]) *)cfg)->id : g_configs[0].id;
-    for (const int32_t *a = attribs; a && *a != EGL_NONE; a += 2)
-        if (a[0] == 0x3098 /* EGL_CONTEXT_CLIENT_VERSION */) c->client_version = a[1];
-    fprintf(stderr, "  [egl] context %u = %p, GLES %d (created on t%llu)\n",
-            g_nctx - 1, (void *)c, c->client_version, klegl_tid());
+    // Which config, kept for eglQueryContext(EGL_CONFIG_ID): HL2VR's VR layer
+    // (Team Beef's HL2Quest code) re-finds its config by that id when it builds
+    // the OpenXR session's EGL state, and an id it cannot match is a session
+    // that never happens — "Unable to match Source EGLConfig" and a flat game.
+    // The id round-trips: it is g_configs' own, which eglGetConfigs enumerates.
+    c->config_id = cfg ? ((const typeof(g_configs[0]) *)cfg)->id : 0;
+    // 0x3098 is EGL_CONTEXT_CLIENT_VERSION and EGL_CONTEXT_MAJOR_VERSION_KHR —
+    // one token under two names, which is why advertising EGL_KHR_create_context
+    // needed no new attribute handling here. The minor version is read for the
+    // log line only: ANGLE hands kl_glfb whatever ES 3.x context it has, and a
+    // guest asking for 3.1 rather than 3.2 is not something this gateway can
+    // narrow. Everything else in the KHR list (context flags, the profile mask,
+    // robustness) is ignored on purpose — none of it is a promise we make.
+    int minor = 0;
+    for (const int32_t *a = attribs; a && *a != EGL_NONE; a += 2) {
+        if (a[0] == 0x3098 /* EGL_CONTEXT_CLIENT_VERSION / MAJOR_VERSION_KHR */)
+            c->client_version = a[1];
+        else if (a[0] == 0x30FB /* EGL_CONTEXT_MINOR_VERSION_KHR */)
+            minor = a[1];
+    }
+    fprintf(stderr, "  [egl] context %u = %p, GLES %d.%d (created on t%llu)\n",
+            g_nctx - 1, (void *)c, c->client_version, minor, klegl_tid());
     return (EGLContext)c;
 }
 
@@ -1502,10 +2025,11 @@ static EGLContext klegl_CreateContext(EGLDisplay dpy, EGLConfig cfg,
 //                               answer would be a promise that a draw is visible
 //                               without a swap.
 //
-// EGL_CONFIG_ID is the refusal: configs here are two fixed picks (see
-// klegl_ChooseConfig) and are not identified by id anywhere, so an id we
-// invented would not round-trip through eglGetConfigs — and a guest that used
-// it to re-find its config would get the wrong one, silently.
+// EGL_CONFIG_ID joined the answerable set when contexts started recording
+// their config: it was the refusal while configs were not identified anywhere
+// (an invented id would not round-trip through eglGetConfigs), and it became
+// honest the moment g_configs grew real ids — the answer is the id of the
+// config eglCreateContext was handed, which IS one eglGetConfigs enumerates.
 #define EGL_OPENGL_ES_API         0x30A0   // also klegl_BindAPI, below
 #define EGL_CONFIG_ID             0x3028
 #define EGL_CONTEXT_CLIENT_TYPE   0x3097
@@ -1566,10 +2090,12 @@ static unsigned klegl_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
         g_last_real_any = ctx;   // cross-thread sticky for the cinema eye-copy
     }
     // Whichever thread this is, it is the one that will now issue GL — or, when
-    // the guest releases the context (NULL), the one giving it up; migration
-    // mode needs both halves.
+    // the guest releases the context (NULL), the one giving it up; the gateway
+    // needs both halves. WHICH guest context goes with it matters: kl_glfb backs
+    // each distinct guest EGLContext with its own real ANGLE context in one
+    // share group, so this handle is the key it looks the real one up by.
     if (kl_glfb_enabled()) {
-        if (ctx) kl_glfb_make_current();
+        if (ctx) kl_glfb_make_current((void *)ctx);
         else     kl_glfb_release_current();
     }
     return EGL_TRUE;
@@ -1671,7 +2197,8 @@ static unsigned klegl_SwapBuffers(EGLDisplay dpy, EGLSurface s) {
     // its pixels).
     const char *out = kl_env_str("KL_GLFB_OUT", NULL);
     if (kl_glfb_enabled() &&
-        (out || kl_glfb_has_frame_sink() || kl_glfb_has_gpu_fence()))
+        (out || kl_glfb_has_frame_sink() || kl_glfb_has_gpu_fence() ||
+         kl_glfb_frametrace()))
         kl_glfb_present(out);
     return EGL_TRUE;
 }
@@ -1768,6 +2295,38 @@ static unsigned klegl_BindAPI(unsigned api) {
     return EGL_FALSE;
 }
 static unsigned klegl_QueryAPI(void) { return EGL_OPENGL_ES_API; }
+
+// eglGetCompositorTimingANDROID(dpy, surface, numTimestamps, const EGLint *names,
+// EGLnsecsANDROID *values) -> EGLBoolean. Part of
+// EGL_ANDROID_get_frame_timestamps, which this runtime does NOT implement and
+// does not name in eglQueryString(EGL_EXTENSIONS).
+//
+// UE4.26's AndroidEGL resolves the whole family through eglGetProcAddress and
+// then calls this one WITHOUT first asking
+// eglGetCompositorTimingSupportedANDROID (measured: the r2 boot log resolves six
+// of these names and calls exactly this one). On a real driver without the
+// extension eglGetProcAddress answers NULL and the guest's own null guard holds;
+// this gateway resolves everything by design, so the refusal has to be here.
+//
+// EGL_FALSE with EGL_BAD_ACCESS is the extension's own "no timing for this
+// surface", and it leaves the out array UNTOUCHED — which is the load-bearing
+// half: a success that wrote nothing would hand UE4 whatever was on its stack as
+// a composite deadline and pace the renderer against it. The other five names in
+// the family stay unimplemented and abort by name on purpose — that is how this
+// project finds out one of them is actually used.
+static unsigned klegl_GetCompositorTimingANDROID(EGLDisplay dpy, EGLSurface surf,
+                                                 int32_t n, const int32_t *names,
+                                                 int64_t *values) {
+    KLEGL_TRACE("eglGetCompositorTimingANDROID(%d)", n);
+    (void)dpy; (void)surf; (void)n; (void)names; (void)values;
+    static int said;
+    if (!said++)
+        fprintf(stderr, "  [egl] eglGetCompositorTimingANDROID -> EGL_FALSE "
+                        "(EGL_ANDROID_get_frame_timestamps is not implemented "
+                        "here; the frame clock is the compositor's)\n");
+    g_error = 0x3002 /* EGL_BAD_ACCESS */;
+    return EGL_FALSE;
+}
 
 static int32_t klegl_GetError(void) {
     KLEGL_TRACE("eglGetError"); int e = g_error; g_error = EGL_SUCCESS; return e; }
@@ -1868,6 +2427,9 @@ void kl_egl_report(FILE *f) {
     // swap: the last census before the abort is the one that names the class.
     kl_glfb_gl_census(f);
     kl_glfb_draw_census(f);
+    kl_glfb_link_census(f);
+    kl_glfb_program_binary_census(f);
+    kl_glfb_eye_map_census(f);
     unsigned called = 0;
     for (unsigned i = 0; i < g_ngl; i++) if (g_gl[i].calls) called++;
     // `calls` counts the NULL driver's own stubs. Under KL_GLFB=1 the guest gets
@@ -1909,6 +2471,7 @@ static const struct { const char *name; void *fn; } g_egl[] = {
     E("eglDestroyContext",      klegl_DestroyContext),
     E("eglQueryContext",        klegl_QueryContext),
     E("eglMakeCurrent",         klegl_MakeCurrent),
+    E("eglGetConfigs",          klegl_GetConfigs),
     E("eglGetCurrentContext",   klegl_GetCurrentContext),
     E("eglGetCurrentDisplay",   klegl_GetCurrentDisplay),
     E("eglGetCurrentSurface",   klegl_GetCurrentSurface),
@@ -1922,6 +2485,7 @@ static const struct { const char *name; void *fn; } g_egl[] = {
     // fourth member of this family and is intercepted in kl_glfb.c instead,
     // because the guest resolves it through eglGetProcAddress and it has to
     // fall through to ANGLE for anything that is not one of our images.
+    E("eglGetCompositorTimingANDROID", klegl_GetCompositorTimingANDROID),
     E("eglGetNativeClientBufferANDROID", klegl_GetNativeClientBufferANDROID),
     E("eglCreateImageKHR",      klegl_CreateImageKHR),
     E("eglDestroyImageKHR",     klegl_DestroyImageKHR),

@@ -70,6 +70,14 @@ int kl_driver_boot(FILE *out);
 
 // The active target's short name (targets.py key), or NULL before init.
 const char *kl_driver_target_name(void);
+// 1 when upstream's process-wide defaults apply to this run, 0 when the row is
+// one of the rows this branch measured on the headset with its own defaults.
+// Upstream turns several behaviours on for every title (MoltenVK concurrent
+// compilation, the 1.1 instance floor, the image-handle registry and overlay
+// shadows, ...); the measured rows were confirmed without them, so they keep
+// that configuration, and every other row — upstream's own, or one a user adds
+// — gets upstream's. KL_UPSTREAM_DEFAULTS=0/1 overrides the choice either way.
+int kl_driver_upstream_defaults(void);
 int kl_driver_gap_only(void);
 
 // Start the guest running: the Unity lifecycle natives (nativeRecreateGfxState,

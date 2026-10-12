@@ -125,6 +125,14 @@ const char *kl_app_target_name(void);
 // launcher UI identify itself on the first render, not only after a boot.
 const char *kl_app_target_name_or_default(void);
 int         kl_app_target_is_steamlink(void);
+// Scene policy, per target — read from the SwiftUI scene body, so both are safe
+// to call before kl_app_configure (see target_now in kl_app.c).
+//   own_hands     the guest draws its own hands; the system must not draw the
+//                 wearer's real ones over the scene (upperLimbVisibility)
+//   opaque_world  the guest draws an opaque world and wants the room gone;
+//                 .full immersion rather than .mixed
+int         kl_app_target_own_hands(void);
+int         kl_app_target_opaque_world(void);
 // Whether this target should open the immersive space FULLY immersive by default
 // (no passthrough) rather than .mixed. True for the native OpenXR VR kind
 // (GTA Vice City), which is an in-world game meant to fill the view — .mixed

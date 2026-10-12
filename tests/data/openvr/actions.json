@@ -1,0 +1,21 @@
+{
+  "action_sets": [
+    { "name": "/actions/default", "usage": "leftright" },
+    { "name": "/actions/move", "usage": "leftright" },
+    { "name": "/actions/dev", "usage": "leftright" }
+  ],
+  "actions": [
+    { "name": "/actions/default/in/TriggerPull", "type": "vector1" },
+    { "name": "/actions/default/in/Fire", "type": "boolean" },
+    { "name": "/actions/default/in/HandPoseLeft", "type": "pose" },
+    { "name": "/actions/default/in/HandPoseRight", "type": "pose" },
+    { "name": "/actions/default/in/HapticVibration", "type": "vibration" },
+    { "name": "/actions/move/in/Move", "type": "vector2" },
+    { "name": "/actions/move/in/Jump", "type": "boolean" },
+    { "name": "/actions/move/in/TurnLeft", "type": "boolean" },
+    { "name": "/actions/dev/in/ToggleMenu", "type": "boolean" }
+  ],
+  "default_bindings": [
+    { "controller_type": "oculus_touch", "binding_url": "bindings_touch.json" }
+  ]
+}

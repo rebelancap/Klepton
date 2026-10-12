@@ -13,6 +13,12 @@ void kl_mtl_provider_install(void);
 // which is the gate: the reference path and the interop path should agree.
 unsigned long kl_mtl_count_lit(int eye, int stage, int *out_w, int *out_h);
 
+// The eye texture's size and its identity, with no texels read — what the
+// composite audit needs, and cheap enough to ask every frame. Returns the
+// MTLTexture pointer (NULL when there is none) so a caller can compare the two
+// eyes' and learn whether they are ONE storage, which is what DoubleWide means.
+void *kl_mtl_eye_size(int eye, int stage, int *out_w, int *out_h);
+
 // The same, for a guest's non-eye LAYER — the only measurement there is for a
 // guest that presents its whole frame as a quad, whose eye table stays empty.
 unsigned long kl_mtl_count_lit_layer(int layer, int stage, int *out_w, int *out_h);

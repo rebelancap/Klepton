@@ -28,16 +28,66 @@ import argparse
 import bisect
 import os
 import re
+import struct
 import subprocess
 import sys
 
 PAT = re.compile(r"(lib[\w.+-]*\.so)\+0x([0-9a-fA-F]+)")
 
 
+def load_elf(path):
+    """(sorted addrs, names) read straight out of an ELF64 .symtab/.dynsym.
+
+    This is the primary path, and it exists because `nm` is not portable here:
+    Apple's /usr/bin/nm answers `no symbols` for an aarch64 ELF — including
+    libUE4.so, which carries 446k of them — and the toolchain llvm-nm is not on
+    PATH on every machine. A tool that quietly reports "no names" is worse than
+    one that fails, so the join no longer depends on an external nm at all.
+    Fifty lines of struct.unpack read exactly what is needed and nothing else.
+    """
+    try:
+        with open(path, "rb") as f:
+            d = f.read()
+    except OSError:
+        return [], []
+    if d[:4] != b"\x7fELF" or len(d) < 0x40 or d[4] != 2:      # ELF64 only
+        return [], []
+    shoff, = struct.unpack_from("<Q", d, 0x28)
+    shentsize, shnum = struct.unpack_from("<HH", d, 0x3a)
+    if not shoff or shoff + shnum * shentsize > len(d):
+        return [], []
+    # sh_offset of every section, for resolving each symbol table's sh_link.
+    sh_off = [struct.unpack_from("<Q", d, shoff + i * shentsize + 0x18)[0]
+              for i in range(shnum)]
+    out = []
+    for i in range(shnum):
+        h = shoff + i * shentsize
+        typ, = struct.unpack_from("<I", d, h + 4)
+        if typ not in (2, 11):                                 # SYMTAB, DYNSYM
+            continue
+        off, size = struct.unpack_from("<QQ", d, h + 0x18)
+        link, = struct.unpack_from("<I", d, h + 0x28)
+        if not size or link >= shnum:
+            continue
+        stroff = sh_off[link]
+        for j in range(size // 24):
+            o = off + j * 24
+            nm, info, _other, _shndx, val, _sz = struct.unpack_from("<IBBHQQ", d, o)
+            if not val or (info & 0xF) not in (1, 2):          # OBJECT, FUNC
+                continue
+            end = d.find(b"\0", stroff + nm)
+            out.append((val, d[stroff + nm:end].decode("utf8", "replace")))
+    out.sort()
+    return [s[0] for s in out], [s[1] for s in out]
+
+
 def load(path):
-    """(sorted addrs, names) from `nm`, or ([], []) if there is nothing to read."""
+    """(sorted addrs, names) for a guest library, or ([], []) if unreadable."""
     if not os.path.exists(path):
         return [], []
+    addrs, names = load_elf(path)
+    if addrs:
+        return addrs, names
     try:
         out = subprocess.run(["nm", "--defined-only", path],
                              capture_output=True, text=True).stdout

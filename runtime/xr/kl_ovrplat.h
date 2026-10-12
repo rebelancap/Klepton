@@ -37,6 +37,7 @@
 //
 // Reporting that the platform is unavailable is true here; answering "yes,
 // entitled" would not be.
+
 #ifndef KL_OVRPLAT_H
 #define KL_OVRPLAT_H
 #include <stdio.h>

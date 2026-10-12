@@ -184,7 +184,46 @@ typedef struct {
     // and `make check` gates on them, so a second population sharing the same
     // counters would move a number that is supposed to be stable.
     unsigned ctr_sites, ctr_patched, ctr_refused;
+    // The jump-table rewrite (round 13). `jt_sites` counts `br x18` dispatches
+    // recognised and converted to branch through x16 into a per-target thunk;
+    // `jt_thunks` is how many targets those tables held, which is what the
+    // rewrite costs in pool. `jt_fallback` is the `br x18` sites that could NOT
+    // be converted and still carry the guarded veneer — those keep the residual
+    // one-instruction window that killed Arizona Sunshine 2 at launches 5, 6
+    // and 7, so a non-zero count here is the number to look at.
+    unsigned jt_sites, jt_thunks, jt_fallback;
 } kl_x18_stats;
+
+// The image a chunk belongs to, so the jump-table rewrite can reach the TABLE.
+//
+// A `br x18` dispatch reads its targets from a table of 32-bit self-relative
+// offsets that lives in .rodata — a different section from the code being
+// veneered — and the whole point of the rewrite is to point those offsets at
+// thunks. kl_x18_emit is handed one executable chunk and nothing else, so the
+// caller supplies the two questions the rewrite has to ask about addresses
+// outside it. Pass NULL for `image` and the rewrite is simply not attempted:
+// every `br x18` keeps the guarded veneer it had before.
+typedef struct {
+    // A writable pointer to `len` bytes at guest VA `va`, or NULL. It must
+    // answer ONLY for non-executable data. Answering for text would let a
+    // mis-recognition write over code, which is the one failure mode this pass
+    // must not have.
+    void *(*data_at)(void *ctx, uint64_t va, size_t len);
+    void   *ctx;
+} kl_x18_image;
+
+// How far back the recogniser looks for each part of the dispatch idiom, and the
+// largest table it will convert. The scan bound is generous because the table
+// base (`adrp`/`add`) is routinely hoisted out of a loop, tens of instructions
+// above the dispatch that uses it; the entry bound is what keeps the pool
+// budget finite. KLX_JT_MAX_SITES bounds the per-chunk record array.
+#define KLX_JT_SCAN         128
+#define KLX_JT_MAX_ENTRIES  256
+#define KLX_JT_MAX_SITES    64
+
+// Pool words a single converted site can cost: the dispatch veneer plus two
+// instructions per thunk. klepton-ld and kl_x18_patch size their pools with it.
+#define KLX_JT_MAX_INSN     (KLX_VEN_MAX_INSN + 2 * KLX_JT_MAX_ENTRIES)
 
 // Check the assumptions the emitted code depends on: thread-pointer alignment
 // and that KLX_TSD_SLOT is actually free. Returns 0 on success; non-zero means
@@ -207,6 +246,15 @@ int  kl_x18_emit(void *code, size_t size, uint64_t code_va,
                  void *pool, size_t poolcap, uint64_t pool_va,
                  kl_x18_stats *st, size_t *pool_used);
 
+// ...and the same emitter with the image behind the chunk, which is what the
+// `br x18` jump-table rewrite needs to read and repoint the table. Callers that
+// can answer for the whole image (klepton-ld offline, kl_image.c at load time)
+// use this; kl_x18_emit is this with `image` NULL.
+int  kl_x18_emit_img(void *code, size_t size, uint64_t code_va,
+                     void *pool, size_t poolcap, uint64_t pool_va,
+                     const kl_x18_image *image,
+                     kl_x18_stats *st, size_t *pool_used);
+
 // Patch every x18 site in an executable range, which must still be writable.
 // `code` is where it is mapped now. Idempotent per range only in the sense that
 // it should be called once, before the segment is made read-execute.
@@ -222,8 +270,11 @@ int  kl_x18_emit(void *code, size_t size, uint64_t code_va,
 // several chunks share one reservation. Pass arena = NULL to fall back to
 // searching for a hole, which is right for a caller that has not reserved one
 // and is still correct for every library small enough to find one.
+// `image` may be NULL, and then the `br x18` jump-table rewrite is not
+// attempted for this chunk — see kl_x18_image.
 int  kl_x18_patch(void *code, size_t size, void *arena, size_t arena_size,
-                  size_t *arena_used, kl_x18_stats *st);
+                  size_t *arena_used, const kl_x18_image *image,
+                  kl_x18_stats *st);
 
 // The data-inside-code detector, exposed so tests/t_x18.c reports the verdict
 // the loader acts on. `index` is a WORD index into `code`; the window is
@@ -234,6 +285,12 @@ int kl_x18_is_data(const void *code, size_t size, size_t index);
 // — without emitting anything. klepton-ld sizes its pool with it, so it has to
 // be the total rather than the x18 half; the stats keep the two apart.
 unsigned kl_x18_count(const void *code, size_t size);
+
+// How many of those are `br x18` — the terminal-branch shape, and the only one
+// whose veneer can grow a thunk per jump-table target. Pool sizing needs it
+// apart from the total because one of these can cost KLX_JT_MAX_INSN words
+// where every other site costs KLX_VEN_MAX_INSN.
+unsigned kl_x18_count_termbr(const void *code, size_t size);
 
 // What an offline translation did, recorded in the emitted image's
 // __TEXT,__klstat section. A translated library has no sites left to count at
@@ -294,5 +351,26 @@ unsigned kl_x18_data_ranges(const void *elf, size_t size,
 int kl_x18_next_code(uint64_t sec_va, size_t sec_size,
                      const klx_range *skip, unsigned nskip,
                      uint64_t *cursor, uint64_t *out_va, size_t *out_size);
+
+// The `br x18` veneer's OTHER race: an exception return between its `mrs` and
+// its `ldr` zeroes x18, so the load reads KLX_TSD_SLOT*8 (0xfa0) instead of the
+// shadow slot. Call from a SIGSEGV handler with the siginfo address and the
+// ucontext; returns 1 if it was that race and the context has been rewound to
+// retry it (the caller should return from the handler and resume), 0 if the
+// fault was anything else and must be reported as usual. Bounded internally.
+int kl_x18_recover_fault(const void *fault_addr, void *uctx);
+
+// How many times the above fired. Reported by kl_x18_report.
+unsigned kl_x18_recoveries(void);
+
+// How many sites the veneer pass REFUSED, across every library loaded so far.
+// A refusal is not a site left merely unpatched: a refused site that WRITES x18
+// leaves the shadow slot stale, and every later read of it is wrong (see the
+// long note above `note_refusal`). The count therefore has to be answerable
+// from a running process and not only from `make check` — a port whose host
+// sweep is clean can still be loading a library the device sweep refuses. Rides
+// the heartbeat for the same reason the recovery count does: the fault it
+// belongs to cannot report itself.
+unsigned kl_x18_refusals(void);
 
 #endif

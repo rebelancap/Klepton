@@ -15,12 +15,17 @@
 #include "kl_opensl.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
+#include "kl_openxr.h"
+#include "kl_openvr.h"
 #include "kl_mediandk.h"
 #include "kl_vulkan.h"
 #include "kl_aaudio.h"
+#include "kl_ndk.h"
 #include "kl_openxr.h"
 
-#define KL_MAX_IMAGES 64
+// 64 held every bionic guest in the fleet. A glibc guest (the native Alyx boot
+// on hla) links ~130 glibc images beside its bionic ones, and dlopens more later.
+#define KL_MAX_IMAGES 256
 typedef struct { char soname[128]; kl_image *img; } entry;
 static entry  g_imgs[KL_MAX_IMAGES];
 static int    g_nimgs = 0;
@@ -92,6 +97,11 @@ void kl_register_image(const char *soname, kl_image *img) {
         snprintf(g_imgs[g_nimgs].soname, sizeof g_imgs[0].soname, "%s", base);
         g_imgs[g_nimgs].img = img;
         g_nimgs++;
+    } else {
+        // Past the table the image is loaded but invisible: no later import
+        // binds to it, dlsym cannot find it, the unwinder cannot see it.
+        fprintf(stderr, "  [klepton] image registry FULL (%d) — %s is loaded but NOT "
+                        "registered; raise KL_MAX_IMAGES\n", KL_MAX_IMAGES, soname);
     }
     pthread_mutex_unlock(&g_lock);
     // libgl4es IS the guest's GL whenever it is present — it is a GL 1.x-over-GLES
@@ -302,6 +312,71 @@ void *kl_guest_sym_global(const char *name) {
     return v;
 }
 
+void *kl_guest_sym_ordered(const char *name, int glibc, const char **soname_out) {
+    void *v = NULL;
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < g_nimgs && !v; i++) {
+        if (kl_image_is_glibc(g_imgs[i].img) != (glibc != 0)) continue;
+        v = kl_sym(g_imgs[i].img, name);
+        if (v && soname_out) *soname_out = g_imgs[i].soname;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return v;
+}
+
+// ---------- replaced sonames, for a glibc image ----------
+// A glibc image's DT_NEEDED names a few libraries the runtime REPLACES rather
+// than loads: glibc itself (the personality, kl_glibc.c), an OpenVR client
+// (kl_openvr), Vulkan and the OpenXR loader (kl_vulkan, kl_openxr), and
+// libraries a PORT supplies its own stand-in for (hla: Steam API, its kept
+// bionic SDL2). The same shape as the kl_*_claims(path) dlopen claims above,
+// keyed by soname: `owner` is what a door's report buckets an unresolved
+// import under, and `sym`, when a module exists, answers a name at relocation
+// time. A port installs its own module for a row with kl_glibc_claim_provide.
+typedef struct { const char *soname, *owner; void *(*sym)(const char *); } kl_glibc_claim;
+static kl_glibc_claim g_glibc_claims[] = {
+    { "libc.so.6",             "kl_glibc (personality)", NULL },
+    { "libm.so.6",             "kl_glibc (personality)", NULL },
+    { "ld-linux-aarch64.so.1", "kl_glibc (personality)", NULL },
+    { "libdl.so.2",            "kl_glibc (personality)", NULL },
+    { "librt.so.1",            "kl_glibc (personality)", NULL },
+    { "libpthread.so.0",       "kl_glibc (personality)", NULL },
+    { "libopenvr_api.so",      "kl_openvr", kl_openvr_sym },
+    { "libsteam_api.so",       "libsteam_api (port-supplied)", NULL },
+    { "libSDL2.so",            "libSDL2 (port-supplied)", NULL },
+    { "libSDL2-2.0.so.0",      "libSDL2 (port-supplied)", NULL },
+    { "libvulkan.so.1",        "kl_vulkan", kl_vulkan_sym },
+    { "libvulkan.so",          "kl_vulkan", kl_vulkan_sym },
+    { "libopenxr_loader.so",   "kl_openxr", kl_openxr_sym },
+};
+
+static kl_glibc_claim *glibc_claim(const char *soname) {
+    if (!soname) return NULL;
+    for (size_t i = 0; i < sizeof g_glibc_claims / sizeof *g_glibc_claims; i++)
+        if (!strcmp(g_glibc_claims[i].soname, soname)) return &g_glibc_claims[i];
+    return NULL;
+}
+
+const char *kl_glibc_soname_claim(const char *soname) {
+    const kl_glibc_claim *c = glibc_claim(soname);
+    return c ? c->owner : NULL;
+}
+
+void *kl_glibc_claim_sym(const char *soname, const char *name, const char **who_out) {
+    const kl_glibc_claim *c = glibc_claim(soname);
+    void *v = c && c->sym ? c->sym(name) : NULL;
+    if (v && who_out) *who_out = c->owner;
+    return v;
+}
+
+int kl_glibc_claim_provide(const char *soname, const char *owner, void *(*sym)(const char *)) {
+    kl_glibc_claim *c = glibc_claim(soname);
+    if (!c) return -1;
+    if (owner) c->owner = owner;
+    c->sym = sym;
+    return 0;
+}
+
 // Load an .so together with its DT_NEEDED chain, dependencies first, so each
 // image's relocation-time imports can bind against the images it needs
 // (kl_guest_sym_global). Names with no file in the library path are assumed
@@ -494,6 +569,7 @@ int kl_can_dlopen(const char *path) {
     return kl_egl_claims(path)  || kl_opensl_claims(path)   || kl_ovrp_claims(path) ||
            kl_ovrplat_claims(path) || kl_mediandk_claims(path) ||
            kl_vulkan_claims(path) || kl_aaudio_claims(path) ||
+           kl_ndk_claims(path)    ||
            kl_openxr_claims(path) || kl_core_shim_claims(path) || kl_can_load(path);
 }
 
@@ -653,6 +729,42 @@ static void kl_dlopen_note_miss(const char *path) {
 
 static void kl_dl_trace_shims(void);
 
+void *klb_dlopen(const char *path, int flags);
+
+// android_dlopen_ext(path, flags, extinfo) is plain dlopen plus a request about
+// WHERE the library should land: a caller-reserved address range, a caller-owned
+// fd to read the ELF from, or a linker namespace to resolve it in. None of the
+// three has a meaning here — we place every guest image ourselves, and there are
+// no linker namespaces at all — so the honest answer is to serve the path and
+// say out loud which request we ignored, rather than refuse the name and abort a
+// guest whose extinfo very likely only asked for a namespace. libMetaXRAudioWwise
+// imports this alongside the liblog names; nothing had reached it yet.
+//
+// The one flag we could NOT paper over is ANDROID_DLEXT_USE_LIBRARY_FD (0x10):
+// the caller means "load THIS fd", and a path lookup is then a different file
+// (or none). That case gets its own line so a future round sees it named instead
+// of inferring it from a library that loaded the wrong bytes.
+void *klb_dlopen_ext(const char *path, int flags, const void *extinfo) {
+    if (extinfo) {
+        // struct android_dlextinfo { uint64_t flags; void *reserved_addr;
+        //                            size_t reserved_size; int relro_fd;
+        //                            int library_fd; off64_t library_fd_offset;
+        //                            struct android_namespace_t *library_namespace; }
+        unsigned long long ef = *(const unsigned long long *)extinfo;
+        static int once;
+        if (!once) {
+            once = 1;
+            fprintf(stderr, "  [dl] android_dlopen_ext(%s) extinfo flags=0x%llx "
+                    "— ignored; we place guest images ourselves and have no "
+                    "linker namespaces\n", path ? path : "(null)", ef);
+        }
+        if (ef & 0x10ULL)
+            fprintf(stderr, "  [dl] android_dlopen_ext(%s) asked for "
+                    "USE_LIBRARY_FD — we are opening the PATH instead, which "
+                    "may not be the same bytes\n", path ? path : "(null)");
+    }
+    return klb_dlopen(path, flags);
+}
 // The Android system libraries that are ALWAYS resident on a device. Their
 // DT_NEEDED edges are already "shim-served (skip)" (kl_load_recursive), but an
 // explicit runtime dlopen() by name is a different door: there is no file to
@@ -738,6 +850,11 @@ void *klb_dlopen(const char *path, int flags) {
     // which is why this door was missing for so long.)
     void *aa = kl_aaudio_dlopen(path);
     if (aa) return aa;
+    // libandroid.so. Same shape as the AAudio line above, and found the same
+    // way: FMOD's asset layer dlopens it by name rather than importing it, and
+    // the miss cost every FMOD bank in HARD BULLET. See kl_ndk_dlopen.
+    void *ndk = kl_ndk_dlopen(path);
+    if (ndk) return ndk;
     // The OpenXR loader. This one is NOT like the lines above it: the file
     // really is in the guest tree, so this must come first to keep the real
     // Khronos loader from loading successfully and then failing at the Android
@@ -842,6 +959,7 @@ void *klb_dlsym(void *handle, const char *name) {
     if (kl_mediandk_is_handle(handle)) return kl_mediandk_sym(name);
     if (kl_vulkan_is_handle(handle)) return kl_vulkan_sym(name);
     if (kl_aaudio_is_handle(handle)) return kl_aaudio_sym(name);
+    if (kl_ndk_is_handle(handle)) return kl_ndk_sym(name);
     if (kl_openxr_is_handle(handle)) return kl_openxr_sym(name);
     // A core system-library handle (libc.so &c.) resolves like RTLD_DEFAULT: the
     // shim serves libc, and the global image search covers anything a guest .so
@@ -978,16 +1096,168 @@ static wchar_t *kl_trace_wmemchr(const wchar_t *s, wchar_t c, size_t n) {
     return r;
 }
 
-static void *kl_dl_shim_override(const char *name) {
-    if (strcmp(name, "wmemchr") == 0 && g_real_wmemchr)
-        return (void *)kl_trace_wmemchr;
+// KL_TRACE_EOS=1 — see the Epic Online Services SDK from the outside.
+//
+// Why here: a guest that ships libEOSSDK.so imports EOS_* the ordinary way, by
+// ELF relocation against that image — there is no dlsym to watch and no JNI
+// crossing until well after EOS_Initialize. When a Redpoint EOS subsystem
+// comes back NULL (Tetris Effect: `GetOnlineSubsystem(FName("RedpointEOS"))`
+// returns nothing and the game dereferences it unchecked), the ONE question
+// worth an instrument is whether the SDK was reached at all — "the module gave
+// up before EOS" and "EOS_Initialize failed" are different rounds of work and
+// look identical from the crash.
+//
+// kl_shim_lookup is consulted for every undefined import BEFORE the guest
+// image registry (kl_image.c sym_value), so an entry here shadows the real
+// export at bind time and forwards to it by name. Nothing is faked: every
+// wrapper calls the real SDK and returns its answer unchanged.
+//
+// The logging wrapper is the valuable half. EOS carries its own diagnostics
+// and the guest normally throws them away in a Shipping build (NO_LOGGING
+// compiles UE_LOG out entirely — that is why a klepton run of a shipped UE4
+// title has no engine log at all). Chaining the guest's callback and turning
+// every category up to VeryVerbose gets the SDK's own account of what it did.
+typedef struct { const char *category, *message; int32_t level; } kl_eos_logmsg;
+static void (*g_eos_guest_logcb)(const kl_eos_logmsg *);
+static int   g_eos_trace;
+
+static void *kl_eos_real(const char *name) {
+    void *v = kl_guest_sym_global(name);
+    if (!v) fprintf(stderr, "  [eos] %s is not in any loaded image\n", name);
+    return v;
+}
+
+static const char *kl_eos_str(const char *s) { return s ? s : "(null)"; }
+
+static const char *kl_eos_result(int32_t r) {
+    static const char *(*to_string)(int32_t);
+    if (!to_string) to_string = (const char *(*)(int32_t))kl_eos_real("EOS_EResult_ToString");
+    const char *s = to_string ? to_string(r) : NULL;
+    return s ? s : "?";
+}
+
+static void kl_eos_logcb(const kl_eos_logmsg *m) {
+    if (m) fprintf(stderr, "  [eos:%d] %s: %s\n", m->level,
+                   kl_eos_str(m->category), kl_eos_str(m->message));
+    if (g_eos_guest_logcb) g_eos_guest_logcb(m);
+}
+
+static int32_t kl_eos_Logging_SetCallback(void (*cb)(const kl_eos_logmsg *)) {
+    static int32_t (*real)(void (*)(const kl_eos_logmsg *));
+    if (!real) real = (int32_t (*)(void (*)(const kl_eos_logmsg *)))
+                          kl_eos_real("EOS_Logging_SetCallback");
+    g_eos_guest_logcb = cb;
+    fprintf(stderr, "  [eos] Logging_SetCallback(%p) — chaining ours in front\n",
+            (void *)cb);
+    return real ? real(kl_eos_logcb) : -1;
+}
+
+static int32_t kl_eos_Logging_SetLogLevel(int32_t category, int32_t level) {
+    static int32_t (*real)(int32_t, int32_t);
+    if (!real) real = (int32_t (*)(int32_t, int32_t))kl_eos_real("EOS_Logging_SetLogLevel");
+    if (!real) return -1;
+    // The guest picks its own level; under the trace we want everything, so the
+    // request is raised, never lowered. 6 is EOS_LOG_VeryVerbose.
+    int32_t want = level < 6 ? 6 : level;
+    fprintf(stderr, "  [eos] Logging_SetLogLevel(cat=%d, %d -> %d)\n",
+            category, level, want);
+    return real(category, want);
+}
+
+// EOS_InitializeOptions, from the SDK's eos_init.h. Only the fields printed are
+// read, and the tail (thread affinity) is left alone.
+typedef struct {
+    int32_t api_version; void *alloc, *realloc_, *release;
+    const char *product_name, *product_version;
+    void *reserved, *system_initialize_options, *override_thread_affinity;
+} kl_eos_init_opts;
+
+static int32_t kl_eos_Initialize(const kl_eos_init_opts *o) {
+    static int32_t (*real)(const void *);
+    if (!real) real = (int32_t (*)(const void *))kl_eos_real("EOS_Initialize");
+    fprintf(stderr, "  [eos] EOS_Initialize(api=%d product=%s version=%s "
+                    "systemOptions=%p)\n",
+            o ? o->api_version : -1, o ? kl_eos_str(o->product_name) : "(null)",
+            o ? kl_eos_str(o->product_version) : "(null)",
+            o ? o->system_initialize_options : NULL);
+    if (!real) return -1;
+    int32_t r = real(o);
+    fprintf(stderr, "  [eos] EOS_Initialize -> %d (%s)\n", r, kl_eos_result(r));
+    return r;
+}
+
+// EOS_Platform_Options, from eos_sdk.h. ClientSecret is deliberately reported
+// as present/absent and never printed.
+typedef struct {
+    int32_t api_version; int32_t pad; void *reserved;
+    const char *product_id, *sandbox_id;
+    const char *client_id, *client_secret;
+    int32_t is_server; int32_t pad2;
+    const char *encryption_key, *country_code, *locale_code, *deployment_id;
+    uint64_t flags;
+} kl_eos_platform_opts;
+
+static void *kl_eos_Platform_Create(const kl_eos_platform_opts *o) {
+    static void *(*real)(const void *);
+    if (!real) real = (void *(*)(const void *))kl_eos_real("EOS_Platform_Create");
+    fprintf(stderr, "  [eos] EOS_Platform_Create(api=%d product=%s sandbox=%s "
+                    "deployment=%s clientId=%s clientSecret=%s server=%d)\n",
+            o ? o->api_version : -1, o ? kl_eos_str(o->product_id) : "(null)",
+            o ? kl_eos_str(o->sandbox_id) : "(null)",
+            o ? kl_eos_str(o->deployment_id) : "(null)",
+            o ? kl_eos_str(o->client_id) : "(null)",
+            o && o->client_secret ? "present" : "absent",
+            o ? o->is_server : -1);
+    if (!real) return NULL;
+    void *h = real(o);
+    fprintf(stderr, "  [eos] EOS_Platform_Create -> %p%s\n", h,
+            h ? "" : "  ** NULL — no platform handle **");
+    return h;
+}
+
+static int32_t kl_eos_Shutdown(void) {
+    static int32_t (*real)(void);
+    if (!real) real = (int32_t (*)(void))kl_eos_real("EOS_Shutdown");
+    int32_t r = real ? real() : -1;
+    fprintf(stderr, "  [eos] EOS_Shutdown -> %d (%s)\n", r, kl_eos_result(r));
+    return r;
+}
+
+static void *kl_eos_trace_sym(const char *name) {
+    if (!g_eos_trace || strncmp(name, "EOS_", 4) != 0) return NULL;
+    if (strcmp(name, "EOS_Initialize") == 0)            return (void *)kl_eos_Initialize;
+    if (strcmp(name, "EOS_Platform_Create") == 0)       return (void *)kl_eos_Platform_Create;
+    if (strcmp(name, "EOS_Shutdown") == 0)              return (void *)kl_eos_Shutdown;
+    if (strcmp(name, "EOS_Logging_SetCallback") == 0)   return (void *)kl_eos_Logging_SetCallback;
+    if (strcmp(name, "EOS_Logging_SetLogLevel") == 0)   return (void *)kl_eos_Logging_SetLogLevel;
     return NULL;
 }
 
+static void *(*g_shim_override_next)(const char *name);
+
+static void *kl_dl_shim_override(const char *name) {
+    if (strcmp(name, "wmemchr") == 0 && g_real_wmemchr)
+        return (void *)kl_trace_wmemchr;
+    void *e = kl_eos_trace_sym(name);
+    if (e) return e;
+    return g_shim_override_next ? g_shim_override_next(name) : NULL;
+}
+
+// Installed from a constructor, not from the first klb_dlopen: the imports this
+// shadows are bound while the DT_NEEDED chain is being loaded, which is before
+// any guest dlopen happens.
+__attribute__((constructor))
 static void kl_dl_trace_shims(void) {
-    if (!kl_env_on("KL_TRACE_WMEMCHR", 0)) return;
-    g_real_wmemchr = wmemchr;
+    static int once; if (once) return; once = 1;
+    g_eos_trace = kl_env_on("KL_TRACE_EOS", 0);
+    if (kl_env_on("KL_TRACE_WMEMCHR", 0)) g_real_wmemchr = wmemchr;
+    if (!g_real_wmemchr && !g_eos_trace) return;
+    g_shim_override_next = kl_shim_override;
     kl_shim_override = kl_dl_shim_override;
+    if (g_eos_trace)
+        fprintf(stderr, "  [eos] KL_TRACE_EOS on — EOS_Initialize, "
+                        "EOS_Platform_Create, EOS_Shutdown and the logging pair "
+                        "are wrapped; every call forwards to the real SDK\n");
 }
 
 static void *kl_dl_interpose(const char *name, void *real) {

@@ -96,6 +96,18 @@ TARGETS = [(d, None) for d in UNITY_TREES] + [
       'libQt6Core_arm64-v8a', 'libQt6Gui_arm64-v8a', 'libQt6Network_arm64-v8a',
       'libQt6Widgets_arm64-v8a', 'libQt6Svg_arm64-v8a',
       'libplugins_platforms_qvirtual_arm64-v8a']),
+    # Half-Life 2 VR (nillerusr's srceng port): thirty plain C++ libraries,
+    # no Unity and no Oculus anything — its libc surface is what a big
+    # non-Unity engine actually imports (fortify chks, the wcs family, scandir,
+    # libz). The name list is discovered (None), the same call targets.py's
+    # `libs: None` makes: the library set is a property of the APK.
+    (os.path.join(ROOT, 'hl2vr/lib/arm64-v8a'), None),
+    # The Simpsons: Hit & Run VR (kote2345's port of the SHAR decompilation) —
+    # the second SDL2 guest, and a libc surface neither Unity nor Source has:
+    # a 2003 console engine's C runtime plus FFmpeg's (libavcodec and friends
+    # ship in this APK for the game's .rmv movies) and OpenAL Soft's. Discovered
+    # (None), the same call targets.py's `libs: None` makes.
+    (os.path.join(ROOT, 'simpsons/lib/arm64-v8a'), None),
 ]
 
 # Libraries we REPLACE rather than translate, so their imports
@@ -105,15 +117,12 @@ TARGETS = [(d, None) for d in UNITY_TREES] + [
 # step with GUEST_REPLACED in the Makefile.
 GUEST_REPLACED = {'libOVRPlugin', 'libovrplatformloader', 'libvrapi'}
 
-# Not part of the APPLICATION at all, so its imports are not the guest's.
-# Beat Saber 1.40 as unpacked here is a modified build whose
-# UnityPlayerActivity.<clinit> was patched to System.loadLibrary("frda") -- a
-# Frida-based injector, configured by libfrda.config.so to patch
-# libovrplatformloader / libvrapi / libc and hijack entitlement RESPONSES for a
-# table of 249 DLC asset IDs and ~270 SKUs. That is the circumvention this
-# project refuses in code (kl_ovrplat.c, the DRM line), and
-# nothing in the game depends on it: no DT_NEEDED anywhere names either
-# library. Keep in step with GUEST_EXCLUDED in the Makefile.
+# Not part of the APPLICATION at all, so their imports are not the guest's.
+# libfrda and libscript (with libfrda.config.so) are third-party
+# instrumentation libraries; no DT_NEEDED anywhere names them. They target
+# libovrplatformloader / libvrapi / libc, which this project replaces, so they
+# would be inert anyway. Entitlement behaviour is kl_ovrplat.c's.
+# Keep in step with GUEST_EXCLUDED in the Makefile.
 GUEST_EXCLUDED = {'libfrda', 'libscript'}
 
 
@@ -134,8 +143,8 @@ def unity_libs(d):
     than a property of this project -- pointing LIBS at another old-Unity title
     should not require editing a list here.
 
-    Selected on the ELF MAGIC, not on the extension. Beat Saber 1.40 ships
-    `libfrda.config.so`, which is JSON: naming a data file `.so` is how you get
+    Selected on the ELF MAGIC, not on the extension. Some APKs ship
+    `libfrda.config.so`, which is not an ELF: naming a data file `.so` is how you get
     Android's installer to extract it into the app's lib dir beside the real
     libraries. Globbing on `.so` handed that file to undefined_symbols() below,
     which read its text as a section-header offset (8100131176265705836) and
@@ -223,6 +232,26 @@ __google_potentially_blocking_region_begin __google_potentially_blocking_region_
 getrandom isnan
 mmap madvise sysinfo
 warnx fopen64 fseeko64 ftello64 __fwrite_chk exit _exit chdir
+# ...and the HL2VR (srceng) batch: struct-layout or numbering mismatches the
+# compiler cannot see (scandir/alphasort hand a guest an array of bionic
+# dirents, which do not match Darwin's; __fpclassifyd's FP_* numbering differs),
+# a variable rather than a function (__stack_chk_guard — the canary itself, which
+# must be the value kl_thread_init seeds), fortify chks Darwin spells with three
+# underscores and a different argument order, and the two wcs case functions
+# Darwin does not have. Hand-written in kl_libc.c / kl_shim.c / kl_va_thunks.S.
+scandir alphasort wcscasecmp wcsncasecmp __fpclassifyd __isnanf
+__stack_chk_guard __snprintf_chk __sprintf_chk __recvfrom_chk
+popen pclose
+statfs64 execlp
+# ...and getcwd, which is neither a layout nor a numbering mismatch: it is the
+# one path call that hands a name OUT. A direct forward gives the guest the
+# HOST spelling of its own working directory, and srceng lowercases what it is
+# told and keeps it as a search-path root — which only works where the
+# filesystem is case-insensitive. See klb_getcwd in kl_libc.c.
+getcwd
+# ...and the signal NUMBER entry points, which carry the Linux<->Darwin SIGUSR2/
+# SIGSYS swap (kl_sig_to_darwin in kl_libc.c) — the hla SysV-semaphore batch.
+kill raise signal
 """.split())
 
 # Excluded from the table but NOT hand-written anywhere: names we deliberately

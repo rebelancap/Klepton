@@ -193,9 +193,15 @@ static void probe_dump_enum(const char *spec) {
     }
 }
 
-static void probe_dump_enums(void) {
+// Public, and callable BEFORE the frame pump exists — see kl_mprobe.h. The
+// gating below (KL_PROBE_INPUT, KL_PROBE_FROM=1200) is right for a probe that
+// reads live input state and wrong for this one: an enum's values are fixed the
+// moment the runtime is up, and a guest that never reaches frame 1200 on the
+// host (Arkham Shadow stops at initJni there) could not be asked at all.
+void kl_mprobe_enums(void) {
     const char *spec = kl_env_str("KL_PROBE_ENUM", NULL);
     if (!spec || !*spec) return;
+    if (!mprobe_init()) { fprintf(stderr, "  [mprobe] enum: IL2CPP not up\n"); return; }
     char buf[512];
     snprintf(buf, sizeof buf, "%s", spec);
     for (char *p = buf, *tok; (tok = strsep(&p, ",")) != NULL; )
@@ -425,6 +431,13 @@ void kl_mprobe_tick(unsigned frame) {
 
     static int on = -1;
     if (on < 0) on = kl_env_on("KL_PROBE_INPUT", 0);
+    // ...and act on it. This gate was computed and then not consulted, so the
+    // probe — which the header and the comment below both describe as off by
+    // default, BECAUSE it has side effects — ran on every host boot past frame
+    // 1200 of every title. It was still running the day it stopped being
+    // harmless: it is in the stack of the out-of-memory abort SUPERHOT hit the
+    // first time it got far enough to load its main scene.
+    if (!on) return;
     static unsigned every, from;
     if (!every) {
         every = kl_env_uint("KL_PROBE_EVERY", 120);
@@ -440,7 +453,7 @@ void kl_mprobe_tick(unsigned frame) {
     if (!mprobe_init()) { on = 0; return; }
 
     static int dumped_enums;
-    if (!dumped_enums) { dumped_enums = 1; probe_dump_enums(); }
+    if (!dumped_enums) { dumped_enums = 1; kl_mprobe_enums(); }
 
     // Input.GetJoystickNames and InputTracking.GetLocalPosition/Rotation are
     // NOT here: IL2CPP's managed stripping removed them, which is itself the
@@ -738,5 +751,349 @@ void kl_mprobe_tick(unsigned frame) {
         }
         fprintf(stderr, "\n");
     }
+    fflush(stderr);
+}
+
+// ===========================================================================
+// KL_PROBE_TIMELINE — read the fields of a running state machine
+// ===========================================================================
+//
+// Everything above CALLS managed methods. This half READS managed fields,
+// which is what a stalled sequence needs: SUPERHOT's launch is a
+// `LevelTimeline` walking a `List<LevelPhase>`, and disassembly can enumerate
+// the phases the coroutine queues but cannot say which index the walk is
+// sitting on 20 seconds later. The index is a field; so is every reason a
+// phase has for not finishing (its duration, its elapsed time, its done byte).
+//
+// The offsets below were read out of `LevelTimeline::Update` (0xdc05bc) and
+// `LevelPhase::Update` (0xd39744) and are printed back with the field NAME
+// il2cpp's own metadata puts at each one — so a wrong offset shows up as a
+// mismatched name in the log rather than as a plausible wrong number.
+
+typedef struct FieldInfo FieldInfo;
+
+static struct {
+    FieldInfo   *(*class_get_field_from_name)(Il2CppClass *, const char *);
+    FieldInfo   *(*class_get_fields)(Il2CppClass *, void **);
+    size_t       (*field_get_offset)(FieldInfo *);
+    const char  *(*field_get_name)(FieldInfo *);
+    void         (*field_static_get_value)(FieldInfo *, void *);
+    int          (*field_get_flags)(FieldInfo *);
+    Il2CppClass *(*class_get_parent)(Il2CppClass *);
+    Il2CppClass *(*class_get_nested_types)(Il2CppClass *, void **);
+} ilf;
+
+#define FIELD_ATTR_STATIC 0x0010   // ECMA-335 FieldAttributes.Static
+
+static int g_tl_state;   // 0 = untried, 1 = up, -1 = unavailable
+
+static int tl_init(void) {
+    if (g_tl_state) return g_tl_state > 0;
+    g_tl_state = -1;
+    kl_image *img = kl_find_image("libil2cpp.so");
+    if (!img) return 0;
+#define BINDF(field, sym) \
+    do { *(void **)&ilf.field = kl_sym(img, sym); \
+         if (!ilf.field) { fprintf(stderr, "  [mprobe] libil2cpp exports no %s\n", sym); \
+                           return 0; } } while (0)
+    BINDF(class_get_field_from_name, "il2cpp_class_get_field_from_name");
+    BINDF(class_get_fields,          "il2cpp_class_get_fields");
+    BINDF(field_get_offset,          "il2cpp_field_get_offset");
+    BINDF(field_get_name,            "il2cpp_field_get_name");
+    BINDF(field_static_get_value,    "il2cpp_field_static_get_value");
+    BINDF(field_get_flags,           "il2cpp_field_get_flags");
+    BINDF(class_get_parent,          "il2cpp_class_get_parent");
+    BINDF(class_get_nested_types,    "il2cpp_class_get_nested_types");
+#undef BINDF
+    g_tl_state = 1;
+    return 1;
+}
+
+// The name metadata gives the field at `off`, searching up the inheritance
+// chain. "" when nothing lives there — which is the finding, not a formatting
+// problem: it means the offset was read wrong.
+static const char *field_name_at(Il2CppClass *k, size_t off) {
+    for (; k; k = ilf.class_get_parent(k)) {
+        void *it = NULL;
+        FieldInfo *f;
+        while ((f = ilf.class_get_fields(k, &it)))
+            if (ilf.field_get_offset(f) == off) return ilf.field_get_name(f);
+    }
+    return "";
+}
+
+static size_t field_off(Il2CppClass *k, const char *name) {
+    FieldInfo *f = k ? ilf.class_get_field_from_name(k, name) : NULL;
+    return f ? ilf.field_get_offset(f) : 0;
+}
+
+// LevelTimeline, from LevelTimeline::Update.
+#define TL_PHASES  0x38   // List<LevelPhase>
+#define TL_INDEX   0x40   // int, the walk position
+#define TL_DONE    0x4c   // bool, set when index runs off the end
+#define TL_MODE    0x74   // int; 2 checks OmniVRSubScene.Pause, 1 Cfiszenplac.IsPaused
+// LevelPhase, from LevelPhase::Update.
+#define PH_ONSTART 0x10
+#define PH_ONUPD   0x20
+#define PH_ENDCOND 0x30
+#define PH_ADDCOND 0x38
+#define PH_DUR     0x40   // float; NewPhase defaults it to -1 (= ends at once)
+#define PH_ELAPSED 0x44
+#define PH_DELAY   0x48
+#define PH_NAME    0x50
+#define PH_DONE    0x58
+#define PH_SKIPPED 0x59
+#define PH_STARTED 0x5a
+#define PH_REALT   0x5b
+
+static void dump_phase(unsigned frame, const char *tag, int i, Il2CppObject *ph,
+                       Il2CppClass *k_phase) {
+    if (!ph) { fprintf(stderr, "  [tl f%u] %s %2d: <null>\n", frame, tag, i); return; }
+    uint8_t *p = (uint8_t *)ph;
+    char nm[128];
+    str_ascii(*(Il2CppObject **)(p + PH_NAME), nm, sizeof nm);
+    fprintf(stderr, "  [tl f%u] %s %2d: \"%s\" dur=%.3f elapsed=%.3f delay=%.3f "
+                    "done=%d started=%d skipped=%d realtime=%d "
+                    "onStart=%s onUpdate=%s endCond=%s addCond=%s\n",
+            frame, tag, i, nm,
+            *(float *)(p + PH_DUR), *(float *)(p + PH_ELAPSED),
+            *(float *)(p + PH_DELAY),
+            p[PH_DONE], p[PH_STARTED], p[PH_SKIPPED], p[PH_REALT],
+            *(void **)(p + PH_ONSTART) ? "y" : "-",
+            *(void **)(p + PH_ONUPD)   ? "y" : "-",
+            *(void **)(p + PH_ENDCOND) ? "y" : "-",
+            *(void **)(p + PH_ADDCOND) ? "y" : "-");
+    (void)k_phase;
+}
+
+// KL_PROBE_CLASSREF: turn `adrp x8, 0x2f83000 / ldr x8, [x8, #0xec0]` into a
+// type name. The slot holds an Il2CppClass* once il2cpp's metadata-usage table
+// is populated; statics hang off it at +0xb8 and the embedding API names them.
+//
+// Note the guest dereferences TWICE — `ldr x20,[x20,#0xec0]` then `ldr x0,[x20]`
+// — because the image's own table holds the ADDRESS of the usage slot, not the
+// class. Reading one level, as the first cut of this did, hands class_get_name
+// a pointer to a pointer and bus-errors.
+static void dump_classrefs(unsigned frame) {
+    static int done;
+    static char spec[256];
+    if (!done) {
+        done = 1;
+        snprintf(spec, sizeof spec, "%s", kl_env_str("KL_PROBE_CLASSREF", ""));
+    }
+    if (!spec[0]) return;
+    kl_image *img = kl_find_image("libil2cpp.so");
+    if (!img) return;
+    uint8_t *base = (uint8_t *)kl_base(img);
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s", spec);
+    for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+        unsigned long off = strtoul(tok, NULL, 0);
+        Il2CppClass **slot = *(Il2CppClass ***)(base + off);
+        Il2CppClass *k = slot ? *slot : NULL;
+        // il2cpp fills its metadata-usage slots lazily, as the code that needs
+        // each one first runs. Before that the slot is not merely null — early
+        // in the boot it can hold a value that is neither null nor a class,
+        // and reading fields off it bus-errors (it did, on the first run of
+        // this probe). A name is the cheap proof that it is a class now.
+        const char *kn = k ? il.class_get_name(k) : NULL;
+        if (!kn) { fprintf(stderr, "  [tl f%u] classref 0x%lx: <not yet resolved>\n",
+                           frame, off); continue; }
+        fprintf(stderr, "  [tl f%u] classref 0x%lx -> %s  statics:", frame, off, kn);
+        void *it = NULL;
+        FieldInfo *f;
+        int n = 0;
+        while ((f = ilf.class_get_fields(k, &it))) {
+            // Only the statics: il2cpp_field_static_get_value on an instance
+            // field reads through a null static block.
+            if (!(ilf.field_get_flags(f) & FIELD_ATTR_STATIC)) continue;
+            uint64_t v = 0;
+            ilf.field_static_get_value(f, &v);
+            fprintf(stderr, " %s@0x%zx=0x%llx", ilf.field_get_name(f),
+                    ilf.field_get_offset(f), (unsigned long long)v);
+            if (++n >= 16) break;
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
+// KL_PROBE_ENUM=<Namespace.Type>[:substring] — the guest's own number for a
+// name. Compiled il2cpp keeps enum constants as bare integers, so every
+// protocol constant this runtime has to answer with (an ovrMessageType, say)
+// is otherwise a value to be guessed or dug out of global-metadata.dat by
+// hand. The metadata is loaded and Enum.GetNames/Enum.Parse read it for us.
+// Printed once, on the first report.
+static void dump_enum(unsigned frame) {
+    static int done;
+    static char spec[192];
+    if (!done) {
+        done = 1;
+        snprintf(spec, sizeof spec, "%s", kl_env_str("KL_PROBE_ENUM", ""));
+    }
+    if (!spec[0]) return;
+    static int printed;
+    if (printed) return;
+
+    char buf[192];
+    snprintf(buf, sizeof buf, "%s", spec);
+    char *filter = strchr(buf, ':');
+    if (filter) *filter++ = 0;
+    char ns[96] = "", nm[96];
+    const char *dot = strrchr(buf, '.');
+    if (dot) {
+        size_t l = (size_t)(dot - buf);
+        if (l >= sizeof ns) l = sizeof ns - 1;
+        memcpy(ns, buf, l); ns[l] = 0;
+        snprintf(nm, sizeof nm, "%s", dot + 1);
+    } else {
+        snprintf(nm, sizeof nm, "%s", buf);
+    }
+    // "Outer/Inner": protocol enums are usually nested inside the class that
+    // speaks the protocol (Oculus's is Message.MessageType), and
+    // il2cpp_class_from_name only finds top-level types.
+    char *inner = strchr(nm, '/');
+    if (inner) *inner++ = 0;
+    Il2CppClass *k = find_class(ns, nm);
+    if (k && inner) {
+        void *it = NULL;
+        Il2CppClass *nk, *found = NULL;
+        while ((nk = ilf.class_get_nested_types(k, &it)))
+            if (strcmp(il.class_get_name(nk), inner) == 0) { found = nk; break; }
+        if (!found) fprintf(stderr, "  [tl] %s has no nested type %s\n", nm, inner);
+        k = found;
+    }
+    if (!k) { fprintf(stderr, "  [tl] no enum %s\n", spec); printed = 1; return; }
+    printed = 1;
+    Il2CppObject *type = il.type_get_object(il.class_get_type(k));
+    const MethodInfo *m_names = find_method("System", "Enum", "GetNames", 1);
+    const MethodInfo *m_parse = find_method("System", "Enum", "Parse", 2);
+    void *ta[1] = { type };
+    Il2CppObject *names = invoke(m_names, ta, "Enum.GetNames");
+    uint32_t n = names ? il.array_length(names) : 0;
+    fprintf(stderr, "  [tl f%u] enum %s: %u names%s%s\n", frame, spec, n,
+            filter ? ", matching " : "", filter ? filter : "");
+    for (uint32_t i = 0; i < n; i++) {
+        Il2CppObject *s = ((Il2CppObject **)((uint8_t *)names + ARR_DATA))[i];
+        char nb[160];
+        str_ascii(s, nb, sizeof nb);
+        if (filter && *filter && !strstr(nb, filter)) continue;
+        // Parse rather than index Enum.GetValues: the values array is unboxed
+        // and its element width is the enum's underlying type, which is a
+        // second thing to get right. A boxed return needs no such guess.
+        void *pa[2] = { type, s };
+        Il2CppObject *v = invoke(m_parse, pa, "Enum.Parse");
+        if (v) fprintf(stderr, "      %s = 0x%08x (%u)\n", nb,
+                       *(uint32_t *)il.object_unbox(v),
+                       *(uint32_t *)il.object_unbox(v));
+        else   fprintf(stderr, "      %s = <parse failed>\n", nb);
+    }
+}
+
+void kl_mprobe_timeline(unsigned frame) {
+    static int every = -1;
+    if (every < 0) every = (int)kl_env_uint("KL_PROBE_TIMELINE", 0);
+    if (every <= 0) return;
+    if (!frame || frame % (unsigned)every) return;   // frame 0 has no managed world yet
+    if (!mprobe_init() || !tl_init()) { every = 0; return; }
+
+    static const MethodInfo *m_findall, *m_find;
+    static const MethodInfo *m_tscale, *m_udt, *m_rt;
+    static const MethodInfo *m_launching, *m_fog;
+    static Il2CppObject *tl_type;
+    static Il2CppClass *k_tl, *k_phase;
+    static int resolved;
+    if (!resolved) {
+        resolved = 1;
+        m_findall = find_method("UnityEngine", "Resources", "FindObjectsOfTypeAll", 1);
+        m_find    = find_method("UnityEngine", "Object", "FindObjectsOfType", 1);
+        m_tscale  = find_method("UnityEngine", "Time", "get_timeScale", 0);
+        m_udt     = find_method("UnityEngine", "Time", "get_unscaledDeltaTime", 0);
+        m_rt      = find_method("UnityEngine", "Time", "get_realtimeSinceStartup", 0);
+        m_launching = find_method("", "VRLaunch", "get_isLaunching", 0);
+        m_fog       = find_method("", "VrFog", "get__enabled", 0);
+        k_tl    = find_class("", "LevelTimeline");
+        k_phase = find_class("", "LevelPhase");
+        if (k_tl) tl_type = il.type_get_object(il.class_get_type(k_tl));
+        // Print the metadata's own names for every offset this reads, once.
+        // A field map that came out of a disassembler is a claim; this is the
+        // check on it, and it costs one log block.
+        if (k_tl && k_phase) {
+            fprintf(stderr, "  [tl] LevelTimeline fields: phases@0x%x=%s index@0x%x=%s "
+                            "done@0x%x=%s mode@0x%x=%s\n",
+                    TL_PHASES, field_name_at(k_tl, TL_PHASES),
+                    TL_INDEX,  field_name_at(k_tl, TL_INDEX),
+                    TL_DONE,   field_name_at(k_tl, TL_DONE),
+                    TL_MODE,   field_name_at(k_tl, TL_MODE));
+            fprintf(stderr, "  [tl] LevelPhase fields: dur@0x%x=%s elapsed@0x%x=%s "
+                            "name@0x%x=%s done@0x%x=%s started@0x%x=%s realtime@0x%x=%s\n",
+                    PH_DUR, field_name_at(k_phase, PH_DUR),
+                    PH_ELAPSED, field_name_at(k_phase, PH_ELAPSED),
+                    PH_NAME, field_name_at(k_phase, PH_NAME),
+                    PH_DONE, field_name_at(k_phase, PH_DONE),
+                    PH_STARTED, field_name_at(k_phase, PH_STARTED),
+                    PH_REALT, field_name_at(k_phase, PH_REALT));
+        }
+    }
+    if (!k_tl || !tl_type) return;
+
+    dump_classrefs(frame);
+    dump_enum(frame);
+
+    {
+        Il2CppObject *ts = invoke(m_tscale, NULL, "Time.timeScale");
+        Il2CppObject *dt = invoke(m_udt, NULL, "Time.unscaledDeltaTime");
+        Il2CppObject *rt = invoke(m_rt, NULL, "Time.realtimeSinceStartup");
+        Il2CppObject *la = invoke(m_launching, NULL, "VRLaunch.isLaunching");
+        Il2CppObject *fg = invoke(m_fog, NULL, "VrFog._enabled");
+        fprintf(stderr, "  [tl f%u] time: scale=%.3f unscaledDt=%.4f realtime=%.2f "
+                        "| VRLaunch.isLaunching=%s VrFog._enabled=%s\n", frame,
+                ts ? *(float *)il.object_unbox(ts) : -1.0f,
+                dt ? *(float *)il.object_unbox(dt) : -1.0f,
+                rt ? *(float *)il.object_unbox(rt) : -1.0f,
+                la ? (*(uint8_t *)il.object_unbox(la) ? "TRUE" : "false") : "?",
+                fg ? (*(uint8_t *)il.object_unbox(fg) ? "TRUE" : "false") : "?");
+    }
+
+    // Inactive ones count: a timeline whose GameObject got switched off stops
+    // ticking without ever finishing, and FindObjectsOfType would hide exactly
+    // that case behind an empty list.
+    void *targs[1] = { tl_type };
+    Il2CppObject *all = invoke(m_findall, targs, "Resources.FindObjectsOfTypeAll");
+    if (!all) all = invoke(m_find, targs, "Object.FindObjectsOfType");
+    uint32_t n = all ? il.array_length(all) : 0;
+    if (!n) { fprintf(stderr, "  [tl f%u] no LevelTimeline in the scene\n", frame); return; }
+
+    static int listed;                       // print the full phase list once
+    for (uint32_t i = 0; i < n && i < 8; i++) {
+        Il2CppObject *tl = ((Il2CppObject **)((uint8_t *)all + ARR_DATA))[i];
+        if (!tl) continue;
+        uint8_t *t = (uint8_t *)tl;
+        Il2CppClass *kc = il.object_get_class(tl);
+        Il2CppObject *list = *(Il2CppObject **)(t + TL_PHASES);
+        int32_t idx = *(int32_t *)(t + TL_INDEX);
+        int32_t mode = *(int32_t *)(t + TL_MODE);
+        int32_t count = 0;
+        Il2CppObject *items = NULL;
+        if (list) {
+            Il2CppClass *kl = il.object_get_class(list);
+            size_t o_items = field_off(kl, "_items"), o_size = field_off(kl, "_size");
+            if (o_items && o_size) {
+                items = *(Il2CppObject **)((uint8_t *)list + o_items);
+                count = *(int32_t *)((uint8_t *)list + o_size);
+            }
+        }
+        fprintf(stderr, "  [tl f%u] %s: phases=%d index=%d mode=%d finished=%d\n",
+                frame, kc ? il.class_get_name(kc) : "?", count, idx, mode,
+                t[TL_DONE]);
+        if (!items || count <= 0) continue;
+        Il2CppObject **arr = (Il2CppObject **)((uint8_t *)items + ARR_DATA);
+        if (!listed) {
+            for (int32_t j = 0; j < count; j++)
+                dump_phase(frame, "  phase", j, arr[j], k_phase);
+        }
+        if (idx >= 0 && idx < count)
+            dump_phase(frame, "CURRENT", idx, arr[idx], k_phase);
+    }
+    listed = 1;
     fflush(stderr);
 }

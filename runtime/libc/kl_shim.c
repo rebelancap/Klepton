@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <inttypes.h>   // strtoumax — libavformat (simpsons) is the only asker
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
@@ -50,6 +51,7 @@ int getentropy(void *buffer, size_t size);
 #include <pwd.h>
 #include <grp.h>        // getgrgid — Qt6Core's QFileSystemEngine asks for it
 #include <zlib.h>
+#include <iconv.h>      // libalyxsdlcore (hla) — see the hla batch in g_shim
 #include <stdatomic.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -87,16 +89,29 @@ int getentropy(void *buffer, size_t size);
 #include "kl_mediandk.h"
 #include "kl_aaudio.h"
 #include "kl_vulkan.h"
+#include "kl_glibc.h"     // kl_sysv_lookup
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
+#include "kl_openxr.h"
 #include "kl_jni.h"
 
 // ---------- bionic stack-guard canary in Darwin TSD slot 5 ----------
 #define TLS_SLOT_STACK_GUARD 5
 static uint64_t g_canary = 0x0000BEEFCAFE0000ULL;
+// Per-thread setup a door needs on every guest thread (kl_thread_init runs at
+// the top of every thread the runtime creates for a guest, and on the doors'
+// own threads). The Alyx door seeds its static-TLS blocks here.
+#define KL_THREAD_HOOKS 4
+static void (*g_thread_hooks[KL_THREAD_HOOKS])(void);
+void kl_thread_init_hook(void (*fn)(void)) {
+    for (int i = 0; i < KL_THREAD_HOOKS; i++)
+        if (!g_thread_hooks[i] || g_thread_hooks[i] == fn) { g_thread_hooks[i] = fn; return; }
+    fprintf(stderr, "  [klepton] thread-init hook table full — hook %p NOT installed\n", (void *)fn);
+}
 void kl_thread_init(void) {
     uint64_t tp; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp));
     ((uint64_t *)tp)[TLS_SLOT_STACK_GUARD] = g_canary;
+    for (int i = 0; i < KL_THREAD_HOOKS && g_thread_hooks[i]; i++) g_thread_hooks[i]();
 }
 
 // The guest installs its own fatal-signal handlers — IL2CPP does this for crash
@@ -160,8 +175,37 @@ __attribute__((noreturn)) static void kl_stack_chk_fail(void) {
 // not known here, so anything landing inside the block routes to stderr. Known
 // gap: the true stride is recoverable from the GLOB_DAT addend.
 static char g_sF[4096] __attribute__((aligned(16)));
+// A second FILE * vocabulary. A guest that is not bionic (the Alyx port's glibc
+// payload, kl_glibc.c) hands its OWN FILE objects to the same stdio entry points
+// — through the host library's interceptors, which call these shims — and only
+// the personality that made them can say which host stream one stands for. It
+// answers NULL for a pointer it did not make, and the bionic rules below apply.
+static FILE *(*g_file_resolver)(void *guest);
+void kl_host_file_resolver(FILE *(*fn)(void *guest)) { g_file_resolver = fn; }
+// Where a bogus FILE * goes: NOT stderr itself. A read through it fails, and a
+// failed read sets the stream's error flag — on Darwin's stderr that makes every
+// later fprintf(stderr) of this runtime return -1 and print nothing (Alyx: one
+// fgets(NULL) in tier0 silenced the rest of the log, fault report included). So
+// a stream of its own: writes go to fd 2 (the log, as before), reads are EOF.
+static int kl_bogus_read(void *c, char *b, int n)        { (void)c; (void)b; (void)n; return 0; }
+static int kl_bogus_write(void *c, const char *b, int n) { (void)c; return (int)write(2, b, (size_t)n); }
+static FILE *kl_bogus_file_sink(void) {
+    static FILE *f;
+    if (!f) {
+        FILE *n = funopen(NULL, kl_bogus_read, kl_bogus_write, NULL, NULL);
+        if (!n) return stderr;
+        setvbuf(n, NULL, _IONBF, 0);
+        f = n;
+    }
+    clearerr(f);
+    return f;
+}
 FILE *kl_host_file(void *guest) {
     if ((char *)guest >= g_sF && (char *)guest < g_sF + sizeof g_sF) return stderr;
+    if (g_file_resolver && guest) {
+        FILE *h = g_file_resolver(guest);
+        if (h) return h;
+    }
     // A FILE * small enough to be a page-zero offset is not a FILE * — it is an
     // argument that landed in the wrong slot or an uninitialised one.
     // Passing it through means dying inside flockfile with no idea who called,
@@ -181,7 +225,7 @@ FILE *kl_host_file(void *guest) {
             seen[n++] = guest;
             fprintf(stderr, "[klepton] bogus guest FILE * %p — routed to stderr\n", guest);
         }
-        return stderr;
+        return kl_bogus_file_sink();
     }
     return (FILE *)guest;
 }
@@ -192,12 +236,35 @@ static size_t kl_fwrite(const void *p, size_t a, size_t b, void *f) { return fwr
 // async loader's throughput is the loading-screen pacing question. Bytes are
 // attributed per open file (kl_file_path) so a slow trickle names its file.
 extern const char *kl_file_path(void *f);
+extern void kl_bank_note_io(const char *op, void *f, long long a, long long b, long long res);
+extern int  kl_bank_is_open(void *f);              // kl_libc.c — gate, false for every other file
 static size_t kl_fread(void *p, size_t a, size_t b, void *f) {
     FILE *hf = kl_host_file(f);
-    size_t r = fread(p, a, b, hf);
+    // The archive trace: WHERE libzip is reading (the offset it starts from) and
+    // whether it got what it asked for. Silent unless this is an open archive.
+    long long at = kl_bank_is_open(hf) ? (long long)ftello(hf) : -1;
     static int on = -1;
     if (on < 0) on = kl_env_on("KL_TRACE_IO", 0);
+    struct timespec t0 = {0, 0};
+    if (on) clock_gettime(CLOCK_MONOTONIC, &t0);
+    size_t r = fread(p, a, b, hf);
+    if (at >= 0) kl_bank_note_io("fread", hf, at, (long long)(a * b), (long long)(r * a));
     if (on) {
+        // Session 05, simpsons: the P3D streamer waits up to 1.25 s for ONE
+        // 192 KB block (`P3D Loading Starved for 79 frames, 1250 ms`), which
+        // is not flash latency. This names the call if the time is spent in
+        // fread itself; silence here moves the suspect to the drive thread's
+        // scheduling or its queue. 10 ms is far above any honest 192 KB read.
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+                    (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+        static _Atomic unsigned slow_lines;
+        if (ms > 10.0 && atomic_fetch_add(&slow_lines, 1) < 400) {
+            const char *path = kl_file_path(f);
+            fprintf(stderr, "  [io] slow fread: %zu KB took %.1f ms  %s\n",
+                    (a * b) >> 10, ms, path ? path : "?");
+        }
         static _Atomic unsigned long long bytes, lines;
         static _Atomic time_t last;
         static struct { char path[160]; unsigned long long bytes; } per[32];
@@ -226,17 +293,33 @@ static size_t kl_fread(void *p, size_t a, size_t b, void *f) {
     }
     return r;
 }
-static int kl_fclose(void *f)                      { return fclose(kl_host_file(f)); }
+extern void kl_bank_note_close(void *f);           // kl_libc.c — the bank probe
+static int kl_fclose(void *f)                      { kl_bank_note_close(f);
+                                                     return fclose(kl_host_file(f)); }
 static int kl_fflush(void *f)                      { return fflush(f ? kl_host_file(f) : NULL); }
 static char *kl_fgets(char *s, int n, void *f)     { return fgets(s, n, kl_host_file(f)); }
 static int kl_getc_(void *f)                       { return getc(kl_host_file(f)); }
 static int kl_feof(void *f)                        { return feof(kl_host_file(f)); }
 static int kl_ferror(void *f)                      { return ferror(kl_host_file(f)); }
 static void kl_clearerr(void *f)                   { clearerr(kl_host_file(f)); }
-static int kl_fseek(void *f, long o, int w)        { return fseek(kl_host_file(f), o, w); }
-static int kl_fseeko(void *f, off_t o, int w)      { return fseeko(kl_host_file(f), o, w); }
+// The offsets ARE the evidence for the bank probe (a 3.4 GB archive whose
+// central directory and Init.bnk both sit above 2^31), so each of these reports
+// the offset it was handed and the offset the host ended up at.
+static int kl_fseek(void *f, long o, int w)        { FILE *hf = kl_host_file(f); int r = fseek(hf, o, w);
+                                                     if (kl_bank_is_open(hf))
+                                                         kl_bank_note_io("fseek", hf, (long long)o, w,
+                                                                         r ? -1 : (long long)ftello(hf));
+                                                     return r; }
+static int kl_fseeko(void *f, off_t o, int w)      { FILE *hf = kl_host_file(f); int r = fseeko(hf, o, w);
+                                                     if (kl_bank_is_open(hf))
+                                                         kl_bank_note_io("fseeko", hf, (long long)o, w,
+                                                                         r ? -1 : (long long)ftello(hf));
+                                                     return r; }
 static long kl_ftell(void *f)                      { return ftell(kl_host_file(f)); }
-static off_t kl_ftello(void *f)                    { return ftello(kl_host_file(f)); }
+static off_t kl_ftello(void *f)                    { FILE *hf = kl_host_file(f); off_t r = ftello(hf);
+                                                     if (kl_bank_is_open(hf))
+                                                         kl_bank_note_io("ftello", hf, 0, 0, (long long)r);
+                                                     return r; }
 static int kl_setvbuf(void *f, char *b, int m, size_t n) { return setvbuf(kl_host_file(f), b, m, n); }
 
 // ---------- sockets: bionic -> Darwin option constants ----------
@@ -1434,23 +1517,15 @@ static ssize_t kl_recvfrom(int fd, void *buf, size_t n, int flags,
     kl_hexdump("<-", buf, r);
     return r;
 }
-
-// FORTIFY's recvfrom: __recvfrom_chk(fd, buf, len, __bos(buf), flags, sa, len).
-// hl2's libtier0 receives its game/LAN traffic through this fortified form and a
-// bare recvfrom binding never covered it, so the first packet aborted on an
-// unresolved import. The extra argument is the destination buffer's known size;
-// a well-formed call has len <= buflen, so this checks that and forwards to
-// kl_recvfrom (which still does the flag translation and the guest sockaddr
-// fixup). Clamp rather than trust: never let the socket write past the buffer.
-static ssize_t kl___recvfrom_chk(int fd, void *buf, size_t n, size_t cap, int flags,
-                                 struct sockaddr *sa, socklen_t *len) {
-    if (n > cap) {
-        if (kl_net_trace())
-            fprintf(stderr, "  [net] __recvfrom_chk: len %zu > buffer %zu — clamped\n", n, cap);
-        n = cap;
-    }
+// bionic's FORTIFY form: (fd, buf, supplied_n, compiler_size, flags, addr,
+// addrlen) — the compiler's proof inserted after the supplied size, exactly
+// the insertion point glibc also uses. The call half is kl_recvfrom's.
+static ssize_t kl_recvfrom_chk(int fd, void *buf, size_t n, size_t dl, int flags,
+                               struct sockaddr *sa, socklen_t *len) {
+    if (n > dl) die("__recvfrom_chk overflow");
     return kl_recvfrom(fd, buf, n, flags, sa, len);
 }
+
 
 // ---------- sendmsg / recvmsg: struct msghdr diverges ----------
 // These were plain forwards, and the layouts do not match. Linux (LP64) makes
@@ -1788,6 +1863,21 @@ static char *kl_strchr_chk(char *s, int ch, size_t dl) {
     kl_strlen_chk(s, dl);                  // proves the object is dl bytes
     return strchr(s, ch);
 }
+// bionic: __strlcat_chk(dst, src, supplied_size, compiler_size). strlcat itself
+// is on Darwin, so this is only the bounds half of the contract. Same shape for
+// strlcpy, and strrchr follows kl_strchr_chk's pattern one function over.
+static size_t kl_strlcat_chk(char *d, const char *s, size_t n, size_t dl) {
+    if (n > dl) die("__strlcat_chk overflow");
+    return strlcat(d, s, n);
+}
+static size_t kl_strlcpy_chk(char *d, const char *s, size_t n, size_t dl) {
+    if (n > dl) die("__strlcpy_chk overflow");
+    return strlcpy(d, s, n);
+}
+static char *kl_strrchr_chk(char *s, int ch, size_t dl) {
+    kl_strlen_chk(s, dl);                  // proves the object is dl bytes
+    return strrchr(s, ch);
+}
 // bionic: __vsnprintf_chk(dest, supplied_size, flags, compiler_size, fmt, va).
 static int kl_vsnprintf_chk(char *d, size_t n, int flags, size_t dl,
                             const char *fmt, void *gva) {
@@ -1855,6 +1945,28 @@ static int kl_execv(const char *p, char *const argv[]) {
     errno = ENOSYS;
     return -1;
 }
+// bionic: __poll_chk(fds, nfds, timeout, fds_size) — FORTIFY's poll. struct
+// pollfd is { int fd; short events; short revents; } on both platforms, so
+// the only work is the size check; the call itself forwards.
+static int kl_poll_chk(void *fds, unsigned long nfds, int timeout, size_t fds_size) {
+    if (nfds * sizeof(struct pollfd) > fds_size) die("__poll_chk overflow");
+    return poll(fds, (nfds_t)nfds, timeout);
+}
+// bionic's `timezone` is a long VARIABLE (seconds west of UTC, standard
+// time). Darwin has only the BSD timezone() FUNCTION under that name, so the
+// variable is ours, filled once at load from the host's idea of standard
+// time (January: no DST). tzset is forwarded rather than wrapped, so a guest
+// that calls it and re-reads the variable still sees this value — none so
+// far does both.
+static long kl_timezone_var;
+__attribute__((constructor)) static void kl_init_timezone(void) {
+    tzset();
+    struct tm jan = {0};
+    jan.tm_year = 120; jan.tm_mon = 0; jan.tm_mday = 15;
+    time_t t = mktime(&jan);
+    struct tm lt;
+    if (t != (time_t)-1 && localtime_r(&t, &lt)) kl_timezone_var = -lt.tm_gmtoff;
+}
 
 // ---------- small bionic-isms ----------
 static void kl_set_abort_message(const char *m) { fprintf(stderr, "[guest abort] %s\n", m ? m : ""); }
@@ -1866,25 +1978,90 @@ static void kl_closelog(void) {}
 static int  kl_cxa_atexit(void (*f)(void *), void *a, void *d) { (void)f;(void)a;(void)d; return 0; }
 static void kl_cxa_finalize(void *d) { (void)d; }
 static void kl_android_log_write(int p, const char *t, const char *m) {
+    kl_mem_log_banner(t, m);                      // KL_TRIM_ON_LOAD (no-op when off)
     fprintf(stderr, "[%d/%s] %s\n", p, t ? t : "", m ? m : ""); }
+
+// __android_log_is_loggable(prio, tag, default_prio) — liblog's "would this line
+// be kept?" gate, which callers ask BEFORE formatting anything. Bionic answers
+// it from the `log.tag.<tag>` property (then `persist.log.tag.<tag>`), and when
+// neither is set — which is always, here: our property store serves ro.* and
+// nothing else, and no guest can set one — bionic's answer is exactly
+// `prio >= default_prio`.
+//
+// So this is not a stub that says yes. It is the whole function for a device
+// with no log.tag properties, and it deliberately honours the CALLER's default
+// rather than overriding it: a guest that passes ANDROID_LOG_INFO wants its
+// verbose lines dropped, and answering "loggable" to all of them would make us
+// noisier than the Android it was written for. The letter cases are kept so the
+// day a log.tag property does exist the decoding is already right.
+//
+// libMetaXRAudioWwise.so is the only guest here that imports it, and it reaches
+// the call from Wwise's output path — which is why nothing had called it until
+// the OpenSL stream actually opened (launch 17), and why refusing the name by
+// abort ended a run that was otherwise fine.
+static int kl_android_log_level_char(int prio, char c) {
+    switch (c) {
+        case 'v': case 'V': return prio >= 2;   // ANDROID_LOG_VERBOSE
+        case 'd': case 'D': return prio >= 3;
+        case 'i': case 'I': return prio >= 4;
+        case 'w': case 'W': return prio >= 5;
+        case 'e': case 'E': return prio >= 6;
+        case 'f': case 'F': return prio >= 7;   // FATAL
+        case 's': case 'S': return 0;           // SILENT — nothing is loggable
+        default:            return -1;          // no property: caller's default
+    }
+}
+static int kl_android_log_is_loggable(int prio, const char *tag, int def) {
+    // The property lookup, spelled out: our store has no log.tag.<tag> entry to
+    // find, so `c` is the "unset" 0 and the decoder falls through to the
+    // caller's default. Keeping the call here rather than deleting it is what
+    // makes adding a real log.tag property a one-line change later.
+    (void)tag;
+    char c = 0;
+    int by_prop = kl_android_log_level_char(prio, c);
+    if (by_prop >= 0) return by_prop;
+    return prio >= def;
+}
+// The _len form is the same question with a tag that is NOT NUL-terminated —
+// liblog offers it so a caller with a slice of a larger buffer need not copy.
+// Since the tag does not affect the answer above, the length is what we would
+// have used to bound the copy, and the decision is identical.
+static int kl_android_log_is_loggable_len(int prio, const char *tag,
+                                          size_t len, int def) {
+    (void)tag; (void)len;
+    return kl_android_log_is_loggable(prio, NULL, def);
+}
 
 // ---------- externs ----------
 #define X(n) extern int n(void);
 X(klv_printf) X(klv_fprintf) X(klv_sprintf) X(klv_snprintf) X(klv_asprintf)
 X(klv_dprintf) X(klv_syslog) X(klv_warnx) X(klv_android_log_print) X(klv_sscanf) X(klv_fscanf)
+X(klv_android_log_assert) X(klb_dlopen_ext)
+X(klb_pthread_barrier_init) X(klb_pthread_barrier_wait) X(klb_pthread_barrier_destroy)
 X(klv_open) X(klv_fcntl) X(klv_ioctl) X(klv_strtold) X(klv_wcstold) X(klv_strtold_l)
+X(klv_roundl) X(klb_pthread_cond_clockwait) X(klb_pthread_gettid_np) X(klb_faccessat)
+X(klb_mincore) X(klb_mkdtemp) X(klb_mallopt) X(klb_android_get_device_api_level) X(klb_ptrace)
+X(klb_kill) X(klb_raise) X(klb_signal)
+X(klb_sigwait) X(klb_sigsuspend) X(klb_sigpending)
 X(klb_errno) X(klb_gettid) X(klb_sysprop_find) X(klb_sysprop_get) X(klb_sysprop_read)
 X(klb_prctl) X(klb_sched_getaffinity) X(klb_sched_setaffinity)
+X(klb_sched_setscheduler) X(klb_sched_getscheduler) X(klb_clock_nanosleep)
 X(klb___sched_cpucount) X(klb___libc_current_sigrtmin) X(klb___libc_current_sigrtmax)
-X(klb_stat) X(klb_lstat) X(klb_fstat) X(klb_statfs) X(klb_uname) X(klb_sigaction)
-X(klb_opendir) X(klb_readdir) X(klb_closedir) X(klb_scandir) X(klb_alphasort)
+X(klb_stat) X(klb_lstat) X(klb_fstat) X(klb_fstatat)
+X(klb_rmdir) X(klb_remove) X(klb_chmod) X(klb_chown) X(klb_lchown) X(klb_truncate) X(klb_mkfifo) X(klb_readlink) X(klb_symlink) X(klb_link) X(klb_utimes) X(klb_utime) X(klb_unlinkat) X(klb_mkdirat) X(klb_fchmodat) X(klb_fchownat) X(klb_readlinkat) X(klb_renameat) X(klb_symlinkat) X(klb_utimensat) X(klb_statfs) X(klb_uname) X(klb_sigaction)
+X(klb_opendir) X(klb_readdir) X(klb_closedir)
 X(klb_FD_ISSET_chk) X(klb_FD_SET_chk) X(klb_ctype_mb_cur_max) X(klb_lseek64)
 X(klb_close) X(klb_lseek) X(klb_pread)
-X(klb_sysconf) X(klb_fopen) X(klb_access) X(klb_mkdir) X(klb_unlink) X(klb_rename)
+X(klb_sysconf) X(klb_fopen) X(klb_freopen) X(klb_access) X(klb_mkdir) X(klb_unlink) X(klb_rename)
 X(klh_android_log_print)
 X(klb_getpwuid) X(klb_getpwuid_r) X(klb_execl) X(klb_system) X(klb_syscall) X(klb_swprintf)
 X(klb_vprintf) X(klb_vsscanf) X(klb_memrchr) X(klb_memalign)
 X(klb_getrandom) X(klb_isnan)
+// The HL2VR (srceng) batch — see gen_libc_table.py's SPECIAL note.
+X(klb_scandir) X(klb_alphasort) X(klb_wcscasecmp) X(klb_wcsncasecmp)
+X(klb___fpclassifyd) X(klb___isnanf) X(klb_popen) X(klb_pclose)
+X(klv___sprintf_chk) X(klv___snprintf_chk)
+X(klb_chdir) X(klb_statfs64) X(klb_execlp) X(klb_getcwd)
 X(klb_isnanf) X(klb_isinf) X(klb_isinff) X(klb_isfinite) X(klb_isfinitef)
 X(klb_mmap) X(klb_mprotect) X(klb_madvise) X(klb_sysinfo) X(klb_sbrk)
 X(klb_pthread_mutex_init) X(klb_pthread_mutex_lock) X(klb_pthread_mutex_unlock)
@@ -1897,6 +2074,7 @@ X(klb_pthread_rwlock_init) X(klb_pthread_rwlock_destroy) X(klb_pthread_rwlock_rd
 X(klb_pthread_rwlock_wrlock) X(klb_pthread_rwlock_unlock)
 X(klb_pthread_attr_init) X(klb_pthread_attr_destroy) X(klb_pthread_attr_setstacksize)
 X(klb_pthread_attr_setdetachstate) X(klb_pthread_attr_getstack) X(klb_pthread_getattr_np)
+X(klb_pthread_attr_setinheritsched)
 X(klb_pthread_key_create) X(klb_pthread_key_delete) X(klb_pthread_getspecific)
 X(klb_pthread_setspecific) X(klb_pthread_once)
 X(klb_pthread_create) X(klb_pthread_join) X(klb_pthread_detach) X(klb_pthread_exit)
@@ -1917,8 +2095,8 @@ X(klb_epoll_create) X(klb_epoll_create1) X(klb_epoll_ctl) X(klb_epoll_wait)
 X(klb_openat) X(klb___open_2)
 X(klb___memmove_chk) X(klb___strncpy_chk) X(klb___strncpy_chk2) X(klb___strcat_chk)
 X(klb___read_chk) X(klb___vsprintf_chk)
-X(klv___sprintf_chk) X(klv___snprintf_chk)
-X(klb___pread64_chk) X(klb___pwrite64_chk) X(klb___strrchr_chk) X(klb_pread64) X(klb_pwrite64)
+X(klb___pread64_chk) X(klb___pwrite64_chk) X(klb___strrchr_chk) X(klb_pread64)
+X(klb_pwrite64)
 X(klb___strncat_chk) X(klb_ftruncate64) X(klb___fwrite_chk)
 X(klb_fopen64) X(klb_fseeko64) X(klb_ftello64) X(klb_exit) X(klb__exit) X(klb_chdir) X(klb_getcwd) X(klb_realpath)
 X(klb_sincosf) X(klb_sincos) X(klb_putchar) X(klb_getchar) X(klb_fdatasync)
@@ -1977,6 +2155,9 @@ static const kl_entry g_shim[] = {
     E("fclose", kl_fclose), E("fflush", kl_fflush), E("fgets", kl_fgets), E("getc", kl_getc_),
     E("feof", kl_feof), E("ferror", kl_ferror), E("clearerr", kl_clearerr),
     E("fseek", kl_fseek), E("fseeko", kl_fseeko), E("ftell", kl_ftell), E("ftello", kl_ftello),
+    // Dropped once by a three-way merge that saw the entry "moved" by both
+    // sides differently; it is neither optional nor covered elsewhere — an
+    // unresolved setvbuf is a fatal import before the first frame.
     E("setvbuf", kl_setvbuf),
 
     // AAPCS64 variadic thunks
@@ -1996,7 +2177,7 @@ static const kl_entry g_shim[] = {
     E("socket", kl_socket),
     E("bind", kl_bind), E("sendto", kl_sendto), E("accept", kl_accept),
     E("getifaddrs", klb_getifaddrs), E("freeifaddrs", klb_freeifaddrs),
-    E("recvfrom", kl_recvfrom), E("__recvfrom_chk", kl___recvfrom_chk),
+    E("recvfrom", kl_recvfrom),
     E("getpeername", kl_getpeername),
     E("sendmsg", kl_sendmsg), E("recvmsg", kl_recvmsg),
     E("send", kl_send), E("recv", kl_recv),
@@ -2019,6 +2200,26 @@ static const kl_entry g_shim[] = {
     E("__FD_ISSET_chk", klb_FD_ISSET_chk), E("__FD_SET_chk", klb_FD_SET_chk),
     E("__strlen_chk", kl_strlen_chk), E("__strchr_chk", kl_strchr_chk),
     E("__vsnprintf_chk", kl_vsnprintf_chk),
+    // The canary itself, as a DATA symbol: guests built with the global-canary
+    // form of -fstack-protector read __stack_chk_guard through the GOT rather
+    // than TLS slot 5, and the value must be the one kl_thread_init seeds or
+    // every protected frame aborts at epilogue. HL2VR's srceng libraries are
+    // the first guests here built that way.
+    E("__stack_chk_guard", &g_canary),
+    E("__recvfrom_chk", kl_recvfrom_chk),
+    E("__sprintf_chk", klv___sprintf_chk), E("__snprintf_chk", klv___snprintf_chk),
+
+    // The HL2VR (srceng) batch that could not ride the generated table —
+    // layout or numbering mismatches the compiler cannot see. The
+    // implementations and their reasoning are in kl_libc.c.
+    E("scandir", klb_scandir), E("alphasort", klb_alphasort),
+    E("wcscasecmp", klb_wcscasecmp), E("wcsncasecmp", klb_wcsncasecmp),
+    E("__fpclassifyd", klb___fpclassifyd), E("__isnanf", klb___isnanf),
+    E("popen", klb_popen), E("pclose", klb_pclose),
+    // chdir is NOT here: the JKXR row below already claims it (the reorg
+    // brought both halves together), and a name entered twice is a table that
+    // disagrees with itself about which entry wins.
+    E("statfs64", klb_statfs64), E("execlp", klb_execlp),
 
     // divergent layouts / Android-only
     E("__errno", klb_errno), E("environ", &environ), E("gettid", klb_gettid),
@@ -2026,14 +2227,12 @@ static const kl_entry g_shim[] = {
     E("in6addr_any", &in6addr_any),
     E("timer_create", klb_timer_create), E("timer_settime", klb_timer_settime),
     E("timer_getoverrun", klb_timer_getoverrun),
-    E("__stack_chk_guard", &klb_stack_chk_guard),   // Source/Portal data import
     E("stat", klb_stat), E("lstat", klb_lstat), E("fstat", klb_fstat), E("statfs", klb_statfs),
     E("uname", klb_uname), E("sigaction", klb_sigaction),
     E("sysconf", klb_sysconf),
     E("fopen", klb_fopen), E("access", klb_access),
     E("mkdir", klb_mkdir), E("unlink", klb_unlink), E("rename", klb_rename),
     E("opendir", klb_opendir), E("readdir", klb_readdir), E("closedir", klb_closedir),
-    E("scandir", klb_scandir), E("alphasort", klb_alphasort),
     E("lseek64", klb_lseek64), E("__ctype_get_mb_cur_max", klb_ctype_mb_cur_max),
     E("getpwuid", klb_getpwuid), E("getpwuid_r", klb_getpwuid_r),
     E("prctl", klb_prctl),
@@ -2042,7 +2241,7 @@ static const kl_entry g_shim[] = {
     // (no flags, 256-byte cap, 0/-1 rather than a count); isnan is a macro on
     // Darwin, so there is no symbol to forward. Both in kl_libc.c.
     E("getrandom", klb_getrandom), E("isnan", klb_isnan),
-    E("__isnan", klb_isnan), E("__isnanf", klb_isnanf), E("__isinf", klb_isinf),
+    E("__isnan", klb_isnan), E("__isinf", klb_isinf),
     E("__isinff", klb_isinff), E("__isfinite", klb_isfinite), E("__isfinitef", klb_isfinitef),
     E("mmap", klb_mmap), E("mprotect", klb_mprotect), E("madvise", klb_madvise),
     E("sbrk", klb_sbrk),
@@ -2051,6 +2250,12 @@ static const kl_entry g_shim[] = {
     E("sysinfo", klb_sysinfo),
     E("sched_getaffinity", klb_sched_getaffinity), E("sched_setaffinity", klb_sched_setaffinity),
     E("JNI_GetCreatedJavaVMs", klb_JNI_GetCreatedJavaVMs),
+    // UE4.27 (Deadpool) reaches for the rest of the scheduler family: the
+    // setter is a no-op success, the getter reports SCHED_OTHER, and
+    // clock_nanosleep is rebuilt on nanosleep — all in kl_libc.c.
+    E("sched_setscheduler", klb_sched_setscheduler),
+    E("sched_getscheduler", klb_sched_getscheduler),
+    E("clock_nanosleep", klb_clock_nanosleep),
     E("__system_property_find", klb_sysprop_find),
     E("__system_property_get", klb_sysprop_get),
     E("__system_property_read", klb_sysprop_read),
@@ -2079,7 +2284,6 @@ static const kl_entry g_shim[] = {
     E("__memmove_chk", klb___memmove_chk), E("__strncpy_chk", klb___strncpy_chk),
     E("__strncpy_chk2", klb___strncpy_chk2), E("__strcat_chk", klb___strcat_chk),
     E("__read_chk", klb___read_chk), E("__vsprintf_chk", klb___vsprintf_chk),
-    E("__sprintf_chk", klv___sprintf_chk), E("__snprintf_chk", klv___snprintf_chk),
     // UE4 reads its OBB through pread64 from several threads, and FORTIFY
     // rewrites every one of those calls to the _chk form.
     E("__pread64_chk", klb___pread64_chk), E("__pwrite64_chk", klb___pwrite64_chk),
@@ -2087,8 +2291,17 @@ static const kl_entry g_shim[] = {
     // Darwin does not declare pread64 (it has one 64-bit pread), so the
     // generator drops it. Only a FORTIFY build reaches the _chk form, so a guest
     // built without it would otherwise find this unresolved.
-    E("pread64", klb_pread64),
-    E("pwrite64", klb_pwrite64),
+    E("pread64", klb_pread64), E("pwrite64", klb_pwrite64),
+    // zlib's compressing half, forwarded straight to the system zlib this
+    // binary already links. They are absent from the generated table only
+    // because the generator scans the Unity, JKXR and Steam Link trees and no
+    // UE4 one — so nothing had imported them yet. Darwin's zlib declares both
+    // with the same signatures, which is what makes a bare forward right here;
+    // adler32 and crc32 are in the generated table for the same reason and by
+    // the same mechanism. Tetris Effect's libUE4 (4.26.2) is the first guest to
+    // ask: compress2 was the abort that ended its permissive scouting pass.
+    E("compress2", compress2), E("compressBound", compressBound),
+    E("deflateBound", deflateBound),
     E("__strrchr_chk", klb___strrchr_chk), E("__strncat_chk", klb___strncat_chk),
     E("__fwrite_chk", klb___fwrite_chk),
     E("ftruncate64", klb_ftruncate64),
@@ -2106,6 +2319,10 @@ static const kl_entry g_shim[] = {
     // ...and the fifth path door, which decides where an id Tech 3 guest
     // thinks its whole installation is.
     E("chdir", klb_chdir),
+    // ...and the SIXTH, which runs the other way: getcwd must answer in the
+    // guest's spelling or the host's path layout becomes the guest's search
+    // path. See klb_getcwd — srceng lowercases what it is told, and a
+    // case-sensitive device volume then refuses every mod-relative open.
     E("getcwd", klb_getcwd),
     E("realpath", klb_realpath),
     E("__sched_cpucount", klb___sched_cpucount),
@@ -2157,6 +2374,54 @@ static const kl_entry g_shim[] = {
     // Darwin's stat — same struct divergence as `stat` itself.
     E("stat64", klb_stat), E("lstat64", klb_lstat), E("fstat64", klb_fstat),
 
+    // The Alyx jailbreak host (hla) batch — rationale per function beside the
+    // implementations in kl_libc_slink.c.
+    E("pthread_cond_clockwait", klb_pthread_cond_clockwait),
+    E("pthread_gettid_np", klb_pthread_gettid_np),
+    E("faccessat", klb_faccessat), E("mincore", klb_mincore),
+    E("mkdtemp", klb_mkdtemp), E("mallopt", klb_mallopt),
+    E("android_get_device_api_level", klb_android_get_device_api_level),
+    E("ptrace", klb_ptrace), E("roundl", klv_roundl),
+    // hla round 2. iconv forwards to Darwin's libiconv (-liconv): iconv_t is an
+    // opaque pointer on both, the conversion contract (in/out pointer-and-count
+    // pairs advanced in place, (size_t)-1 with errno) is POSIX's on both, and
+    // the three errnos it sets (E2BIG, EILSEQ, EINVAL) come back through
+    // klb_errno's Darwin->Linux table like every other call's. wchar_t is 4
+    // bytes on both, so "WCHAR_T" means the same encoding.
+    E("iconv_open", iconv_open), E("iconv", iconv), E("iconv_close", iconv_close),
+    // adrenotools' "give me a Vulkan loader, optionally with a custom driver"
+    // (libadrenotools, which the host links): answered with the runtime's own
+    // libvulkan.so over MoltenVK — kl_vulkan.c, beside the dlopen door it
+    // reuses.
+    E("adrenotools_open_libvulkan", kl_vulkan_adrenotools_open),
+    // Signal numbers: the SIGUSR2/SIGSYS swap — see kl_sig_to_darwin.
+    E("kill", klb_kill), E("raise", klb_raise), E("signal", klb_signal),
+    E("fstatat", klb_fstatat), E("fstatat64", klb_fstatat),
+    // The rest of the path family: translated, and failures published to
+    // the guest errno slot (kl_libc.c, "the rest of the path family").
+    E("rmdir", klb_rmdir),
+    E("remove", klb_remove),
+    E("chmod", klb_chmod),
+    E("chown", klb_chown),
+    E("lchown", klb_lchown),
+    E("truncate", klb_truncate),
+    E("mkfifo", klb_mkfifo),
+    E("readlink", klb_readlink),
+    E("symlink", klb_symlink),
+    E("link", klb_link),
+    E("utimes", klb_utimes),
+    E("utime", klb_utime),
+    E("unlinkat", klb_unlinkat),
+    E("mkdirat", klb_mkdirat),
+    E("fchmodat", klb_fchmodat),
+    E("fchownat", klb_fchownat),
+    E("readlinkat", klb_readlinkat),
+    E("renameat", klb_renameat),
+    E("symlinkat", klb_symlinkat),
+    E("utimensat", klb_utimensat),
+    E("sigwait", klb_sigwait), E("sigsuspend", klb_sigsuspend),
+    E("sigpending", klb_sigpending),
+
     // setjmp/longjmp forward directly: bionic's jmp_buf (256B) is LARGER than
     // Darwin's (192B), so the guest's buffer is safe, and registering the host
     // function itself avoids interposing a stack frame that longjmp would destroy.
@@ -2177,7 +2442,6 @@ static const kl_entry g_shim[] = {
     E("pthread_cond_broadcast", klb_pthread_cond_broadcast),
     E("pthread_cond_wait", klb_pthread_cond_wait),
     E("pthread_cond_timedwait", klb_pthread_cond_timedwait),
-    E("pthread_cond_clockwait", klb_pthread_cond_clockwait),
     E("pthread_condattr_init", klb_pthread_condattr_init),
     E("pthread_condattr_destroy", klb_pthread_condattr_destroy),
     E("pthread_condattr_setclock", klb_pthread_condattr_setclock),
@@ -2190,6 +2454,7 @@ static const kl_entry g_shim[] = {
     E("pthread_attr_destroy", klb_pthread_attr_destroy),
     E("pthread_attr_setstacksize", klb_pthread_attr_setstacksize),
     E("pthread_attr_setdetachstate", klb_pthread_attr_setdetachstate),
+    E("pthread_attr_setinheritsched", klb_pthread_attr_setinheritsched),
     E("pthread_attr_getstack", klb_pthread_attr_getstack),
     E("pthread_getattr_np", klb_pthread_getattr_np),
     E("pthread_key_create", klb_pthread_key_create),
@@ -2225,9 +2490,33 @@ static const kl_entry g_shim[] = {
     // va_list is a 32-byte descriptor and so arrives by reference — which is
     // what a kl_va * is.
     E("__android_log_vprint", klh_android_log_print),
+    // The three liblog names libMetaXRAudioWwise.so imports beyond print/write.
+    // is_loggable is the one that actually fired (launch 17, the first run whose
+    // OpenSL stream was genuinely open); assert and dlopen_ext are bound in the
+    // same pass because they sit in the same library and each would otherwise
+    // cost its own device round to discover.
+    E("__android_log_is_loggable", kl_android_log_is_loggable),
+    E("__android_log_is_loggable_len", kl_android_log_is_loggable_len),
+    E("__android_log_assert", klv_android_log_assert),
+    E("android_dlopen_ext", klb_dlopen_ext),
     E("android_set_abort_message", kl_set_abort_message),
     E("openlog", kl_openlog), E("closelog", kl_closelog),
     E("__cxa_atexit", kl_cxa_atexit), E("__cxa_finalize", kl_cxa_finalize),
+
+    // QuakeQuest additions. Barriers are a real implementation (kl_pthread.c) —
+    // Darwin has no pthread_barrier_t to forward to; the other two are a
+    // fortify wrapper and a variadic thunk over host libc.
+    E("pthread_barrier_init", klb_pthread_barrier_init),
+    E("pthread_barrier_wait", klb_pthread_barrier_wait),
+    E("pthread_barrier_destroy", klb_pthread_barrier_destroy),
+    E("__strlcat_chk", kl_strlcat_chk), E("warnx", klv_warnx),
+    E("__strlcpy_chk", kl_strlcpy_chk), E("__strrchr_chk", kl_strrchr_chk),
+    E("freopen", klb_freopen),
+    // ctype and srand: identical signatures, no struct in sight, so plain
+    // forwards. They only turn up here because the generated libc table is
+    // built from the Beat Saber and Steam Link imports, and QuakeQuest is the
+    // first target that calls them.
+    E("ispunct", ispunct), E("iscntrl", iscntrl), E("srand", srand),
 
     // Steam Link (SDL3) additions — plain forwards plus the small wrappers above
     E("getentropy", getentropy), E("tzset", tzset), E("strncasecmp", strncasecmp),
@@ -2238,6 +2527,14 @@ static const kl_entry g_shim[] = {
     E("mallctl", kl_mallctl), E("mallctlnametomib", kl_mallctlnametomib),
     E("mallctlbymib", kl_mallctlbymib),
     E("MallocExtension_Internal_GetNumericProperty", kl_MallocExtension_GetNumericProperty),
+
+    // Deadpool (UE4.27) additions. fesetround is a plain forward (fenv.h);
+    // __poll_chk is FORTIFY's poll; timezone is DATA (see its definition).
+    // execvp / mkdtemp / deflateBound / compress2 / __stack_chk_guard were in
+    // this list on the deadpool branch and are driver's own now.
+    E("fesetround", fesetround),
+    E("__poll_chk", kl_poll_chk),
+    E("timezone", &kl_timezone_var),
 
     E("__klepton_unresolved", kl_unresolved),
 };
@@ -2257,6 +2554,9 @@ void kl_shim_set_guest_gl(kl_image *img) { g_guest_gl = img; }
 
 void *kl_shim_lookup(const char *name) {
     if (kl_shim_override) { void *o = kl_shim_override(name); if (o) return o; }
+    // SysV sem*/shm*: the in-process emulation, ahead of the generated
+    // table's direct forwards (Darwin's SysV is SIGSYS on visionOS).
+    { void *v = kl_sysv_lookup(name); if (v) return v; }
     for (size_t i = 0; i < sizeof g_shim / sizeof g_shim[0]; i++)
         if (strcmp(g_shim[i].name, name) == 0) return g_shim[i].fn;
     // Tier 4: the NDK surface lives in its own table — it is a different
@@ -2389,7 +2689,22 @@ void *kl_shim_lookup(const char *name) {
     // `ovrp_` is OVRPlugin's prefix and a different library (kl_ovrp), so the
     // fourth character is checked: `ovr_` and `ovrID` are the platform's, and
     // `ovrp_` must not be claimed here.
-    if (!strncmp(name, "ovr_", 4) || !strncmp(name, "ovrID", 5))
+    //
+    // `ovrID` was one name; it is really a FAMILY. The platform SDK's public
+    // header set gives every enum a `ovr<Type>_ToString` / `_FromString` pair
+    // (56 of them exported from this title's own libovrplatformloader.so —
+    // ovrLaunchType_ToString, ovrMessageType_ToString, ovrID_ToString, ...) and
+    // UE4 links them, so they bind at relocation time like the `ovr_*` calls
+    // above. Tetris Effect aborted on `ovrLaunchType_ToString` for exactly this
+    // reason: the platform surface serves it, the door did not claim it.
+    //
+    // The test is `ovr` + an UPPERCASE letter, which is the SDK's own spelling
+    // for "a type name follows" and is precisely what excludes `ovrp_` (lower
+    // case p) without listing names. A name kl_ovrplat_sym does not know still
+    // comes back as an abort-by-name stub, so this widens the door, not the
+    // answers — and not the DRM line, which is classified inside that function.
+    if (!strncmp(name, "ovr_", 4) ||
+        (!strncmp(name, "ovr", 3) && name[3] >= 'A' && name[3] <= 'Z'))
         return kl_ovrplat_sym(name);
     return NULL;
 }

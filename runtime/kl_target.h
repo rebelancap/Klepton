@@ -42,6 +42,15 @@ typedef enum {
     // the Activity's own order, threading the handle onCreate returned through
     // every one after it.
     KL_GUEST_JKXR,
+    // SDL2's front door (org.libsdl.app.SDLActivity). The engine behind it
+    // varies — the first guest on this kind is nillerusr's srceng port — and
+    // the kind names the DOOR, not the engine, because the door is what the
+    // boot sequence is a transcription of: System.loadLibrary("SDL2") runs
+    // libSDL2's JNI_OnLoad, and nativeRunMain("launcher",
+    // "LauncherMainAndroid", args) is SDL's own dlopen+dlsym of the entry
+    // library's main function. Named SDL rather than SRCENG because a second
+    // SDLActivity guest would take the same door regardless of its engine.
+    KL_GUEST_SDL,
     // A plain Android NativeActivity + OpenXR guest: entered through
     // ANativeActivity_onCreate, runs its own loop on the android_main thread the
     // native-app-glue spawns, and submits its own OpenXR frames. No engine Java
@@ -86,6 +95,50 @@ typedef struct {
     // — and both engines report a missing OBB by carrying on.
     const char *obb;
     kl_guest_kind kind;
+    // Scene policy, read by the SwiftUI scene body (kl_app_target_own_hands /
+    // kl_app_target_opaque_world). own_hands: the guest models the wearer's
+    // hands itself, so the system must not draw the real ones over the scene
+    // (upperLimbVisibility). opaque_world: the guest draws an opaque world and
+    // wants the room gone — .full immersion rather than .mixed.
+    int own_hands;
+    int opaque_world;
+    // Engine dialect, not scene policy: UE4.26 and 4.27's GameActivity pass
+    // Build.VERSION.SDK_INT as the SECOND argument of
+    // nativeSetAndroidVersionInformation where 4.25's (re4) passes five bare
+    // strings. Verified against each APK's own GameActivity.smali. kl_ue4.c
+    // transcribes that call per target, so the row has to say which spelling
+    // the guest's native expects — calling the six-argument native with the
+    // five-argument signature faults inside the guest's first string read
+    // (tetris, r1: SIGSEGV in klj_str with an int in a jstring's place).
+    int ue4_sdk_int;
+    // SDL door only: the function SDLActivity.getMainFunction() answers, which
+    // libSDL2's nativeRunMain dlsym's out of `entry_lib`. It is in the table
+    // for the reason `entry_lib` is — it is a property of the GUEST's Java,
+    // read off each APK's own smali, and the two SDL guests here disagree:
+    // hl2vr's ValveActivity2 overrides it to "LauncherMainAndroid" out of
+    // liblauncher.so, and Simpsons Hit & Run's SimpsonsActivity overrides
+    // nothing, so it takes stock SDLActivity's {"SDL2","main"} /
+    // "SDL_main" out of libmain.so. NULL on every non-SDL row, and the door
+    // treats NULL as SDL's own default.
+    const char *sdl_main;
+    // Environment this target needs BAKED IN, as a space-separated list of
+    // NAME=VALUE (empty for almost every row).
+    //
+    // It exists because **a device launch has no command line**. Every other
+    // knob in this project is an environment variable set in front of
+    // `build/m_boot`, and that works right up until the guest is an installed
+    // .app the wearer starts from the Home View: there is nowhere to put an env
+    // var, so a target that cannot boot without one cannot boot on the device at
+    // all. ITR is the first — OnlineSubsystemOculus aborts on "Unable to get a
+    // valid UserID" unless KL_PLAT_USER answers one.
+    //
+    // A value here NEVER overrides one the caller already set: the real
+    // environment wins, so a host A/B (`KL_PLAT_USER=0 ./build/m_boot itr`)
+    // still does what it says. Each entry is announced when it is applied, and a
+    // malformed one is refused BY NAME rather than skipped — a row that silently
+    // bakes nothing is a device build that dies the way it did before, with no
+    // line in the log saying why.
+    const char *env;
 } kl_target;
 
 // NULL if the name is not in the table. `kl_target_names()` is for the error
@@ -126,5 +179,13 @@ const kl_target *kl_target_resolve(const char *arg);
 // `libdir_override` is for a run that was handed a path outside the tree
 // (nothing in-tree does this today); NULL uses the target's own.
 void kl_target_apply_host(const kl_target *t, const char *libdir_override);
+
+// The row THIS run is for, for runtime code that is not handed the target and
+// must not re-derive it (kl_target_resolve(NULL) reads KL_TARGET, which a host
+// run started from argv never sets — that is how one run reported another
+// target's OBB path). kl_target_apply_host records it; until something does,
+// the table default stands in.
+void             kl_target_use(const kl_target *t);
+const kl_target *kl_target_current(void);
 
 #endif

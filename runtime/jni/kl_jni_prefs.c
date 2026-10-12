@@ -252,13 +252,13 @@ static klj_val klj_Context_getSharedPreferences(void *env, void *self, const klj
             name, n > 1 ? (int)a[1].j : 0, p->path, p->kv.n);
     void *obj = kl_jni_new_object("android/content/SharedPreferences");
     klj_as_object(obj)->data = p;
-    // Android SharedPreferences are long-lived and callers keep them (hl2's
-    // libsourcevr fetches once and reads later). We cache the object in
-    // g_prefs_objs and hand it back on the next getSharedPreferences, so it must
-    // outlive the local frame it was made in — otherwise the cached pointer is
-    // retired and the guest's next GetObjectClass/getInt on it aborts on an
-    // "untagged pointer". Pin it.
-    kl_jni_pin_object(obj);
+    // Pinned, the same rule klj_singleton states: the store is a per-name
+    // singleton on Android itself (SharedPreferencesImpl lives for the
+    // process), and HL2VR's srceng holds the handle across JNI calls while
+    // still DeleteLocalRef'ing it — legal on Android, where the object
+    // outlives the local ref, and a use-after-retire here, where DeleteLocalRef
+    // retires the object (see klj_DeleteLocalRef's own note).
+    klj_as_object(obj)->pinned = 1;
     g_prefs_objs[g_nprefs_files++] = obj;
     return (klj_val){.l = obj};
 }
@@ -595,12 +595,22 @@ static klj_val klj_Box_init(void *env, void *clazz, const klj_val *a, int n) {
     const char *cls = klj_class_name(clazz);
     klj_pref   *e   = calloc(1, sizeof *e);
     if (!e || !cls) return (klj_val){.l = NULL};
-    if      (strcmp(cls, "java/lang/Integer") == 0) e->kind = 'I';
-    else if (strcmp(cls, "java/lang/Long")    == 0) e->kind = 'J';
-    else if (strcmp(cls, "java/lang/Float")   == 0) e->kind = 'F';
-    else                                            e->kind = 'Z';
-    if (e->kind == 'F') e->fval = n > 0 ? (float)a[0].d : 0.0f;
-    else                e->ival = n > 0 ? (int64_t)a[0].j : 0;
+    if      (strcmp(cls, "java/lang/Integer")   == 0) e->kind = 'I';
+    else if (strcmp(cls, "java/lang/Long")      == 0) e->kind = 'J';
+    else if (strcmp(cls, "java/lang/Float")     == 0) e->kind = 'F';
+    else if (strcmp(cls, "java/lang/Double")    == 0) e->kind = 'D';
+    else if (strcmp(cls, "java/lang/Byte")      == 0) e->kind = 'B';
+    else if (strcmp(cls, "java/lang/Short")     == 0) e->kind = 'S';
+    else if (strcmp(cls, "java/lang/Character") == 0) e->kind = 'C';
+    else                                              e->kind = 'Z';
+    if      (e->kind == 'F') e->fval = n > 0 ? (float)a[0].d : 0.0f;
+    // A double does not fit klj_pref's float, and klj_pref is SharedPreferences'
+    // own record — widening it there to serve a box would change what a
+    // preference is. So the double rides in the integral slot as its own bits
+    // and comes back out through the same memcpy; the kind is what says which
+    // reading is the right one.
+    else if (e->kind == 'D') { double d = n > 0 ? a[0].d : 0.0; memcpy(&e->ival, &d, sizeof d); }
+    else                     e->ival = n > 0 ? (int64_t)a[0].j : 0;
     void *obj = kl_jni_new_object(cls);
     klj_as_object(obj)->data = e;
     return (klj_val){.l = obj};
@@ -619,6 +629,20 @@ static klj_val klj_Box_floatValue(void *env, void *self, const klj_val *a, int n
     klj_object *o = klj_as_object(self);
     klj_pref   *e = o ? o->data : NULL;
     return (klj_val){.d = e ? (double)e->fval : 0.0};
+}
+
+// doubleValue() reads whichever bank the box was built from — a Double carries
+// its bits in the integral slot (see klj_Box_init), a Float its float, and every
+// integral box widens. Java's Number lets any numeric box answer any of these,
+// and a guest that boxed an int and asked for a double is doing something legal.
+static klj_val klj_Box_doubleValue(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    klj_pref   *e = o ? o->data : NULL;
+    if (!e) return (klj_val){.d = 0.0};
+    if (e->kind == 'D') { double d; memcpy(&d, &e->ival, sizeof d); return (klj_val){.d = d}; }
+    if (e->kind == 'F') return (klj_val){.d = (double)e->fval};
+    return (klj_val){.d = (double)e->ival};
 }
 
 const klj_binding klj_bind_prefs[] = {
@@ -666,14 +690,36 @@ const klj_binding klj_bind_prefs[] = {
     {"java/util/Iterator", "next",    "()Ljava/lang/Object;", klj_Iterator_next},
     {"java/util/Map$Entry", "getKey",   "()Ljava/lang/Object;", klj_Entry_getKey},
     {"java/util/Map$Entry", "getValue", "()Ljava/lang/Object;", klj_Entry_getValue},
-    {"java/lang/Boolean", "<init>", "(Z)V", klj_Box_init},
-    {"java/lang/Integer", "<init>", "(I)V", klj_Box_init},
-    {"java/lang/Long",    "<init>", "(J)V", klj_Box_init},
-    {"java/lang/Float",   "<init>", "(F)V", klj_Box_init},
+    // The boxes, all seven of them. Unity's AndroidJavaObject names every one of
+    // these classes by string when it boxes a C# primitive — java.lang.Byte,
+    // .Character, .Double and .Short are literals in this title's il2cpp
+    // metadata beside the four that were already here — and which one it picks
+    // is decided by the C# type at the call site, not by anything a host can
+    // see. Binding four of seven means three of them are a launch each.
+    {"java/lang/Boolean",   "<init>", "(Z)V", klj_Box_init},
+    {"java/lang/Byte",      "<init>", "(B)V", klj_Box_init},
+    {"java/lang/Character", "<init>", "(C)V", klj_Box_init},
+    {"java/lang/Short",     "<init>", "(S)V", klj_Box_init},
+    {"java/lang/Integer",   "<init>", "(I)V", klj_Box_init},
+    {"java/lang/Long",      "<init>", "(J)V", klj_Box_init},
+    {"java/lang/Float",     "<init>", "(F)V", klj_Box_init},
+    {"java/lang/Double",    "<init>", "(D)V", klj_Box_init},
     {"java/lang/Integer", "intValue",     "()I", klj_Box_integral},
     {"java/lang/Long",    "longValue",    "()J", klj_Box_integral},
     {"java/lang/Boolean", "booleanValue", "()Z", klj_Box_integral},
+    {"java/lang/Byte",      "byteValue",  "()B", klj_Box_integral},
+    {"java/lang/Short",     "shortValue", "()S", klj_Box_integral},
+    {"java/lang/Character", "charValue",  "()C", klj_Box_integral},
     {"java/lang/Float",   "floatValue",   "()F", klj_Box_floatValue},
+    {"java/lang/Double",  "doubleValue",  "()D", klj_Box_doubleValue},
+    // Number's widening accessors: any numeric box answers any of them.
+    {"java/lang/Float",   "doubleValue",  "()D", klj_Box_doubleValue},
+    {"java/lang/Integer", "doubleValue",  "()D", klj_Box_doubleValue},
+    {"java/lang/Long",    "doubleValue",  "()D", klj_Box_doubleValue},
+    {"java/lang/Byte",    "intValue",     "()I", klj_Box_integral},
+    {"java/lang/Short",   "intValue",     "()I", klj_Box_integral},
+    {"java/lang/Double",  "intValue",     "()I", klj_Box_integral},
+    {"java/lang/Integer", "longValue",    "()J", klj_Box_integral},
     {"java/util/List", "iterator", "()Ljava/util/Iterator;", klj_List_iterator},
     {0}
 };

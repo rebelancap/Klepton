@@ -152,6 +152,54 @@ typedef struct {
     // having a hard jagged edge.
     float         chroma_min, chroma_max;
     float         chroma_key[3];
+    // THE GUARD BAND, as a fraction of the quad's half-extent, applied to the
+    // OUTERMOST ring of grid vertices only.
+    //
+    // **A reprojected picture is exactly as big as the view it is shown in, and
+    // any correction at all makes it smaller.** The quad is sized by the
+    // tangents the guest RENDERED with, and those are the display's own — so
+    // with a zero delta it fills the eye precisely, and the instant the
+    // model-view rotates it, one side of the view is no longer covered. Under
+    // head ROLL the quad turns in its own plane and what is left over is four
+    // wedges at the corners; under yaw or pitch it is a sliver down one edge.
+    // They move with the head because they are defined by where the picture
+    // is NOT. They are the "black triangles that adjust with head roll"
+    // reported from the headset, 2026-08-23.
+    //
+    // The single-layer/rigid-warp argument does not exclude them, and this is
+    // the distinction r15 missed: it says nothing INSIDE the picture can move
+    // relative to anything else in it — and a gap is not inside the picture.
+    //
+    // A real runtime pays for this with a real guard band: the guest renders a
+    // few degrees more than it displays. That costs pixels and, worse, changes
+    // the frustum the guest is handed — the one thing about this port's
+    // geometry that is confirmed correct on a headset. So the margin is taken
+    // from the picture instead. The outer ring of cells is STRETCHED outward
+    // with its texture coordinates unchanged, which smears the outermost row of
+    // texels across the margin: standard edge-clamp behaviour, it cannot sample
+    // anything the guest did not draw (the uv never leaves the grid, so the
+    // other eye's half of a DoubleWide texture stays unreachable), and against
+    // black it is invisible.
+    //
+    // Sized against the correction it has to cover, and the CORNER is what
+    // sizes it: a rotation of theta moves the corner of the quad by sqrt(2)
+    // theta relative to its own half-extent, so the margin has to be about
+    // twice the angle in radians rather than equal to it. t_reproject measures
+    // exactly that — a 3 deg roll (0.052 rad) needs 0.10 to fill the corner
+    // texel and is black at 0.
+    //
+    // **It is MEASURED per eye per frame, not baked.** r16 baked 0.03 off a
+    // worst delta of 0.9 deg, and r17's worn log shows that under-sized before
+    // the head moved at all: `view rot 1.077 deg` is the eye's own CANT, which
+    // is inside the correction chain, so the delta on this display never
+    // reaches zero and 1.077 deg already asks for ~0.038. A constant sized off
+    // one title's measurement is a constant that is wrong on the next one, so
+    // kl_reproject_build takes the angle out of the rotation it is about to
+    // apply and asks for twice it. KL_REPROJECT_GUARD is now the FLOOR (0.03),
+    // not the value: 0 still restores the pre-r16 black, and a number still
+    // pins the floor for an A/B. `[rp] guard:` reports what was really needed,
+    // which is the line r16 had no way to be falsified by.
+    float         guard;
 } kl_reproject_uniforms;
 
 // The blit's uniforms — buffer(0) of its FRAGMENT stage. It carried a bare
@@ -339,6 +387,31 @@ static inline uint32_t kl_reproject_grid_vertices(uint32_t nx, uint32_t ny) {
 // second shader.
 void kl_reproject_grid_identity(simd_float2 *out);
 
+// The PER-LAYER composite's grid (kl_proj_layer_build's draw), and why it must
+// not be 1x1.
+//
+// The shader's guard band pushes the OUTER RING of grid vertices outward by
+// `guard` while their uv stays put (see `cq` in the shader). On a 1x1 grid every
+// vertex is on the outer ring, so there is no inner cell to hold the picture
+// still: the whole picture is MAGNIFIED by 1 + 2 * guard. And `guard` is sized
+// per frame from the correction angle (2 * theta + 0.005, floor
+// KL_REPROJECT_GUARD) — so the magnification follows the head's angular speed:
+// on the Vision Pro ~1.08x at rest (the eye cant alone is ~1.07 deg) and ~1.19x
+// in a quick turn. A world that "zooms in and out in proportion to how fast the
+// head moves" (hla launches 3/4). The eye pass's unfoveated grid had the same
+// fault and was moved to 64x64 (KleptonCompositor, `unwarpGrid`); this is the
+// same fix for the projection-layer pass, where the stretched ring becomes one
+// cell of `dim` — the thin edge smear the guard band was designed to be.
+//
+// kl_proj_layer_grid_dim() is KL_PROJ_LAYER_GRID (1..KL_REPROJECT_GRID_MAX),
+// DEFAULT 64 for every guest (promoted from hla 2026-10-04, after the tester
+// confirmed the zoom gone on the headset); KL_PROJ_LAYER_GRID=1 restores the
+// pre-fix 1x1 grid for a port's A/B. kl_proj_layer_grid() fills a buffer of
+// kl_reproject_grid_entries(dim, dim) entries; draw
+// kl_reproject_grid_vertices(dim, dim) vertices.
+uint32_t kl_proj_layer_grid_dim(void);
+void kl_proj_layer_grid(simd_float2 *out, uint32_t dim);
+
 // Fill a grid from a rate map, without this file knowing what a rate map is.
 //
 // `fn` is the platform's screen->physical conversion — on Apple that is
@@ -481,5 +554,71 @@ float kl_reproject_delta_degrees(const kl_ovrp_render_pose *rendered,
 // stops being a matter of opinion. Reverse-Z, so near maps towards 1 and far
 // towards 0; anything in [0,1] is inside the clip range.
 float kl_reproject_ndc_depth(const kl_reproject_uniforms *u);
+
+// ---------------------------------------------------------------------------
+// The COMPOSITE AUDIT — the layer path, checked on a host that has no compositor
+//
+// **This is the blind spot ITR's first device launch fell into.** The host reads
+// the guest's eye texture back directly (kl_vulkan_capture_eyes) and the PNG is
+// correct, so every host instrument said the port was right — while the only
+// thing between that texture and a person's eyes, the COMPOSITE, had never been
+// exercised at all. The gap is not ITR's: no host run of any port has ever
+// executed the decisions KleptonCompositor makes from the frame record, and
+// those decisions are where the whole picture is placed.
+//
+// So: the same decisions, as arithmetic, with no Metal and no drawable. Given
+// the record a compositor would read (kl_ovrp_last_complete_record) and the eye
+// texture it would be holding, this answers the one question that decides
+// whether the display shows the picture ONCE:
+//
+//     which texels of the eye texture does each eye end up sampling?
+//
+// It reproduces `sanitise` in KleptonCompositor.unwarpGrid line for line — the
+// viewport_of guard included — because a check that reimplements the rule
+// differently from the code is a check that passes while the code is wrong.
+//
+// `shared_storage` is nonzero when both eyes resolve to the SAME MTLTexture,
+// which is what DoubleWide means (kl_glfb.h) and what makes the crop
+// load-bearing rather than cosmetic: with one texture and no crop, every eye
+// samples the whole double-wide canvas and sees BOTH halves — the picture,
+// twice, side by side. With two textures an absent crop is merely a picture in
+// the wrong corner.
+//
+// It FAILS LOUDLY and by name: `fault` is nonzero and `why` says which of the
+// four it is, so a caller cannot report a healthy composite from a struct it
+// did not read. Nothing here is ITR-shaped; every guest that submits a render
+// viewport is audited by it.
+typedef struct {
+    int   have_record;   // a completed frame record was available at all
+    int   crop_dropped;  // the rect was refused because it describes another texture
+    int   cropped[2];    // a crop is applied for this eye
+    float uv[2][4];      // {x, y, w, h} of the eye texture each eye samples, 0..1
+    float overlap;       // fraction of eye 0's rect that eye 1's rect covers
+    int   fault;         // nonzero: what a compositor would show is WRONG
+    int   kind;          // which fault, as a kl_composite_fault
+    char  why[224];      // ...and which of the faults it is, in words
+} kl_composite_audit;
+
+// The fault classes, so a caller can COUNT them rather than keep one string.
+// The distinction is the whole value of the instrument: a run whose only faults
+// are KL_CF_NO_RECORD is a run that was healthy from its first submitted frame,
+// and a run carrying KL_CF_DOUBLED is showing the picture twice.
+enum kl_composite_fault {
+    KL_CF_NONE = 0,
+    KL_CF_NO_TEXTURE,   // nothing allocated to sample
+    KL_CF_NO_RECORD,    // no completed frame: symmetric default, no crop
+    KL_CF_CROP_REFUSED, // the rect describes another generation of the texture
+    KL_CF_DOUBLED,      // shared storage, overlapping rects — the picture twice
+    KL_CF_OUT_OF_RANGE, // an eye sampling outside its own texture
+    KL_CF_COUNT
+};
+
+// Returns `fault` — 0 when the composite this record and texture produce is
+// sound. A NULL or serial-0 record is itself a fault, because it is the case
+// where both eyes fall back to the symmetric default frustum AND to no crop at
+// once.
+int kl_composite_audit_eyes(const kl_ovrp_render_pose *rec,
+                            int tex_w, int tex_h, int shared_storage,
+                            kl_composite_audit *out);
 
 #endif

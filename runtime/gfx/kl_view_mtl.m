@@ -302,13 +302,20 @@ static id<MTLTexture> klvm_array_view(id<MTLTexture> src) {
 // render viewport smaller than the texture — and the cached grid belongs to the
 // single-eye path, which would thrash between the two shapes.
 static id<MTLBuffer> g_grid_id;
-static id<MTLBuffer> klvm_identity_grid(void) {
-    if (!g_grid_id) {
-        simd_float2 tmp[8];
-        kl_reproject_grid_identity(tmp);
+// At KL_PROJ_LAYER_GRID's density (kl_reproject.h, kl_proj_layer_grid_dim):
+// 1x1 lets the guard band magnify the whole picture by 1 + 2*guard.
+static id<MTLBuffer> klvm_identity_grid(uint32_t dim) {
+    static uint32_t built;
+    if (!g_grid_id || built != dim) {
+        uint32_t n = kl_reproject_grid_entries(dim, dim);
+        simd_float2 *tmp = calloc(n, sizeof *tmp);
+        if (!tmp) return g_grid_id;
+        kl_proj_layer_grid(tmp, dim);
         g_grid_id = [g_dev newBufferWithBytes:tmp
-                                       length:kl_reproject_grid_entries(1, 1) * sizeof *tmp
+                                       length:n * sizeof *tmp
                                       options:MTLResourceStorageModeShared];
+        free(tmp);
+        built = dim;
     }
     return g_grid_id;
 }
@@ -333,8 +340,9 @@ static int klvm_draw_proj_layers(id<MTLRenderCommandEncoder> enc, int eye,
     float px, py, pz, qx, qy, qz, qw;
     kl_ovrp_get_head_pose(&px, &py, &pz, &qx, &qy, &qz, &qw);
     simd_float4x4 device = simd_matrix4x4(simd_quaternion(qx, qy, qz, qw));
-    id<MTLBuffer> gbuf = klvm_identity_grid();
-    uint32_t gverts = kl_reproject_grid_vertices(1, 1);
+    uint32_t gdim = kl_proj_layer_grid_dim();
+    id<MTLBuffer> gbuf = klvm_identity_grid(gdim);
+    uint32_t gverts = kl_reproject_grid_vertices(gdim, gdim);
     int drawn = 0;
     for (int i = 0; i < n; i++) {
         kl_ovrp_proj_layer pl = list[i];

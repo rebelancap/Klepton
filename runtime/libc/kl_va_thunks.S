@@ -56,18 +56,26 @@ KL_VTHUNK klv_printf,             klh_printf,            1
 KL_VTHUNK klv_fprintf,            klh_fprintf,           2
 KL_VTHUNK klv_sprintf,            klh_sprintf,           2
 KL_VTHUNK klv_snprintf,           klh_snprintf,          3
+// bionic's variadic fortify pair — see the handlers in kl_va_handlers.c.
+KL_VTHUNK klv___sprintf_chk,      klh___sprintf_chk,     4
+// glibc's variadic fortify family, for the glibc personality (kl_glibc.c).
+KL_VTHUNK klv___printf_chk,       klh_gl_printf_chk,     2
+KL_VTHUNK klv___fprintf_chk,      klh_gl_fprintf_chk,    3
+KL_VTHUNK klv___asprintf_chk,     klh_gl_asprintf_chk,   3
+KL_VTHUNK klv___syslog_chk,       klh_gl_syslog_chk,     3
+KL_VTHUNK klv___snprintf_chk,     klh___snprintf_chk,    5
 KL_VTHUNK klv_asprintf,           klh_asprintf,          2
 KL_VTHUNK klv_dprintf,            klh_dprintf,           2
-// __sprintf_chk(dst, flag, cap, fmt, ...) — FORTIFY sprintf. Its four named args
-// (dst, flag, cap, fmt) are exactly klb___vsprintf_chk's, so the thunk hands &va
-// as the 5th arg and reuses that handler directly (no separate klh_ needed).
-KL_VTHUNK klv___sprintf_chk,      klb___vsprintf_chk,    4
-// __snprintf_chk(dst, n, flag, cap, fmt, ...) — one more named arg; forwards to
-// klb___snprintf_chk (see kl_libc_slink.c).
-KL_VTHUNK klv___snprintf_chk,     klb___snprintf_chk,    5
 KL_VTHUNK klv_syslog,             klh_syslog,            2
 KL_VTHUNK klv_warnx,              klh_warnx,             1
 KL_VTHUNK klv_android_log_print,  klh_android_log_print, 3
+// The handler does not return; the thunk's epilogue after `bl` is simply never
+// reached, which costs nothing and keeps this table one shape.
+KL_VTHUNK klv_android_log_assert, klh_android_log_assert, 3
+// A guest's own printf-shaped release logger, forwarded to a sink chosen by
+// whichever target interposes it. Inert unless something calls kl_interpose on
+// the guest symbol, so this row costs every other target nothing.
+KL_VTHUNK klv_guest_trace_printf, klh_guest_trace_printf, 1
 KL_VTHUNK klv_sscanf,             klh_sscanf,            2
 KL_VTHUNK klv_fscanf,             klh_fscanf,            2
 KL_VTHUNK klv_open,               klh_open,              2
@@ -126,3 +134,19 @@ _\name:
 KL_LDTHUNK klv_strtold,   strtod
 KL_LDTHUNK klv_wcstold,   wcstod
 KL_LDTHUNK klv_strtold_l, strtod_l
+
+// ---- long double in AND out ----
+// roundl takes its binary128 argument in q0 and returns one there too. The C
+// half (kl_f128_roundl, kl_libc_slink.c) works on the bits in x0:x1.
+    .globl _klv_roundl
+    .p2align 2
+_klv_roundl:
+    stp     x29, x30, [sp, #-16]!
+    mov     x29, sp
+    fmov    x0, d0
+    fmov    x1, v0.d[1]
+    bl      _kl_f128_roundl
+    fmov    d0, x0
+    fmov    v0.d[1], x1
+    ldp     x29, x30, [sp], #16
+    ret

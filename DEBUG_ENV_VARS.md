@@ -21,6 +21,11 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   SIGABRT to `waitpid`). The guard in `kl_ovrplat.c` itself is unaffected.
 - `KL_FAULT_WAIT=1` — park in m_boot's fault handler on SIGSEGV/SIGBUS/
   SIGABRT/SIGALRM and print the pid, for post-mortem `lldb -p` attach.
+  Read ONCE by `kl_fault_install` (as is `KL_FAULT_PEEK`, bytes of memory
+  peeked per register, 16..512, default 16) — the handler itself never calls
+  getenv, since a fault taken while the thread holds libc's environ lock would
+  re-lock it and abort with no report. Set both before launch; a later
+  `setenv` is not seen.
 - `KL_LIFECYCLE=1` — drive the UnityPlayer lifecycle sequence
   (nativeRecreateGfxState, nativeResume, nativeRender) instead of stopping
   after initJni.
@@ -36,10 +41,31 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   0 instead of aborting. Read by `kl_jni.c` (via `kl_jni_set_permissive`),
   `kl_egl.c`, `kl_ovrp.c`, `kl_ovrplat.c`. Scouting only — the guest carries
   on with answers we invented. Does not apply to the DRM entitlement guard.
+- `KL_PLAT_DRM_ABORT=1` — (`runtime/xr/kl_ovrplat.c`) restore the abort for the
+  ownership families' REQUEST half. By default, since the decision of
+  2026-08-20, the request-shaped calls listed in `g_plat_drm_request` (the
+  `ovr_IAP_*` requests except `LaunchCheckoutFlow`, and `ovr_AssetFile_Delete*`;
+  `ovr_AssetFile_Status*` is answered as an enumeration) answer
+  `0` — "the request could not be made" — because no Oculus service exists here;
+  Pinball FX VR aborted at its store-catalogue fetch on every launch otherwise.
+  This knob is the A/B, not a policy: the ownership ACCESSORS (`ovr_Purchase_*`,
+  `ovr_Product_*`, `ovr_AssetDetails_*`) and every `ovr_AssetFile_Download*`
+  abort unconditionally either way.
 - `KL_DYLIB_DIR=<dir>` — (`runtime/kl_image.c`) prefer `<dir>/<name>.dylib`
   (klepton-ld output) over the ELF when loading each guest library — how
   `make bootdylib*` runs the translated images. Unset, the runtime ELF loader
   maps the `.so` directly.
+
+## Upstream defaults (`runtime/guest/kl_driver.c`)
+
+- `KL_UPSTREAM_DEFAULTS=0/1` — whether upstream's process-wide defaults apply
+  to this run. Default: 1, except on the rows measured with this tree's own
+  defaults (batman, beatsaber, deadpool, fnaf, gorn2, hl2vr, itr, pinballfx,
+  pttr, re4, simpsons, superhot, tetris), which run as they were confirmed.
+  Read by `kl_driver_upstream_defaults()`; the knobs that follow it say so in
+  their entries (`KL_MVK_CONCURRENT_COMPILE`, `KL_VK_API_1_1`,
+  `KL_VK_UPSTREAM_LAYER` and its layer, `KL_XR_VULKAN2`, `KL_UE4_VULKAN`,
+  `KL_SIG_X18_REPAIR`, `KL_GLFB_HANDOFF_SHARE`).
 
 ## GL / null driver (`runtime/gfx/kl_egl.c`)
 
@@ -59,6 +85,14 @@ answers GL and kl_glfb never initializes.
 - `KL_GLFB=1` — enable the one-eye reference renderer on ANGLE/Metal.
   Host-only; it exists to produce the known-good frame a real backend gets
   diffed against.
+- `KL_GLFB_HANDOFF_SHARE` — when a second thread makes the SAME guest
+  EGLContext current without a release, give that thread its own context in
+  the root share group (upstream's handoff model) instead of refusing. Default:
+  on where upstream's defaults apply (`KL_UPSTREAM_DEFAULTS`), off on the
+  measured rows, which keep the refusal.
+- `KL_GLFB_TB_TRACE=1` — one line per buffer-texture refresh (tex, buffer,
+  format, offset, texel count): a frozen texel buffer shows as a count that
+  stops climbing.
 - `KL_EGL_EXTENSIONS=<space-separated list>` — override what
   `eglQueryString(EGL_EXTENSIONS)` answers. The default names the three we
   actually implement (`EGL_KHR_image_base`,
@@ -122,6 +156,29 @@ answers GL and kl_glfb never initializes.
   a whole swapchain — 250-380 MiB — per loading transition). The A/B for that
   fix; with it off, watch `KL_GL_CENSUS`'s live texture MiB climb at every
   rebuild and never come down.
+- `KL_EYE_FORGET_STRICT=0` — when an eye texture is released, clear the
+  `(eye, stage)` registration even if the slot has ALREADY been re-registered
+  with the texture that replaced it. The pre-2026-08-23 behaviour, and the A/B
+  for r12's fix: `ovrp_GetLayerTexture2` registers the new name and then binds
+  its Metal storage, and kl_glfb's "replaced with no teardown" backstop
+  releases from inside that bind — one line too late. With this off, every eye
+  stage loses its identity in the first seconds of the run and every frame is
+  booked as "drew into no eye stage" while the guest draws happily into the
+  textures. Pair with the two knobs below to see it on host.
+- `KL_OVRP_SKIP_EYE_TEARDOWN=1` — make `ovrp_DestroyEyeTexture` a no-op, so the
+  next `SetupEyeTexture2` takes the "replaced with no teardown" backstop. That
+  is the path Tetris Effect takes on device and no host run took, which is why
+  r11 and r12 were both diagnosed from a host report of a device-only bug.
+  Needs `KL_GLFB_MTL=1` (the backstop lives in the MTLTexture-backed branch);
+  `m_boot`'s UE4 door honours that knob as of 2026-08-23.
+- `KL_GLFB_CENSUS_SECS=N` — how often the eyemap / per-FBO draw / link /
+  eye-swapchain censuses print DURING a run (default 15 s, 0 = off). This is
+  always on, because on device the exit report is unreachable:
+  `KL_EXIT_ON_BACKGROUND=0` is baked for these targets and a force quit is
+  SIGKILL, so `kl_egl_report` never runs there. Printed from both the
+  compositor loop and `ovrp_EndFrame4`, plus an immediate flush labelled
+  `(layer paused)` when the immersive space is dismissed. Grep `[census] ---
+  live`.
 - `KL_GLFB_NOSRGB=1` — allocate `GL_RGBA8` where the guest asked for
   `GL_SRGB8_ALPHA8`. A probe; a captured frame is then wrong (un-decoded
   sRGB).
@@ -200,6 +257,35 @@ answers GL and kl_glfb never initializes.
   trampoline (`kl_gl_trace.S`).
 - `KL_GLFB_TRACE_FROM=<n>` — start the `KL_GLFB_TRACE` printout at the nth
   call (default 0), so a crash deep in a long run stays readable.
+- `KL_GLFB_ATTRIB_DUMP=N` — before each of the first N draws, print the whole
+  vertex-attribute table AS THE DRIVER SEES IT: index, enabled, the buffer bound
+  to its binding, the client pointer, size/type/stride/divisor — plus the linked
+  program's active attributes and the location the linker gave each of them.
+  Read from GL rather than from an interception ledger on purpose: ANGLE's
+  "client-side attribute" test is exactly `enabled && bound buffer == 0`, and
+  this prints that test's own inputs. It is what named the ES 3.1
+  vertex-attrib-binding gap in one line (tetris r7).
+- `KL_GLFB_ATTRIB_TRACE=N` — the first N calls of the vertex-array setup family
+  (`glBindVertexArray`, `glVertexAttribPointer`, `glEnable/DisableVertexAttrib-
+  Array`, and the ES 3.1 `glVertexAttribFormat`/`Binding`/`glBindVertexBuffer`/
+  `glVertexBindingDivisor`), each stamped with the thread and the REAL ANGLE
+  context it landed on. The dump above says what the state IS at the draw; this
+  says which context each half of it was written to.
+- `KL_GLFB_ATTRIB_TRACE_BUF=1` — add `glBindBuffer` to that trace. Off by
+  default because buffer binds outnumber the attribute calls by three orders of
+  magnitude during asset streaming and eat the whole quota before the first
+  draw.
+- `KL_GLFB_VAB=0` — hand the ES 3.1 vertex-attrib-binding family back to ANGLE
+  unchanged instead of translating it to `glVertexAttribPointer`. ANGLE's Metal
+  backend is an ES 3.0 context and rejects every one of them, so this is the A/B
+  for "was the translation the thing that fixed it", not a usable mode.
+- `KL_GL_ES_VERSION=<major>.<minor>` (`kl_egl.c`) — override the GLES level this
+  gateway DESCRIBES itself as, for one run. The default is 3.2 and the reason is
+  in `kl_egl.c`; the claim is not cosmetic, because a guest picks its shader
+  dialect AND its vertex-setup API from it. This is the bisect instrument for
+  "is the overstatement the problem?" — for tetris the answer was no (`3.0` and
+  `3.1` both crash UE4 in RHI init), and the fix was to SERVE the ES 3.1/3.2
+  families rather than stop claiming them.
 - `KL_GLFB_LOCK=1` — route every resolved GL entry point through a
   process-wide lock held across the call (`kl_gl_lock.S`). Serialises all
   guest GL; a probe, not a mode.
@@ -224,6 +310,60 @@ answers GL and kl_glfb never initializes.
   ~17 s of a 2D UI at the shell's frame rate, which is far too coarse to see
   what a `KL_VIEW_POKE` click did; 10 is the useful value when driving a
   frontend.
+- `KL_GLFB_STAGE_PROBE_HALVES=1` — needs `KL_GLFB_STAGE_PROBE=<N>` to arm the
+  sweep. The DoubleWide question, and the one a lit-pixel count cannot answer
+  however honest it is: count each HALF of the eye texture separately and
+  compare them texel by texel. Every r13 failure — both eyes handed the left
+  half, a split that copied one half over the other, an eye reading a slice
+  nothing wrote — leaves the TOTAL count looking exactly like success. The
+  verdict names the shape: `a stereo pair`, `IDENTICAL — one picture in both
+  halves, no stereo`, `RIGHT HALF EMPTY`, `BOTH HALVES EMPTY`. A sampled patch
+  cannot do this job (157,357 lit of 10,992,000 is 1.4% of the surface, and four
+  patches read 0.0000 straight through a scene that was plainly there), so this
+  reads the whole surface and costs a `glFinish` plus ~20 MB of staging.
+- `KL_GLFB_DOUBLEWIDE=0/1` — force the DoubleWide bridge off or on, overriding
+  what `klovrp_eye_layout` decided. On means eye 1 is served eye 0's MTLTexture
+  and slice, and each eye crops its own half through its own unwarp block.
+- `KL_GLFB_DOUBLEWIDE_SPLIT=1` — go back to r8's answer: blit each half of the
+  eye-0 texture out to a whole eye texture at `EndFrame`. **Wrong on device, and
+  off by default since r13.** It works in logical screen coordinates over
+  variable-rate FOVEATED storage, so it reads texels the guest never wrote and
+  un-squeezes a picture the unwarp grid is about to un-squeeze again. In the
+  headset that was a stretched, displaced, low-left left eye; a black right eye;
+  and a flicker as the stages the frame's mask did not name came round still
+  carrying good content. Kept only for a present path with no per-eye viewport
+  at all (the host viewer).
+- `KL_GLFB_STAGE_PROBE=N` — every Nth `ovrp_EndFrame`, read two 32x32 patches
+  (centre and 25%,25%) out of every registered (eye, stage) eye texture and
+  report min/mean/max over RGB with a `BLACK`/`content` verdict, alongside the
+  draws, clears and resolve blits that landed in that stage since the last
+  sweep. The only reader of eye-texture pixels that works ON DEVICE —
+  `KL_GLFB_DUMP_SINK` needs a frame sink and only the host viewer has one. Note
+  for device logs: with foveation in force the texture is larger than the
+  physically rasterized region, so the CENTRE patch can legitimately read zero
+  while the picture is fine; the 25% patch is the load-bearing one, and the
+  verdict is the OR of the two. **`N` is a period, not a delay** — the sweep
+  counter starts at zero, so the first sweep is on the guest's FIRST
+  `ovrp_EndFrame`, not on frame `N`. **Not baked on for any target**: it was
+  baked to 120 for `superhot` and on 2026-08-12 that first-frame sweep killed a
+  worn round outright (the readback is safe now; see below). Ask for it on a
+  tethered round, where a bad one is cheap:
+  `KLEPTON_TARGET=superhot KL_GLFB_STAGE_PROBE=120 ./run.sh device`.
+  The readback goes through a pixel pack buffer rather than straight into our
+  own memory, because on device the eye stage is an EGLImage over a
+  `storageMode = .private` `MTLTexture`: a plain `glReadPixels` puts ANGLE's
+  Metal backend into `mtl::Texture::getBytes`, whose only guard against a
+  non-CPU-accessible texture is an `ASSERT` that a release build compiles out,
+  and `-[MTLTexture getBytes:]` then faults inside the driver. A bound pack
+  buffer routes the same call through `readPixelsToPBO`, which copies with a
+  blit encoder. On a Metal-backed stage the probe refuses to read at all rather
+  than fall back to the direct path.
+- `KL_GLFB_CLAMP_INSTANCING=1` — clamp Unity's `UnityInstancing_PerDrawN` array
+  to what `GL_MAX_UNIFORM_BLOCK_SIZE` will actually take. Off by default and
+  lossy on purpose: it makes the program link, but Unity still batches up to
+  the count it chose, so instances past the clamp read the array out of bounds.
+  The right fix is a driver whose limit is not the GLES 3.0 spec minimum
+  (ANGLE's Metal backend hardcodes 16384; its own ceiling is 65536).
 - `KL_GLFB_RAWSTATS=0` — silence the per-60-captures line reporting the eye
   texture's raw (pre-tone-map) min/max/mean. On by default; it is how the
   "very dark" picture was shown to be 1e-3 linear content, not a bad curve.
@@ -272,6 +412,30 @@ answers GL and kl_glfb never initializes.
   the guest over the Simulator's ETC2 fault.
 - `KL_GLFB_LOG_UNITS=1` — log texture-unit traffic (the "Invalid texture
   unit!" neighbourhood — see `KL_POKE_CAP` under Viewer).
+
+- `KL_GL_LINK_THREADS=<N>` — how many worker threads ANGLE may use for shader
+  links. **Default 0, which means links resolve INLINE on the calling thread**
+  (`glMaxShaderCompilerThreadsKHR(0)`), and that default is not a preference: it
+  is how the r10 device wedge was removed — a render thread parked 33 s inside
+  `gl::Program::MainLinkLoadEvent::wait` from our own `GL_LINK_STATUS` query,
+  holding a guest mutex, with the whole run dead behind it. The same binary
+  linked fine on host, so it is a timing race in ANGLE's parallel link worker
+  and not a shader the Metal backend cannot compile. `N<0` leaves ANGLE's
+  default untouched, which is the way back to the r10 behaviour.
+
+  It is per-CONTEXT state, so `kl_glfb_make_current` re-applies it whenever a
+  thread's context changes — the root-context call alone does not cover the
+  contexts UE4 creates for its own threads, and one of those is where the wedge
+  was.
+
+  **The cost of the default is real and now measured.** The link census prints
+  `N s of the last M spent INSIDE glLinkProgram (P% of the render thread)`
+  whenever linking happened in the window. Tetris Effect links 610 programs
+  during its menu at about ten a second and runs the menu at 13.6 fps against
+  119.4 fps in a level; the count stops growing at exactly the frame the rate
+  goes to 120. Raising this knob is the free experiment that asks whether the
+  r10 race still exists on the current OS and ANGLE build — but the failure mode
+  is an unlaunchable build, so it is a deliberate experiment and not a default.
 
 ## Networking (`runtime/libc/kl_shim.c`)
 
@@ -509,6 +673,23 @@ The guest's own memory management, and the three seams that used to disable it.
 - `KL_LOWMEM_CLEAR=<percent>` — re-arm threshold, default 70. A guest that
   cannot free anything is asked once, not once a frame. The OS's own
   memory-pressure signal ignores both and always fires.
+- `KL_TRIM_ON_LOAD=1` — knock the low-memory door (`nativeLowMemory`) every
+  time the guest logs Unity's scene-load banner `I/Unity: Loading:<scene>`, and
+  again at the bare `Loading:` that ends each load (logged as `"(load end)"`;
+  trailing newline stripped — HARD BULLET launch 3, `make trimload`). Default
+  **0** on driver; a target row
+  or env file turns it on. For titles that stack the next scene on top of the
+  current one — HARD BULLET's lobby trip is +750 MB in ~1 s, far inside the OS
+  pressure source's reaction time. The log doors (`__android_log_print` /
+  `_vprint` / `_write`) only record the request; the door is knocked from the
+  next `kl_mem_pressure_poll` (looper pump / render loop), never from inside
+  the guest's log call, and back-to-back loads collapse to one knock. One line
+  per knock: `[trim] scene load → trim fired (nativeLowMemory) for "<scene>",
+  load K, foot …, budget free …` (budget free = reported budget − footprint,
+  not the `[hb]` OS avail); `… seen but the guest registered no trim door`
+  when there is none. (hardbullet's lineage adds the GameActivity
+  `onTrimMemoryNative` door at `KL_TRIM_LEVEL` and a log collapser; neither is
+  on driver yet.)
 
 ## Guest storage (`runtime/kl_jni.c`)
 
@@ -546,6 +727,13 @@ The guest's own memory management, and the three seams that used to disable it.
   SUPERHOT's save loader chains its whole load off this one request, so a
   refusal leaves the SDK waiting on a completion that never comes, behind the
   launch precache's own black clear.
+
+
+- `KL_APK=<path>` — the APK behind `getPackageCodePath()`, which Unity opens
+  as a zip for its streaming assets. Host default is `beatsaber.apk`; set it
+  (with `KL_FILES_DIR`) when host-booting another Unity title via
+  `make boot LIBS=<title>/lib/arm64-v8a`. visionOS ignores it — `kl_app.c`
+  passes the staged APK explicitly.
 
 ## Device identity (`runtime/kl_jni.c`)
 
@@ -640,6 +828,36 @@ CLOCK_REALTIME. Forwarding either verbatim poisons guest time:
 - `KL_NO_REBASE=1` — disable the monotonic→realtime abstime rebase in
   `klb_pthread_cond_timedwait` entirely. Diagnostic for the capture deadlock;
   breaks class-init waiters.
+
+## Guest thread scheduling (`runtime/libc/kl_pthread.c`)
+
+- `KL_GUEST_QOS=off|background|utility|default|initiated|interactive` — the QoS
+  class **every guest thread** is created at. Default `initiated`
+  (`QOS_CLASS_USER_INITIATED`); `off` restores `QOS_CLASS_UNSPECIFIED`, which is
+  what this runtime did before and is the exact revert.
+
+  Why it is not `unspecified`: a plain `pthread_attr` carries
+  `QOS_CLASS_UNSPECIFIED`, and on Apple silicon that is the legacy tier the
+  scheduler may satisfy from an efficiency core. `kl_app.c` already gives the
+  guest's own frame thread `USER_INTERACTIVE` and says why — but every OTHER
+  guest thread comes through `klb_pthread_create`, so UE4's render thread, its
+  RHI thread, its task-graph pool, its streaming threads and the audio engine's
+  mixer thread all got nothing. Deadpool measured it on a one-to-two-minute
+  load; Tetris Effect points at it from two directions at once (a guest whose
+  Wwise mixer returns one silent buffer in six, and a menu that runs at 13.6 fps
+  while its render thread links 610 shader programs).
+
+  `initiated` rather than `interactive` on purpose: interactive is the frame
+  producer's tier and the compositor's, and a task-graph worker that shares it
+  can preempt the thread whose deadline actually matters. `interactive` is
+  available as the next rung when a specific guest needs it, and the class in
+  force is printed once per run (`[thr] guest threads are created at QoS ...`)
+  so a before/after is a grep rather than a guess.
+
+  Both audio feeder threads (`kl_aaudio.c`, `kl_opensl.c`) are host threads and
+  are set to `USER_INTERACTIVE` unconditionally — they call the guest's mixer
+  and then block for exactly one buffer's playback, so there is no queue in
+  front of them to absorb a late wake. This knob does not reach them.
 
 ## Mutex map (`runtime/libc/kl_pthread.c`) — deadlock instruments
 
@@ -772,6 +990,42 @@ behind "no controllers render". Diagnostic only, off unless asked for.
   between the two is the measurement — `VRLaserPointer=0/1` means the laser
   exists and is switched off.
 
+### Reading managed FIELDS instead of calling managed methods
+
+The knobs above ask the guest questions. These three read its state directly,
+which is what a sequence that has stopped advancing needs — disassembly can
+list the steps a coroutine queues, but only the live object knows which one it
+is sitting on. Same seam, same safety (between frames, on the thread that just
+ran one), same "off unless asked for". Host only so far: `m_boot` calls them.
+
+- `KL_PROBE_TIMELINE=<frames>` — every N frames, dump every `LevelTimeline` in
+  the scene (including derived types, and inactive ones — a timeline whose
+  GameObject was switched off stops ticking without finishing, and
+  `FindObjectsOfType` would hide exactly that). Per timeline: the concrete type,
+  the phase count, the walk index, the mode, and for the current phase its name,
+  duration, elapsed, delay, and its `done`/`started`/`skipped`/`realtime` bytes.
+  The **whole ordered phase list** is printed once, on the first report — which
+  is how SUPERHOT's nine-step launch precache was enumerated from live data
+  rather than guessed. Also prints `Time.timeScale`/`unscaledDeltaTime`/
+  `realtimeSinceStartup` and `VRLaunch.isLaunching` / `VrFog._enabled`.
+  The field offsets come from disassembly and are printed back with the field
+  NAME il2cpp's metadata puts at each one, so a wrong offset shows up as a
+  mismatched name rather than as a plausible wrong number.
+- `KL_PROBE_CLASSREF=<hex>[,<hex>...]` — resolve an il2cpp class-ref slot (an
+  image offset, read out of a disassembled `adrp`/`ldr` pair) to a type NAME
+  plus that type's static fields and values. Compiled il2cpp names nothing: a
+  gate that early-outs an entire `Update` is an anonymous byte at
+  `statics+0x14` until something reads the slot at runtime. This named
+  SUPERHOT's as `TimeControl.PauseMenuOpen`. Note the guest dereferences
+  **twice** and so does this.
+- `KL_PROBE_ENUM=<Namespace.Type>[:substring]` — the guest's own number for a
+  name, via `Enum.GetNames` + `Enum.Parse`, printed once. Protocol enums are
+  usually nested inside the class that speaks the protocol, so `Outer/Inner` is
+  accepted: `KL_PROBE_ENUM=Oculus.Platform.Message/MessageType:CloudStorage`.
+  This is where `ovrMessageType_CloudStorage2_GetUserDirectoryPath` came from,
+  cross-checked in the same run against the two constants already baked into
+  `kl_ovrplat.c`.
+
 **One caveat, recorded so it is not trusted.** The probe also prints
 `eventsystem: overUI=...`, which stays `no` even when the pointer works:
 `EventSystem.IsPointerOverGameObject()`'s zero-argument overload asks about
@@ -893,18 +1147,74 @@ puts the camera on the ground with its hands underneath it.
   silence but the assertion that a controller whose position is changing in the
   same sample is stationary. `kl_openxr` was already careful to distinguish
   those; the zeros defeated it from the publishing side.
+- `KL_OVRP_ORIGIN_REBASE=0` / `KL_OVRP_ORIGIN_Y=<metres>` — **whether the poses
+  we file are actually in the space the guest named.** `ovrpTrackingOrigin`
+  EyeLevel means y = 0 is at the user's eyes, so the head sits at y ~ 0;
+  FloorLevel/Stage put y = 0 on the floor and the head a standing height above
+  it. `klovrp_eye_height()` is this runtime's own statement of that rule. The
+  device pose path broke it: `kl_ovrp_set_head_pose` is fed `queryDeviceAnchor`'s
+  `originFromAnchorTransform` verbatim and ARKit's world origin is near the
+  FLOOR, so a guest that asked for EyeLevel got a head at y ~ 1.5 and everything
+  it placed AT its tracking origin landed a standing height low. On Tetris
+  Effect that is exactly the symptom — the menu has to be looked down at while
+  a level's content, placed relative to the pawn rather than the origin, is
+  straight ahead.
+  So when the guest has EXPLICITLY called a `SetTrackingOriginType` and asked
+  for EyeLevel, the head's height at that moment is captured and subtracted from
+  every pose filed for the guest — captured rather than assumed, so a seated
+  player gets a seated origin. Applied at the publish seam, the one place all
+  four guest-facing read paths already go through, so it cannot be applied twice
+  or missed once; `kl_ovrp_get_head_pose` adds it back because the frontend's
+  question is still asked in the frontend's space.
+  **Gated on the setter having been CALLED**: `g_tracking_origin` is 0 by
+  default, so a port that never spoke to it keeps the poses it always had. Beat
+  Saber asks FloorLevel and SUPERHOT only ever calls the getter, so no port
+  other than Tetris Effect is reached. `=0` is the whole revert, and it is also
+  the fix if the rebase turns out to be BACKWARDS — the symptom then is that the
+  scene that was right moves too HIGH by exactly the amount the other was low.
+  `KL_OVRP_ORIGIN_Y` forces a value instead of capturing one.
+- `KL_OVRP_QUAD_ORIGIN=0` — **the other half of the rebase: the guest's
+  world-locked quads.** A non-eye OVRPlugin layer's pose comes FROM the guest,
+  in its (rebased EyeLevel) tracking space, and the compositor places it in its
+  own floor-relative one — so the rebase is ADDED BACK to a world-locked quad's
+  y (head-locked quads carry no origin and are left alone). Default on. Without
+  it a quad the guest put "straight ahead" at y=0 lands on the floor: FNAF HW2's
+  opening logos on launch 3 after the 10-09 crossing (fnaf's 8028b4a0 had this
+  half; driver only had the head half). `=0` reverts. Inert for every guest the
+  rebase is inert for (never set an origin, or FloorLevel/Stage).
+- `KL_OVRP_ORIGIN_TRAIL=0` / `KL_OVRP_QUAD_TRAIL=0` — silence the two placement
+  trails. `[ovrp] origin #N HH:MM:SS.mmm A -> B (raw head … m above the floor;
+  rebase in force until now … m)` — one line per CHANGE of the guest's tracking
+  origin (cap 400); `[ovrp] quad layer N HH:MM:SS.mmm (… tex, … m, flags …):
+  guest pose (x, y, z) world-locked|HEAD-LOCKED, origin …, rebase … m -> placed
+  at floor-space y … m` — one line per layer when it appears and whenever its
+  placement changes by > 2 cm (cap 300). Both on by default: an Unreal guest
+  that flips EyeLevel/FloorLevel per level (FNAF HW2: ~37 times a session) is
+  unreadable without them.
 - `KL_OVRP_EYE_HEIGHT=<metres>` — standing eye height for the *default* head
   pose, i.e. what a headless run reports when no frontend has called
   `kl_ovrp_set_head_pose`. **Default 1.6**, and forced to 0 when the guest
   selected the EyeLevel origin (there the eye already is the origin). This is
   not cosmetic: with the head at y=0 under FloorLevel the menu renders above
-  the view and the default hands sit ~1.7 m below the frustum.
+  the view and the default hands sit ~1.7 m below the frustum. It is also the
+  fallback the tracking-transform family uses for the EyeLevel origin's height
+  until a real head pose has been published.
+- `KL_OVRP_ORIGIN_RELATIVE=0` — make `ovrp_GetTrackingTransformRelativePose`
+  answer identity for every origin instead of the floor/eye offset. We have one
+  tracking space (ARKit's, y=0 at the floor), so the relative pose is
+  `height(requested) - height(current)` on y alone, and identity whenever the
+  guest names the origin it is already running. Set this to 0 if a guest applies
+  the offset on top of poses that already carry it — the symptom would be
+  content sitting a standing height too high or too low.
 - `KL_OVRP_HANDS_IN_VIEW=1` — park both hands at a fixed spot inside the
   *current head's* frustum (head-relative, 15 cm out, 12 cm down, 55 cm
-  forward), overriding whatever the frontend last wrote. Read side, so it
-  beats the viewer's per-frame writes. Answers one question only — does the
-  guest draw controllers at all. Diagnostic: the hands do not move with your
-  real hands. The offset was absolute tracking-space coordinates until the
+  forward), overriding whatever the frontend last wrote, **and assert
+  controller presence** (the pose park alone never set the presence bit,
+  so an OpenXR guest — whose controller existence *is* that flag — reported
+  "untracked" forever and the knob's question was unanswerable on that
+  door). Read side, so it beats the viewer's per-frame writes. Answers one
+  question only — does the guest draw controllers at all. Diagnostic: the
+  hands do not move with your real hands. The offset was absolute tracking-space coordinates until the
   FloorLevel origin was measured, which parked them below the floor and out
   of frustum — the knob meant to prove the controllers render was hiding them.
 - `KL_OVRP_POKE="<when>:<BUTTON>[+<BUTTON>],..."` — a scripted controller
@@ -920,6 +1230,28 @@ puts the camera on the ground with its hands underneath it.
   the left controller, which is OVRPlugin's own convention). A misspelt name is
   NAMED, not skipped — a press that never happens reads as the guest ignoring
   input. `KL_OVRP_POKE_HOLD_MS` (250) is how long each press is held.
+  One more name, `AIM<deg>` / `AIMY<deg>` (deadpool): not a button but a
+  **pitch/yaw for the default hand aim**, sticky from that point in the script
+  until a later AIM replaces it — `f4000:AIM-10,f4400:RTRIG` aims the laser
+  10° from its rest angle and then clicks. It exists because a menu script is
+  otherwise limited to whatever widget the fixed default pose happens to point
+  at. Negative degrees only via `-` (`AIM-10`, never `AIM+10`): `+` is the
+  button separator. Calibrated on this title against `KL_VK_OUT` captures:
+  rest aim (0/0) sits on the language list's bottom row, `AIM-16` is the
+  "next" button below it. Applied to the default head-relative hand pose
+  only — a frontend's real hands are never retargeted. Same harness class as
+  the presses: a scripted input source, not an invented game answer.
+  `POSX<m>` / `POSY<m>` / `POSZ<m>` (deadpool): the position half of the same
+  idea — a **head-local delta in metres** added to the default hand pose,
+  sticky and per-axis (`POSX0.2` does not touch Y/Z), floats allowed
+  (`POSY-0.15`). It exists because aiming rotates the laser but never MOVES
+  the hand, and a proximity grab is overlap, not aim: deadpool's tutorial
+  ("hold the grip buttons to grab") cannot be passed from the rest pose, no
+  grabbable object intersects it. The axes are the default pose branch's own:
+  +X right, +Y up, +Z *backward* (the rest offset is dz=-0.35 forward, so
+  reaching further out is `POSZ-0.2`). Both hands move together. Whether the
+  reach actually touches anything is the guest's own collision, not ours —
+  same honesty rule as the presses.
   Merged where the guest **reads** its controller state rather than written
   into the published input, so it survives a frontend publishing every frame
   and works with **no frontend at all**: a headless `./build/m_boot re4` gets
@@ -961,6 +1293,141 @@ puts the camera on the ground with its hands underneath it.
   data we cannot read. A sweep does not need to know it — if any pitch produces
   a UI hit the offset is the only unknown left; if none does over 140°, the ray
   is not the problem. Pair with `KL_OVRP_FAKE_TRIGGER=1`.
+- `KL_OVRP_HAND_PITCH=<deg>` / `KL_OVRP_HAND_YAW=<deg>` — turn the reported
+  controller pose by a **right-hand rotation about the controller's own `+X` /
+  `+Y`**. `_L`/`_R` per hand, bare name for both; default 0.
+
+  The sign is deliberately not dressed up as "up" and "right": which way the
+  picture moves depends on the frame the GUEST builds its ray in and on the
+  controller-to-pointer offset it applies, neither of which is readable from
+  here, and a knob whose documented direction is an assumption is exactly the
+  failure `KL_XR_AIM_PITCH` already had. Measure it with the scan below.
+  Measured on ITR (UE 4.27, OVRPlugin): pitch **-10 aims one menu row lower**;
+  the yaw direction was not measured and is not claimed.
+
+  Applied in the controller's own frame (`-Z` points, `+Y` up, `+X` right) and
+  post-multiplied onto whatever pose was going to be reported, so it composes
+  with the frontend's live poses, with `KL_OVRP_HANDS_IN_VIEW` and with the
+  sweep alike. **This is the OVRPlugin door's answer to `KL_XR_GRIP_PITCH`,
+  which is OpenXR-only** — before it, an OVRPlugin guest's aim could only be
+  moved by the sweep, and the sweep destroys the thing it is measuring: it puts
+  the ray's origin inside the eye, so the laser the guest draws is a dot and
+  cannot be read off a picture. This one leaves the hand where it is and only
+  turns it.
+- `KL_OVRP_HAND_ROLL=<deg>` — the third rotation, about the controller's own
+  `+Z`. `_L`/`_R` per hand, default 0. Added in ITR round 17 because round 15
+  had measured that **96 degrees of yaw moved the hit point less than one menu
+  button** while pitch walked it cleanly down the column: a rotation about an
+  axis parallel to the ray it steers does nothing, so a near-null yaw says the
+  pointer lies near the controller's own `±Y` and the untried orthogonal axis is
+  `+Z`. **Measured on ITR: roll has no authority either** (0 → +60 deg, seven
+  cells, the highlight never left "Start New Game").
+- `KL_OVRP_HAND_DX` / `_DY` / `_DZ=<metres>` — **translate** the reported hand,
+  i.e. move the ray's ORIGIN, in the controller's own frame and resolved after
+  the three rotations above. `_L`/`_R` per hand, default 0.
+
+  These are the fallback that a rotation cannot absorb: whatever unknown
+  controller-to-pointer ROTATION the guest applies, it cannot rotate away a
+  shifted origin. They are also the weaker lever by construction — a
+  centimetre of origin shift moves a hit point on a panel two metres away by a
+  centimetre, where a degree of rotation moves it ~3.5 cm per metre of range —
+  so reach for the rotations first and use these to decide whether a null
+  rotation means "absorbed" or "not used at all".
+
+  **Measured on ITR, and this is what they were built to settle:** `_DY` moves
+  the menu hit point down the column exactly as pitch does (it walked the
+  highlight from "Start New Game" to "Credits", which then opened), while `_DX`
+  swept -1.0 → +1.0 m and never moved it sideways at all. Four levers, two
+  rotational and two translational, and **only the vertical family reaches this
+  guest's menu pointer** — see STATUS's round 17.
+- `KL_OVRP_HAND_SCAN="a0,a1,da;b0,b1,db[;frames[;start]]"` — walk a **grid** of two
+  of the six across one run, `frames` guest frames a cell (default 200), the
+  second range the outer loop.
+
+  **Which two** is chosen by `KL_OVRP_HAND_SCAN_A` (the inner loop, default
+  `pitch`) and `KL_OVRP_HAND_SCAN_B` (the outer, default `yaw`), each one of
+  `pitch|yaw|roll|dx|dy|dz`. The defaults reproduce the two axes this scan has
+  always walked, so every recipe written before round 17 keeps its exact
+  meaning. An unknown axis name and naming the **same** axis twice are both
+  refused by name and turn the scan OFF — a grid that searched one axis while
+  reporting two is how a lever gets cleared that was never pulled. The chosen
+  names are printed in the header line and in every cell line, so a capture can
+  never be matched to the wrong axis pair after the fact. The scan replaces the
+  statics only on the two axes it owns and leaves the other four alone, so a
+  static roll or translation can hold one aim steady while the grid walks two
+  others. Each cell is announced with the guest frame it begins on, and that
+  number is the one `KL_VK_OUT` puts in `vk_fNNNNNN_*.png` — so set
+  `KL_VK_OUT_EVERY` to a divisor of `frames` and every cell is matched to its
+  own picture by name. While a scan runs it **replaces** the static offsets
+  above (they would otherwise bias every cell). It refuses, loudly and by name,
+  a malformed spec, a zero or wrong-signed step (an infinite grid, not a small
+  one) and a grid over 4096 cells, and it says `grid COMPLETE` when it wraps —
+  a grid reported as searched when it was not is how a knob gets cleared that
+  was never actually tried. Worked example, and the one this was built for:
+  `KL_OVRP_HAND_SCAN="-30,50,10;-10,30,10;200" KL_VK_OUT_EVERY=100` found the
+  aim that puts ITR's laser on its main menu in a single 180 s run — 45 cells,
+  two full passes, three of them hovering a button and the rest not.
+  `start` (default 0) is the guest frame the **grid begins on**; until then the
+  static `KL_OVRP_HAND_PITCH` / `_YAW` above apply unchanged, and the run says
+  out loud when the lead-in ends. That is what makes scanning a **submenu**
+  possible: ITR's round 6 opened the New Game panel from inside the scan's own
+  first cell, which moved the grid's origin out from under every later cell and
+  then occluded the buttons they were aiming at. With a lead-in, a
+  `KL_OVRP_POKE` at a frame *before* `start` does the opening at a fixed aim,
+  and the grid only starts once the screen it is searching is up.
+- `KL_OVRP_HEAD_PITCH=<deg>` / `KL_OVRP_HEAD_YAW=<deg>` — move the reported
+  **head**. Pitch is a right-hand rotation about the head's own `+X`,
+  post-multiplied; yaw is a right-hand rotation about the *tracking space's*
+  `+Y`, **pre**-multiplied, so the two compose the way a neck does rather than
+  about a tilted axis. Default 0, and the whole family is inert unless one of
+  the three is set.
+
+  Applied at **one seam** — `klovrp_head_published()` — which every guest-facing
+  head read goes through (the one-pose freeze, the frame latch, `Update2`'s
+  fallback, `klovrp_head`), for the same reason `klovrp_origin_capture` is
+  placed there: it cannot be applied twice or missed on a path.
+
+  The sign is **not** dressed up as "up" and "left". `KL_OVRP_HAND_YAW`'s
+  comment declined to claim a direction and round 15 then measured that it walks
+  the pointer *down a column*; a knob whose documented direction is an
+  assumption is worse than one with none. **Measured on ITR (UE 4.27,
+  OVRPlugin), round 16, from captures**: `KL_OVRP_HEAD_PITCH` reaches the
+  guest's camera and a positive value aims the view **up**;
+  **`KL_OVRP_HEAD_YAW` does NOT reach it at all** — 180° of yaw produced an
+  unchanged framing while a 40° pitch in the same run tilted the whole scene.
+  This guest cancels the yaw component of the head orientation (UE4's
+  `FOculusHMD` base-orientation / recenter path is the suspect;
+  `ovrp_GetAppShouldRecenter2` is polled once a frame). **So on this title the
+  head knob is a PITCH knob**, and any experiment needing horizontal head motion
+  has to settle that first.
+- `KL_OVRP_HEAD_SCAN="p0,p1,dp;y0,y1,dy[;frames[;start]]"` — the same grammar and
+  the same refusals as `KL_OVRP_HAND_SCAN` above, applied to the head: walk a
+  grid, `frames` guest frames a cell (default 200), yaw the outer loop, each
+  cell announced with the guest frame it begins on (the number in
+  `vk_fNNNNNN_*.png`). `frames=1` with a tiny step is a **slow continuous
+  sweep**; two cells a hair apart is the **A/B**.
+
+  Two things make it an instrument rather than a knob. First, the cell is keyed
+  on the guest's own submitted-frame counter, so **the offset is constant for
+  the whole of a frame** — an offset that moved mid-frame would hand the game
+  thread and the render thread different views, i.e. it would *manufacture* the
+  view mismatch such a test is trying to detect. Second, **every cell boundary
+  prints the draw census over the frames that cell owned** (mean / min / max,
+  read-and-clear via `kl_vulkan_draw_window`), so the offset and its draw count
+  are adjacent lines and nothing has to be joined up afterwards. With the census
+  off it prints `UNAVAILABLE`, never a plausible zero.
+
+  **The failure mode to exclude before reading any number: a knob that does not
+  reach the guest reads exactly like "the draw count did not change".** The log
+  says the offset was *applied*, not that the guest *consumed* it. Confirm from
+  a `KL_VK_OUT` capture that the picture moved — that check is what caught the
+  yaw finding above.
+
+  Worked example, round 16's perturbation test:
+  `KL_OVRP_HEAD_SCAN="0,5.0,0.05;0,0,1;150" KL_OVRP_EYE_TAN=vision` — 101 cells,
+  two passes, and the guest recorded **exactly 232 draws every frame below
+  pitch 0.3575° and exactly 238 above it**, with min == max inside every cell
+  and no other step anywhere in five degrees.
 - `KL_OVRP_DUMP_VRDEVICE=1` — dump libunity's own Oculus VRDevice object once:
   the three unique device ids it stamps into both the joystick descriptors and
   the XR node states, then every function-pointer slot **named** by matching it
@@ -986,6 +1453,44 @@ puts the camera on the ground with its hands underneath it.
   measurement was taken against, and its tearing; each extra stage costs a
   full-size RGBA16F two-slice eye texture (~160 MB at map resolution). The
   A/B in both directions.
+
+  **Baked to 4 for `itr` as of round 13, and it is that port's flicker
+  candidate.** Three stages at Into the Radius's measured 89-93 fps come round
+  every 33.0 ms; the device log's `pose age` is 17.8-22.2 ms; so the compositor
+  has 11-15 ms to encode, commit and let its GPU pass finish SAMPLING the stage
+  before the guest starts drawing the next frame into it — against a slot that
+  already measures 9-11 ms. Round 11's drain closed "the guest is still finishing
+  frame N when the composite samples it"; nothing closed "the guest has started
+  frame N+3 in the same texture". A fourth stage takes the reclaim period to
+  44.0 ms and the headroom to 22-26 ms. Measured cost on host at device geometry:
+  RSS peaked at 2.41 GB over 26,510 frames, and the device prices one eye image
+  at 101 MiB. `KL_OVRP_STAGES=3` is the one-variable backout.
+- `KL_OVRP_MARGIN_CENSUS=0` — silence `[ovrp] stage margin`, which is **ON by
+  default** and rate-limited to one line per 10 s. It is the measurement for the
+  knob above, and it is deliberately a DISTRIBUTION rather than a fault count:
+  under `KL_OVRP_STAGES=4` a bare zero cannot distinguish "the extra stage fixed
+  it" from "the instrument is blind". Per stage it reports
+
+      margin = (the guest FILES its next frame into that stage)
+             - (the composite's GPU pass FINISHES reading it)
+
+  as mean / worst / tightest, a seven-bucket histogram, the count of PROVEN
+  collisions (`margin <= 0`), and — measuring the guest's frame period for itself
+  — the count of margins below one guest frame, which are the presents that
+  **would have collided at 3 stages**. That last number makes a launch
+  informative even when the reporter says nothing changed.
+
+  **`margin > 0` is NOT a safety verdict.** It says the overwrite finished after
+  our read did, not that it had not already started, so a mass in the small
+  buckets is the danger signal and not just the zero bucket. The log line says so
+  itself. **Observation-only**: the near end is one relaxed atomic store made
+  from a completion handler the compositor already had
+  (`KleptonCompositor.swift:2308`); the far end is exact, because round 11's
+  drain runs one statement before the record is filed. **It fails loudly** — the
+  stamp is cleared when consumed, so a file with no intervening read counts as
+  `no read` rather than reusing a stale one, and a run with no compositor at all
+  prints `MARGIN CENSUS FAILED` instead of a plausible zero. Every host run does
+  exactly that, which is what stops a clean host run voting on the hypothesis.
 - `KL_OVRP_TRACE=1` — log the live call SEQUENCE, with a global ordinal and the
   caller's image+offset, for the frame/layer/display family; `=all` for every
   entry point (the input pollers run thousands of times a frame and bury it).
@@ -1004,9 +1509,253 @@ puts the camera on the ground with its hands underneath it.
   pays one line for the run, so this is cheap to leave on. (RE4 carries
   what it measured and where the quad's world size lives.)
 - `KL_OVRP_LATCH=0` — restore the live per-call pose read instead of latching
-  head+hands once per frame at `ovrp_Update2` (the guest's real per-step latch
-  point). The A/B if the pinning is ever suspected of costing latency;
-  controller *buttons* stay live either way.
+  head+hands once per frame at `kl_ovrp_frame_latch`. The A/B if the pinning is
+  ever suspected of costing latency; controller *buttons* stay live either way.
+  **Default 1.** It was silently default-0 from a953945 until session 15: that
+  commit mechanised `getenv("KL_OVRP_LATCH")` + `!(e && e[0]=='0')` into
+  `kl_env_on(..., 0)` and inverted the default while keeping the comment.
+  What the flag actually gates is `klovrp_head()`/`klovrp_hand()`, and an
+  OVRPlugin guest never reaches those — every pose it asks for comes from the
+  `ovrp_Update2` step sample, which is a latch of its own. The paths that DID
+  go unlatched are the OpenXR ones (`kl_ovrp_eye_view`,
+  `kl_ovrp_get_guest_head_pose`, `kl_ovrp_frame_begin_external`), which have no
+  step ring and so were answering from the live published pose.
+- `KL_OVRP_POSE_KEY=index` (default) or `=live` — how `ovrp_BeginFrame` picks
+  the pose it files as the frame's render pose. `index` looks the pose up under
+  the guest's OWN frame index, as filed by the `ovrp_Update2(Render)` that
+  sampled it. `live` restores the old behaviour: file whatever Render-step
+  sample happens to be current when BeginFrame executes — which on this title
+  runs near the end of a `nativeRender`, with the next frame's `Update2` racing
+  behind it on another thread. Losing that race files frame N's pixels under
+  frame N+1's pose, and reprojection then subtracts one guest frame of rotation
+  that never happened to those pixels. Read it with:
+
+      [ovrp] pose filing: by-index N% | fallback-live N% | filed-at-lag 0x N% 1x N% 2+x N% (mode=..., N frames)
+      [ovrp] intra-frame pose spread: worst N deg | eye offset pushes N, changes N, worst N mm
+
+  `filed-at-lag` is how many `Update2(Render)` samples had landed since the one
+  belonging to the frame being filed. On the `live` path a steady nonzero `1x`
+  share **is the race, caught in the act**. On the `index` path the filed pose
+  is right regardless, and the histogram just says how often the old code would
+  have been wrong. `fallback-live 100%` means `Update2` and `BeginFrame` are
+  not sharing a frame numbering — a one-shot line names both indices when that
+  happens, and the knob cannot help in that case.
+
+  The second line is the two companion measurements: the largest angle between
+  any two head poses handed to the guest inside one of its frames (0 expected
+  for an OVRPlugin guest, since all answers come from the step sample), and
+  whether the unlatched per-eye offset the compositor pushes at panel rate ever
+  actually moves (`changes 0` closes that as a doubling suspect).
+
+  **Measured, session 15 round 2, on device:** `by-index 100% |
+  filed-at-lag 0x 100%` — the race NEVER fires on this title, so `index`
+  changed nothing and the BeginFrame race is dead as a suspect. What the
+  companion line printed instead is the live one: `intra-frame pose spread:
+  worst 2.973 deg`, and `eye offset pushes 1864, changes 1843, worst
+  0.178 mm`. See `KL_OVRP_ONE_POSE` below, which is the fix for that reading.
+- `KL_OVRP_ONE_POSE=index` (default, ON) or `=live` / `=off` / `=0` — **one
+  pose per guest frame**. A real OVR runtime answers every pose query inside
+  frame N from ONE pose for frame N's display time. This runtime answered from
+  live-ish sources, so queries scattered across a 13.9 ms guest frame —
+  `Update2(Physics)` early, `Update2(Render)` later, twenty
+  `ovrp_GetNodePoseState` reads between them, the eye view later still — each
+  got a different answer. Measured at up to **2.973 deg apart inside one
+  frame**. The pixels then embody a mixture, while reprojection subtracts the
+  single pose we filed, so the picture is displaced by a varying amount frame
+  to frame: shaking that grows with head speed and fuses at rest.
+
+  With this on, the guest's frame boundary freezes one head pose and every
+  head-derived answer for that frame returns it — both `Update2` steps, every
+  `GetNodePoseState`, `kl_ovrp_eye_view`, `kl_ovrp_get_guest_head_pose` — so
+  the pose filed for reprojection is the frame's only pose by construction.
+  The **eye transform** (`kl_ovrp_set_eye_offset` + `kl_ovrp_set_eye_rotation`,
+  together `device_from_view`) is promoted at the same instant, for the same
+  reason in miniature: the frontend pushes it at panel rate, and a guest that
+  reads it between its left and right eye render would otherwise see two.
+
+  The boundary is **the guest's frame CYCLE** — see `KL_OVRP_POSE_BOUNDARY`
+  below, which is round 23's correction and the reason this block did not
+  deliver what it promised until then. **Hands and controllers stay live** —
+  they are not world-lock relevant and pinning them would only add input
+  latency.
+- `KL_OVRP_POSE_BOUNDARY=cycle` (default) or `=index` — **where the frozen
+  pose above is renewed.** `index` is what shipped through launch #21: the
+  freeze was keyed on the frame index `ovrp_Update2`/`Update3` carries, on the
+  reasoning that the two steps of one frame carry one number.
+
+  **They do not.** This title calls `ovrp_Update3` exactly twice per frame
+  (2614 calls over 1307 frames in launch #21 — the Render step and the Physics
+  step), and in gameplay Unity's render thread TRAILS its sim thread, so the
+  two arrive carrying different indices: Physics with N, Render with N-1.
+  Keyed on the index, the second call saw a change and **re-froze in the middle
+  of the frame** — the ~26 `ovrp_GetNodePoseState3` calls of that frame were
+  answered from TWO different head poses, split at whichever instant the second
+  `Update3` landed, and that split point moves with thread scheduling every
+  frame. Sub-degree, alternating, scaling with head speed, fusing at rest.
+
+  The measurement, from `one-pose: served update2 N ... over 300 frames`
+  divided by the guest's two calls per frame — the same build, the same eye
+  size, the same warp arm, in boot20 and boot21 alike:
+
+  | | `served update2` per 300 freezes | poses per guest frame | the tester |
+  |---|---|---|---|
+  | menu | 588-600 | **1.00** | smooth |
+  | gameplay | 350-369 | **1.70** | **jitters** |
+
+  `cycle` keys on something both threads agree on instead:
+  `ovrp_WaitToBeginFrame`, called exactly once per guest frame (1307 for 1307
+  frames) and already this file's "the frame's first instruction". It ARMS the
+  boundary; the first freeze of the cycle spends the arm and every later
+  `Update2` in the same cycle reuses that pose whatever index it carries. A
+  guest that never calls `WaitToBeginFrame` (the OpenXR path, a headless run)
+  never arms and keeps the index keying it always had.
+
+  Read it with the companion census line:
+
+      [ovrp] pose boundary: freezes N, reuses N, guest frame cycles N | poses/frame X.XX (MUST be 1.00) | update2 per freeze Y.YY (this guest calls it 2x a frame) (mode=cycle|index)
+
+  `poses/frame` must be **1.00** in gameplay as well as in the menu, and
+  `intra-frame pose spread` should fall to **0.000 deg** — the spread window is
+  now the same cycle. `make posebound` is the host gate: it drives the entry
+  points with the gameplay pattern (two `Update2` steps with different indices,
+  the frontend publishing in between) and fails under `=index`, reporting
+  8 freezes over 4 cycles and a filed anchor that is not the pose the queries
+  got.
+- `KL_PREDICT_DISPLAY_TIME=1` (default off) — push the drawable's presentation
+  time across the `kl_ovrp_set_predicted_display_time` seam, so
+  `ovrp_GetPredictedDisplayTime` (called **1330 times** by this guest in launch
+  #21) answers the instant the frame will be SHOWN rather than falling through
+  to `clock_gettime(CLOCK_MONOTONIC)` — the instant it was asked, short by a
+  whole pipeline latency. Pistol Whip has always pushed it; this port never
+  did. Off for launch #22 only because that launch is the
+  `KL_OVRP_POSE_BOUNDARY` A/B and two mechanisms in one launch confound both.
+
+  **Round 24 evaluated it for pttr and left it OFF, deliberately.** The
+  boundary fix was enough (launch #22: `poses/frame 1.00`, `intra-frame pose
+  spread worst 0.069 deg`, the tester: jitter gone), and arming it would introduce
+  a disagreement rather than remove one: the frozen pose is the latched sample
+  dated at the drawable's `present`, never extrapolated, so pushing
+  `present + one display period` tells the guest its frame is shown 8.33 ms
+  after the only pose it gets. The fixed one-period lead is also knowably short
+  for this port — launch #22 reads `holds 1x:0 2x:49 3x:67` in gameplay against
+  a 120 Hz panel, i.e. 2-3 slots from publish to panel — and Application
+  SpaceWarp (which consumes frame timing) is enabled in this title's build. If
+  it is ever armed here, arm it with a lead measured from `holds`, not a fixed
+  period, and re-read `intra-frame pose spread` in the same launch.
+
+  What is frozen is the **latched sample**, not an extrapolation to
+  `kl_ovrp_predicted_display_time()`. Constancy is the property under test;
+  extrapolation is a second variable whose failure mode looks like the very
+  artifact. (The head's linear and angular velocity ARE populated and handed to
+  the guest at +0x1c / +0x34, derived in `klovrp_derive_motion` — so if the
+  guest runs its own predictor, it is being fed real velocities. Acceleration
+  stays zero.) Read it with:
+
+      [ovrp] one pose per guest frame ON (KL_OVRP_ONE_POSE=index) — ...
+      [ovrp] one-pose: served update2 N step N head N eyeview N live N | live-divergence worst X deg mean Y | eye-offset rot pushes N changes N worst Z deg (mode=..., over 300 frames)
+
+  `served` is per entry point, per 300 guest frames; `live` counts answers that
+  fell through because no pose was frozen yet (boot only — a steady nonzero
+  `live` means the boundary is not being reached and the rest of the line is
+  fiction). **`live-divergence` is the payoff number**: how far the frozen pose
+  had already drifted from the live published pose by the time each answer was
+  given — i.e. exactly what the pixels WOULD have embodied differently. Worst
+  around 3 deg with the shaking gone is the mechanism confirmed with a number.
+  Identical shaking with every query served frozen points the next round at the
+  guest's OWN extrapolator, and therefore at what we feed it: the velocities
+  above.
+
+  `=live` / `=off` / `=0` restores round 2's behaviour for a one-launch A/B
+  without a rebuild.
+
+  Round 7 added a second line under the same 300-frame report, and it measures
+  the frozen poses **against each other** rather than against anything else:
+
+      [ovrp] frozen series: mean step X deg, alternation index Y, sign flips N% (a of b moving pairs), worst reversal Z deg (over N steps)
+
+  `mean step` is the mean angle between consecutive frozen poses — at a steady
+  yaw rate ω on a 90 Hz panel it should read about ω × 11.1 ms. **`alternation
+  index` is the number to read**: mean(|dᵢ − dᵢ₋₁|) / mean(d), which is near 0
+  for a series stepping uniformly and 1 or more for an A-B-A-B pattern, the
+  signature of two interleaved time bases. `sign flips` is the percentage of
+  consecutive steps that REVERSED about the dominant axis while the head was
+  genuinely moving (both steps > 0.05 deg — at rest the series is float noise
+  and its sign flips at random, which would drown the reading). A head being
+  turned by hand cannot reverse forty times a second; a badly sampled series
+  can. A smooth series beside a picture that still shakes clears the sampling
+  and leaves the velocities below holding the bag.
+
+### Reading a panel-rate change (do this before believing any smoothness verdict)
+
+visionOS picks the app's frame rate and changes it mid-session. The rate is
+latched ONCE at boot (`[cp] display rate SETTLED at ... Hz`) because the guest
+reads its rate once and stores it, so a later change cannot be pushed through.
+The compositor says so when it happens:
+
+    [cp] THE PANEL IS NO LONGER RUNNING AT THE RATE WE LATCHED. We latched X Hz
+    at boot and told the guest Y Hz; the last six seconds present every Z ms ...
+
+Three consecutive liveness reports (six seconds) more than 10% off the latched
+period. **Grep it in every boot log before reading a jitter report** — three of
+pttr's four late launches had one:
+
+| launch | settled at | ran at | warn |
+|---|---|---|---|
+| #20 | 120.026 Hz (1000 ms) | 120 -> **90** | yes, 18:03:00 |
+| #21 | **50.008 Hz** (2400 ms, "no canonical rate within 0.5") | 20.00 -> **16.67 ms (59.99 Hz)** | yes, 19:11:52 |
+| #22 | 120.013 Hz (1000 ms) | 120.013 Hz throughout | none |
+
+This is system-initiated and not `KL_GUEST_FPS_DIV`: in #21 the settle window
+closed at 19:11:44.159, before the gate had logged a line (19:11:44.178) and
+before the first present (`alive: 1 iters`, 19:11:44.180) — and #20 demoted with
+the gate OFF. The gate cannot reduce the present rate at all; it withholds
+`kl_app_guest_publish`, while the drawable is queried, encoded and presented
+below it on every loop iteration. A long settle (2400 ms vs the usual 1000) and
+a rate that is not in the canonical set are the tell that the session started on
+an unsteady clock.
+
+pttr survives a demotion without a beat: the guest's rate is PINNED at 72 Hz
+(`KL_DISPLAY_HZ`) whatever the panel measures, and the latched `displayPeriod`
+feeds only the (off) cadence gate, the census, and the (off) predicted-display
+lead. There is no servo here to fall out of lock — that was Pistol Whip's
+harmonic re-lock problem, and it does not apply.
+
+- `KL_OVRP_ZERO_HEAD_VEL=1` — **the head node reports zero linear and angular
+  velocity** (`motion_valid` stays 1: "stationary", not "unknown", so the guest
+  does not go estimate one from the pose series and reintroduce the term being
+  removed). Default **off**, and no row turns it on: the durable fix is the
+  `klovrp_derive_motion` dt repair below, which makes the derived velocities
+  trustworthy. This knob is the proven fallback — Pistol Whip shipped a round
+  on it — for a title whose shake survives the repair.
+
+  Why: rounds 1-6 cleared the whole delivery chain — sampling, filing,
+  projection, warp, present order — in a configuration where the warp is a
+  near-no-op, and the shake was unchanged. That puts the oscillation in the
+  guest's own rendered content, and the last thing we hand it that could move
+  its view matrices is the head MOTION we synthesize. Its predictor integrates
+  those velocities, so noise in them is an orientation error proportional to
+  head angular speed and alternating in sign.
+
+  **Hands and controllers are untouched** — they publish through
+  `kl_ovrp_set_hand_motion` / `kl_ovrp_set_hand_pose` and never pass the head
+  seam, so gun feel, throws and swing detection keep their real velocities.
+  `=0` restores the derived head velocities for the A/B.
+
+  The instrument reports the real derived numbers in **either** arm (they are
+  captured before the zeroing), per 300 head publishes:
+
+      [ovrp] derived motion: ang vel mean X rad/s std Y, lin vel mean X m/s std Y (over N publishes, handed to guest: ZEROED|as derived)
+
+  The **std** is the reading. A head turning at a roughly steady rate should
+  give a mean comfortably above its own std; a std comparable to or larger than
+  the mean is velocity noise of the kind that would explain the artefact.
+- `KL_OVRP_DERIVE_VELOCITY=0` — stop differencing poses into velocities
+  altogether; every derived sample reports UNKNOWN (`motion_valid` 0) instead.
+  Affects the head and any pose-only hand publisher (the macOS viewer); a
+  frontend that measures velocity itself (KleptonControllers on the Sense
+  controllers) is authoritative and unaffected. Distinct from
+  `KL_OVRP_ZERO_HEAD_VEL` above, which asserts *zero* rather than *unknown* —
+  the difference matters, because "unknown" invites a guest to estimate one.
 - `KL_OVRP_EYE_CANT=0` — ignore the per-eye rotation the frontend pushes
   (`kl_ovrp_set_eye_rotation`) and restore the dropped-cant behaviour as the
   A/B. Identity by default, so host and headless runs are unchanged.
@@ -1020,6 +1769,19 @@ puts the camera on the ground with its hands underneath it.
   back full width, and the only instrument left is a person in the headset.
   Pairs with `KL_VIEW_EYE=1`. Read on the same path as the union below, so it
   overrides the compositor on device too.
+- `KL_OVRP_DROP_NO_EYE=0` — default **on** (promoted from itr 2026-10-09).
+  A Vulkan OVRPlugin frame that names NO eye layer (Unreal's loading screens;
+  ITR launch 2: 1720 such frames at ~100 fps) used to fall through the record
+  ladder to `serial % stages` and file its fresh head pose over an older
+  picture — a different one of the three every frame — so the loading strip
+  shook whenever the head moved. Such a frame is now DROPPED, the GL path's
+  "drew into no eye stage" rule: the last real eye frame stays on screen with
+  its own pose. Gated on all three of: the observation is blind (Vulkan), this
+  submit named no eye stage, and an earlier submit DID name one (the legacy
+  EndFrame never names stages and keeps the counter). One line on the first
+  drop (`[ovrp] frame N submitted NO eye layer — its pose is DROPPED …`), and
+  the exit report counts them (`…named NO eye layer and were dropped`).
+  `=0` files them on the counter again (the A/B). t_posebound covers it.
 - `KL_OVRP_UNIFY_FRUSTUM=1` — tell **both** eyes the union of the two cones.
   **Default 0 as of 2026-08-13**; it used to default to on for a multiview
   guest, which was the stopgap for BONELAB's warped right eye. That is now
@@ -1031,6 +1793,19 @@ puts the camera on the ground with its hands underneath it.
   (2026-08-13, user-confirmed), so 1 is now purely the A/B — and the answer for
   any guest ever found that collapses the cones without submitting per-eye
   rects, which would be unservable any other way.
+- `KL_OVRP_SUBMIT_FOV=0` — record the frustum we **offered** instead of the one
+  the guest **submits**. **Default on.** `ovrpLayerSubmit_EyeFov.Fov[2]` (at
+  +0x104, read out of libOculusXRPlugin.so's own DWARF) is the guest's own
+  statement of what it rendered with, and a plugin doing symmetric projection
+  puts the UNION there while leaving `ViewportRect` full width — so the rect
+  says nothing and only this field does. Measured on GORN 2 (OVRPlugin 1.106):
+  a 4032-wide desc comes back as a 5088-wide layer with both eyes rendered at
+  l=r=1.73205, and a composite placing that with the per-eye cones is the
+  "everything is doubled" report. Identical to the old behaviour for any guest
+  that renders what it was told, which is every host run so far. This is the
+  full-density answer to the problem `KL_OVRP_UNIFY_FRUSTUM=1` solves by lying
+  to the guest — prefer it; the knob above stays for a guest that collapses the
+  cones and submits neither a rect nor a Fov.
 - `KL_VRR` — **foveated guest rendering** (host: `tests/t_mtl_provider.m`;
   device: `KleptonCompositor.swift`). **On by default**; `KL_VRR=0` is the A/B.
   Builds an `MTLRasterizationRateMap` for the eye size and hands it to
@@ -1091,6 +1866,20 @@ puts the camera on the ground with its hands underneath it.
   - `KL_ANGLE_VRR_TRACE=1` alongside it shows the ANGLE half: which render
     passes found the map, and whether each eye resolve took the
     physical-passthrough path (`passthrough=1`) rather than warping twice.
+- `KL_VRR_FLOOR=<0.01..1>` — **the smallest per-zone rate the GUEST's map may
+  carry, default 0.50.** Applied to both axes, under both curve sources (the
+  display's captured curve and the synthetic `KL_VRR_ZONES`/`KL_VRR_EDGE`
+  fallback), before the DoubleWide per-eye tiling. It exists because **a
+  rasterization rate is a mip level**: a fragment shader under a rate map runs in
+  PHYSICAL space, so `dFdx`/`dFdy` — and every texture LOD derived from them —
+  measure physical pixels, and nothing renormalizes them. A zone at rate `r`
+  therefore samples `log2(1/r)` mip levels high. This display's own curve bottoms
+  out at 0.10-0.12, i.e. **+3.3 levels**, which is the Tetris Effect blue fill: a
+  fine particle texture collapsing to its own flat average in the periphery. The
+  floor bounds that at a stated number of levels — 0.50 is +1.00 level at 48.8%
+  of the fragments where the raw curve is +3.32 at 28.6%. `KL_VRR_FLOOR=0.01` is
+  the A/B (the display's raw curve, pre-r20 behaviour). The
+  `[cp] foveation LOD:` line states both biases and both fragment fractions.
 - `KL_VRR_EDGE=<0..1>` — the rate at the edge of the eye, default 0.35 (the
   fovea is always 1.0, falling off linearly). Lower is cheaper and blurrier in
   the periphery; 1.0 is a map that does nothing. Ignored on device when the
@@ -1116,7 +1905,38 @@ puts the camera on the ground with its hands underneath it.
   packaged Vulkan-only and says so itself when refused ("This device does not
   support Vulkan but the app was not packaged with ES 3.1 support", out of its
   own message box), so this restores that refusal exactly and is the A/B for
-  anything that suspects the API choice.
+  anything that suspects the API choice. Any value above 1 is reported as the
+  version word itself. Unset: 1.1.128 to a UE5 guest; to a UE4 guest 1.1.0
+  (upstream's answer) unless the row is one measured with 1.0.3
+  (`kl_driver_upstream_defaults`, `KL_UPSTREAM_DEFAULTS`).
+- `KL_SIG_X18_REPAIR=1` — wrap guest signal handlers so x18 is restored to the
+  veneer's target on return. Default: on for a Unity guest when upstream's
+  defaults apply to the row (`KL_UPSTREAM_DEFAULTS`), off otherwise; br/blr x18
+  dispatch through x16 already closes the branch-to-0 window structurally.
+- `KL_UE4_MULTIVIEW` — **TRI-STATE**, and unset is the right answer for every
+  known guest. UE4 sets `GSupportsMobileMultiView` / `FOpenGLES::
+  bSupportsMobileMultiView` during RHI init and
+  `GLSLToDeviceCompatibleGLSL` branches on it, prepending
+  `layout(num_views = 2) in;` to every cooked shader when it is true. ANGLE's
+  Metal backend implements no multiview, so on a **GL** guest that shader fails
+  to compile and UE4 turns the Fatal into a ForceQuit — hence the runtime
+  clears both flags. On a **Vulkan** guest none of that applies: no cooked GLSL
+  is rewritten and ANGLE is not in the picture, and clearing the flags only
+  forces UE4's two-sequential-view **DoubleWide** mobile stereo path, which is
+  what made Into the Radius's static world meshes vanish and reappear for
+  eleven launches (`docs/r25-multiview.md`).
+  - **unset (default)** — decide from `kl_vulkan_guest_active()`, i.e. from
+    what the guest actually brought up. GL guests get the clear (log line
+    *"mobile multiview was ON — cleared"*); Vulkan guests keep their own
+    answer (log line *"mobile multiview left alone — this guest brought up a
+    VULKAN device"*). Because the pump ticks before the Vulkan device exists,
+    an early tick can clear a flag the Vulkan RHI just set — so the runtime
+    **remembers what it cleared and puts it back** on the first tick Vulkan
+    proves active, before any shader compile reads it.
+  - **`=1`** — never clear, whatever the RHI. The A/B, and the way back if a
+    future ANGLE grows `GL_OVR_multiview2`.
+  - **`=0`** — always clear, the pre-r25 behaviour, and the way back if a
+    Vulkan guest is ever found that needs the clear.
 - `KL_UE4_WAIT=<seconds>` — the pump budget for a NativeActivity guest, default
   5. There is no frame count on this door: the guest owns its own game thread
   and its own frame loop, so seconds are the only unit. **RE4 needs 300** — its
@@ -1142,12 +1962,58 @@ puts the camera on the ground with its hands underneath it.
   so the two cannot disagree. `+set developer 1` is the useful one; note that
   this port's `Sys_Print` writes to a buffer and drops it, so console output
   does not reach the log however verbose it is asked to be.
+- `KL_OVRP_EYE_FORCE=<W>x<H>` — **host only (`build/m_boot`): stand in for the
+  frontend's display measurement.** On device `KleptonCompositor` calls
+  `kl_ovrp_set_eye_texture_size` with the size it measured off the drawable's
+  rate map (Vision Pro: 6888x5525) and `KL_OVRP_EYE_MAX` / `KL_OVRP_EYE_SCALE`
+  act on THAT; with no frontend the host keeps the compile-time Quest 2 default
+  **2290x2400** and both knobs are inert. Set this and the host runs the guest's
+  eye chain at the headset's geometry.
+
+  **It was UNREACHABLE for four of the five guest kinds until round 9 of the
+  Into the Radius port**, and the miss was expensive rather than academic. The
+  block sat BELOW the door dispatch in `m_boot`, and SteamLink, UE4, JKXR and
+  SDL all `return` from that dispatch — so on any of them the knob did nothing,
+  silently, and every host capture of a UE4 guest was taken at 2290x2400 while
+  the headset ran it at 4032x3234. ITR's device eye layer is **13568x3588
+  DoubleWide** and its host one was **5888x2664**: the two runs were never the
+  same picture, and the one premise a duplication investigation rested on — what
+  the guest actually draws into its eye texture on the DEVICE — could not be
+  checked from the host by construction. Reproduce a Vision Pro eye chain on a
+  laptop with:
+
+      KL_OVRP_EYE_FORCE=6888x5525 KL_OVRP_EYE_MAX=4032 KL_VK_OUT=<dir> \
+        KL_UE4_WAIT=300 ./build/m_boot itr
+
+  A run that does not set it is byte-identical to before, on every guest kind.
 - `KL_OVRP_EYE_SCALE=<x>` — scale the per-eye render target size the guest is
   told to use (`ovrp_GetEyeTextureSize`), default 1.0, accepted in 0.05..4.0.
   Applies to whatever the frontend measured off the display
   (`kl_ovrp_set_eye_texture_size`); with nothing pushed the size stays the
   Quest 2's 2290x2400 and this does nothing. The cheapest resolution knob
   there is — Unity then applies its **own** ~1.2x on top of the result.
+- `KL_OVRP_EYE_SCALE_MIN=<x>` — default **0** (off). A FLOOR under the
+  guest's own render scale (Unity's `XRSettings.eyeTextureResolutionScale`,
+  arriving as `ovrp_CalculateEyeLayerDesc3`'s `textureScale`), applied before
+  `KL_OVRP_EYE_MAX` (the ceiling) — so a 1.5 menu scale is still capped and a
+  floor can never exceed the cap. Made for Unity titles that set a PER-LEVEL
+  render scale (Paint the Town Red VR: 1.5 menu, 1.0 Disco, 0.87 Prison): each
+  change rebuilds the eye layer and Unity's eye-sized targets at a new size
+  while the old generation is still alive (PTTR's Prison load peaked at
+  7.84 GB, 355 MB free). With `1.0` every level gets the same desc, the eye
+  storage is reused, and lower-scale levels render at the cap (costs them GPU:
+  0.87 -> 1.0 is +32% pixels). Logged once per distinct guest scale:
+  `[ovrp] eye scale clamped: guest asked WxH (render scale s), gave WxH`.
+- `KL_OVRP_EYE_ALIGN=<n>` — default **1** (off). After the cap, round each
+  axis of the eye size DOWN to a multiple of n (both the advertisement and the
+  desc, `kl_ovrp_cap_eye_size`). For Unreal guests: UE4 quantizes its scene
+  buffers UP to a multiple of 4, so a 4032x3234 eye got a 4032x3236 scene and
+  every exact-extent eye-pass match in kl_vulkan.c's foveation missed with no
+  line at all (Resident Evil 4: `encoders marked 0`). With 4 the eye
+  is 4032x3232 and the scene equals it. A mismatch is now named once:
+  `[vk] [fove] near miss, NOT marked: … why: a runtime eye image (WxH) is
+  attached as the resolve or a later subpass's output at ANOTHER extent than
+  the colour (WxH)`. Baked into the re4 row.
 - `KL_OVRP_EYE_MAX=<px>` — cap on the longer axis of that size, default 3072,
   0 to disable. Vision Pro's logical per-eye resolution is far larger than a
   Quest's, and the guest allocates stages x eyes of RGBA16F at whatever it is
@@ -1156,6 +2022,108 @@ puts the camera on the ground with its hands underneath it.
   tangents pushed alongside would otherwise disagree with the picture's shape.
   Every change logs the requested size, the applied size and the resulting
   swapchain MiB.
+  **Batman: Arkham Shadow's measured rung is 4032** (2026-08-26, worn A/B, one
+  variable, same save): at 4032 the rat canal runs 50-60 fps with a 5039M peak
+  footprint and **0** panel warnings; at 5120 the same canal runs 36-41 fps with
+  a 6269M peak and **4** panel warnings. 6144 was rejected earlier on memory
+  (`[hb] foot=7067M avail=1124M` at a menu, before a level was resident). Both
+  higher rungs are rejected for **fill**, not sharpness — this is a Vulkan guest
+  with no guest-side foveation (`ovrp_GetTiledMultiResSupported=false` by
+  design), so every advertised texel is rendered at full rate.
+
+  **It caps the DESC as well as the advertisement, as of round 10 of the Paint
+  the Town Red VR port**, and until then it did not. Unity does not allocate
+  from what we advertise: it multiplies the advertised size by
+  `XRSettings.eyeTextureResolutionScale` and allocates from the product, which
+  arrives as `ovrp_CalculateEyeLayerDesc3`'s `textureScale`. PTTR ships 1.5, so
+  a capped 4032x3234 advertisement became a 7584x4851 eye layer — 2.25x the
+  pixels in our images *and* in every render target Unity sizes off them — and
+  the process went 620 MiB to 7170 MiB in two seconds and was jetsammed three
+  seconds into the first picture the port ever drew. SUPERHOT did the same
+  thing at 2x on 2026-08-12. A guest's render scale is supersampling above the
+  eye size ITS platform recommends (a third of this host's), so clamping it
+  back to the cap is not a resolution cut — the cap is the native size. Below
+  the cap the scale is still honoured in both directions; `m_boot`'s eye cap
+  guard asserts exactly that.
+- `KL_OVRP_EYE_FORCE=<W>x<H>` — host only (`m_boot`): stand in for the
+  frontend's display measurement, so `KL_OVRP_EYE_MAX` / `KL_OVRP_EYE_SCALE` /
+  `KL_OVRP_EYE_CAP_ALLOC` have something to act on. Set before the guest loads.
+  Pair it with `KL_OVRP_EYE_TAN=vision` to reproduce the headset's canted
+  regime on the host: `KL_OVRP_EYE_FORCE=4032x3234 KL_OVRP_EYE_TAN=vision
+  ./build/m_boot pinballfx` reproduces the device's eye-layer sizes and its
+  0.268 per-eye rect offset exactly.
+- `KL_OVRP_EYE_CAP_ALLOC=1` — make `KL_OVRP_EYE_MAX` bound the eye texture the
+  guest **allocates** rather than the size we recommend. Default 0, i.e. every
+  target keeps the historical behaviour. Two multipliers sit between the two
+  numbers and both are the guest's: its own pixel density (UE5.3 asks for a desc
+  at `textureScale` 1.000 and again at 1.300), and the **union widening** an
+  OculusXR guest applies on a canted display — it renders both eyes through
+  `max(L0,L1)/max(R0,R1)`, widens its eye texture by the ratio to keep the
+  angular density it was recommended, and submits per-eye sub-rects. On Vision
+  Pro that ratio is ~1.26, so a cap of 4032 produced a 6628x4208 layer. With
+  this on, the recommendation is scaled back aspect-preserving until
+  `w x scale x widening` lands under the cap. **The FOV is never touched** —
+  cropping the tangents to match a capped width tells the guest to render a
+  narrower cone than the display has, and the periphery goes missing. One log
+  line per distinct arrival, carrying the whole arithmetic.
+- `KL_OVRP_LAYER_REC_DISPLAY=1` — make `ovrp_GetLayerRecommendedResolution`
+  answer for an **eye** layer from the display and the cap (the same computation
+  every eye desc comes through, at scale 1.000) rather than from the layer's own
+  current texture size. Default 0. Non-eye layers always answer from themselves
+  — a quad's recommended resolution is its own size. This is a shape fix rather
+  than a measured one: "recommended" is a property of the panel, and answering
+  from the layer made this the one entry point on the eye path whose answer was
+  a function of its own previous answer.
+- `KL_OVRP_QUAD_SIZE_OFF=<hex>` — where `ovrpLayerSubmitQuad.Size` (the quad's
+  WORLD size in metres) sits inside the guest's `ovrpLayerSubmitUnion`, default
+  `0xb0`. That is the offset measured out of RE4's OVRPlugin; a **newer**
+  plugin's common header runs four bytes longer — it gained
+  `has_blend_factors`/`src`/`dst` — and the arm starts at `0xbc` instead, so
+  reading 0xb0 there yields two zeroed ints, i.e. a `0.0x0.0 m` quad the
+  compositor then declines with "no placement or no MTLTexture". Pinball FX
+  (UE5.3, Meta fork) is `0xbc`. One log line per quad layer states the size, the
+  offset, and the quad's aspect beside its texture's — the two agree on any
+  guest that means it, which is how a wrong offset is caught without a hex dump.
+- `KL_OVRP_FLOOR_OFFSET=1` — raise every node position handed to an OVRPlugin
+  guest by the standing eye height (`KL_OVRP_EYE_HEIGHT`, default 1.6) whenever
+  the guest has asked for a non-EyeLevel tracking origin **and** a real tracker
+  is publishing. Default 0.
+
+  The space this runtime documents everywhere is floor-relative, and with ARKit
+  running it is not: visionOS's `WorldTrackingProvider` puts its world origin at
+  the device's own pose when the session starts, so the head reports `y ≈ 0` and
+  the origin is at the EYE. Under `ovrpTrackingOrigin_EyeLevel` that is right by
+  construction. Under `FloorLevel`/`Stage` the guest expects the head ~1.6 m up
+  and gets ~0, so the camera sits in the ground — measured on Pinball FX VR,
+  which runs its splashes and loading screen under EyeLevel and switches to
+  FloorLevel for its lobby, and therefore showed the defect only after loading.
+
+  Applied at `ovrp_GetNodePoseState`'s single position write, **not** to the
+  stored pose: `KleptonCompositor` reprojects the recorded render pose against a
+  raw ARKit `originFromDevice`, so offsetting the stored value would put 1.6 m
+  of translation into every reprojection on every port. It also never
+  double-counts the default head's raise, which applies only while no tracker
+  has published.
+
+  Off by default because the other ports have been shipping under the un-offset
+  space; turning it on globally moves their floors and wants a per-port headset
+  round. One log line, once, when it engages.
+- `KL_OVRP_USER_EYE_HEIGHT=standing|origin` — which answer
+  `ovrp_GetUserEyeHeight` / `ovrp_GetUserEyeHeight2` give. Default `origin`:
+  `klovrp_eye_height()`, i.e. 0 under EyeLevel and `KL_OVRP_EYE_HEIGHT` under
+  FloorLevel/Stage (fnaf c24d73d3; FNAF HW2 confirmed with it). `standing`:
+  `KL_OVRP_EYE_HEIGHT` whatever the origin — the same number the offset above
+  adds, deliberately, so a guest that folds our answer back into a pose we have
+  already raised lands where it started (pinballfx 49aea58c/78fef7f7; Pinball
+  FX's lobby confirmed with it, baked in its row). Both ports reached the name
+  independently; the knob was written at the 2026-10-11 promotion so neither
+  confirmed answer moves. The ABI was read out of Pinball FX's own
+  `libOVRPlugin.so` (0x177d60 / 0x17ef20) and FNAF's (0x171c10): `ovrpResult` +
+  out-param, -1001 on NULL, and the un-suffixed form is a wrapper, not a second
+  measurement. `t_ovrpfloor` asserts the `standing` identity.
+- `KL_OVRP_SUBMIT_TAIL=1` — with `KL_OVRP_LAYERS=1`, dump `0xa0..0x130` of a
+  non-eye submit as floats and ints, which is how the offset above is found on a
+  new guest. Off by default; it prints once per census entry.
 - `KL_OVRP_VIEWPORT_SCALE=<x>` — force the **render viewport** to that fraction
   of the eye texture, default 1.0, accepted in 0..1 and multiplied by whatever
   the guest itself asked for. This is not a resolution knob, it is the **A/B for
@@ -1172,6 +2140,49 @@ puts the camera on the ground with its hands underneath it.
   guest submitted), `[view]`/`[cp] first render viewport read from the frame
   record` (what the compositor read), and `[view]`/`[cp] render viewport … —
   compositing that sub-rect` (what it did with it).
+- `KL_OVRP_VIEWPORT_CARRY=0` — stop carrying the last render viewport into a
+  frame whose submit named **no eye layer**, i.e. go back to leaving that
+  record's rect at zero. Default is on, and this is the A/B for **ITR's
+  duplication**. An Unreal guest does not submit its eye layer every frame: on a
+  loading screen, a splash, or while it compiles shaders it submits only its
+  quad layers, and the record for such a frame used to be filed with the rect
+  its `BeginFrame` memset left — all zeroes, which every compositor is entitled
+  to read as *the whole texture*. For a Stereo or Array guest that is right by
+  accident (one texture per eye). For a **DoubleWide** guest — one texture,
+  both views side by side — it is the picture composited TWICE, in both eyes,
+  because the crop is the only thing separating the halves. Carrying the rect
+  forward pairs the stale eye texture the compositor is sampling with the rect
+  it was drawn with, which is the only rect that describes it. Two instruments
+  say whether it is happening: the census line `N frame(s) submitted NO eye
+  layer` on the producing side, and `m_boot`'s **composite audit** (below) on
+  the consuming side.
+
+### The composite audit (`kl_composite_audit_eyes`, host only)
+
+The step between the guest's eye texture and a person's eyes — the crop, the
+per-eye rects, the frame record they are read out of — is the one thing **no
+host run of any port had ever executed**. `m_boot` reads the eye texture back
+directly and the PNG is correct, so every host instrument reported a flawless
+run while ITR's headset showed the whole picture several times over.
+
+So `m_boot` now runs a compositor's decisions as arithmetic, from a thread of
+its own at 50 Hz, and prints them under `=== the composite audit: what a
+compositor would SAMPLE ===`: the uv rect each eye ends up reading, whether the
+two eyes share one MTLTexture (which is what DoubleWide means), how much of eye
+0's rect eye 1 also covers, and a count of faults **by class** —
+
+- `no completed frame record` — before the guest's first `ovrp_EndFrame`;
+  both eyes fall back to the symmetric 90° default and to no crop.
+- `the crop was REFUSED (viewport_of skew)` — the rect describes an older
+  generation of the eye texture, so it is not applied (`kl_ovrp.h`).
+- `DOUBLED: both eyes read one shared texture whole` — the failure above.
+- `an eye sampled outside its own texture`.
+
+It reproduces `sanitise` in `KleptonCompositor.unwarpGrid` deliberately line for
+line: a check that restates the rule in its own words is a check that passes
+while the display is wrong. It latches the FIRST fault as well as counting them,
+so a transient — the class that flickers in a headset — cannot hide behind a
+clean end-of-run reading.
 
 ### Haptics (`runtime/xr/kl_ovrp.c` — the seam that runs OUT of the guest)
 
@@ -1223,6 +2234,37 @@ that reports what came due since the frontend last asked. Platform-independent
   compositor's priming pass pushes the rate it actually presented at, and under
   `KL_VIEW` the viewer pushes the rate of the display its window opens on.
   Without either it is the Quest 2's 72, the device we describe everywhere else.
+- `KL_DISPLAY_HZ=<hz>` — **PIN** the display frequency the guest is told the
+  headset runs at, 30..240. It defaults to the Quest 2's 72, which is the
+  device we describe everywhere else, and on the host there is no panel to
+  measure; on visionOS the compositor's priming pass pushes the real number.
+  With this set the push is *recorded as the panel rate and not passed on* —
+  the guest keeps the pinned number and the compositor keeps presenting at the
+  panel's, reprojecting across the difference, exactly as a 72 Hz title on a
+  120 Hz headset works on real hardware. Two log lines say which happened:
+  `[ovrp] display frequency PINNED to N Hz by KL_DISPLAY_HZ` at the first read,
+  and `[ovrp] the panel measures M Hz; the guest keeps its pinned N Hz` once,
+  at the compositor's push.
+
+  **This is a pacing fix, not a cosmetic one.** A guest told a rate it cannot
+  hit sizes its frame budget from that number and then misses every deadline —
+  Unity stores it in its VR timing config, and the fixed timestep and audio
+  scheduling come off it too. The symptom is jitter under head rotation with
+  every host-side compositor statistic perfect (`1.00 periods`, `0 past
+  deadline`) and a high `repeats` count in the present-order line, because the
+  compositor is not what is late. Both Pistol Whip (session 16) and Paint the
+  Town Red (round 18) landed here; in PTTR's case the guest itself named the
+  rate it wanted, calling `ovrp_SetSystemDisplayFrequency(72.0)` and being
+  refused. Read the refusal as a request.
+
+  **It does NOT pace an Unreal OVRPlugin title.** Pinball FX (UE5) ran
+  `KL_DISPLAY_HZ` and still jittered on head turns: an Unreal guest's game
+  thread is released from `ovrp_WaitToBeginFrame` by `kl_app_guest_publish()`,
+  which the compositor calls on EVERY panel slot, so it runs at the panel's
+  cadence whatever rate it was told. The pacing knob for those titles is
+  `KL_GUEST_FPS_DIV` (below; Pinball FX's row bakes `=2`, an even 60 at
+  120 Hz). `KL_DISPLAY_HZ` still decides what such a guest reads back from
+  `ovrp_GetSystemDisplayFrequency2` and friends.
   It matters beyond pacing for Steam Link: the VR client publishes this list to
   the Steam host as `VTE_AVAILABLE_FRAMETIMES_US`, the host asks for a rate,
   and the negotiation is visible in the guest's own log.
@@ -1384,6 +2426,66 @@ that reports what came due since the frontend last asked. Platform-independent
   to the streaming host against a clock nothing drove. Paced, the guest's frame
   count tracks the composite (JKXR: 105 fps paced against 100 shown, 125 fps
   unpaced against the same 100).
+- `KL_XR_HEADLESS_PACE=1` — `m_boot` with NO viewer: hold `xrWaitFrame` of a
+  native-door guest (UE4/JKXR kinds, and any door routed through
+  `native_door_run`) to the display frequency (90 Hz unless `KL_DISPLAY_HZ`
+  pins it), publish a head at rest at `KL_OVRP_EYE_HEIGHT` each tick, and
+  default `KL_OVRP_IPD` to 0.063 (`mains/m_boot.c`, `headless_pace_wait`).
+  Default off. Unpaced, the Alyx jailbreak host's XR/input loop ran ~400 k
+  frames/s and starved the render thread; hla's door is the one that needs it.
+  A late frame waits for the next tick on the same grid (2026-10-04; it used
+  to re-base to now + a whole period, ~22 ms frames became ~34 ms).
+- `KL_HZ_SETTLE=0|1` — the **boot rate settle gate**, default **on**
+  (`visionos/Sources/KleptonCompositor.swift`, `primeDisplay`). The Vision Pro
+  brings the layer up at 120 Hz and drops to 90 once the immersive session
+  engages; the old fixed eight-frame priming measurement (~66 ms) landed inside
+  that window, so the rate the guest was told was decided by a race. With the
+  gate on, priming keeps presenting black until the presentation intervals have
+  agreed on one period to within 6% for **500 ms** (`KL_HZ_SETTLE_MS`), then
+  latches; if that never happens within **3000 ms**
+  (`KL_HZ_SETTLE_TIMEOUT_MS`) it latches the median of everything seen and says
+  so loudly. A gap that is a near-exact 2x/3x of the run's period is a held
+  frame, not a rate change, and extends the run rather than breaking it.
+  `KL_HZ_SETTLE=0` restores the eight-frame behaviour exactly, so the A/B costs
+  one launch and no rebuild. Holding here holds *every* consumer with no extra
+  plumbing: `primeDisplay` runs before `kl_app_guest_start`, so the guest's
+  single early Hz read, the frame clock's tick and our own cadence ratio all
+  see the latched value.
+  *Read it with:*
+  `  [cp] display rate SETTLED at 90.00 Hz after 511 ms of steady cadence (46 intervals in the settled run); 7 pre-settle interval(s) discarded, and they suggested 120.00 Hz`
+  followed by the unchanged `[cp] display .. Hz measured over N frames` and
+  `[cp] guest will be told .. Hz`, which remains the truth of what the guest
+  got. A panel rate that moves *after* the latch is caught separately by
+  `[cp] THE PANEL IS NO LONGER RUNNING AT THE RATE WE LATCHED` — six seconds of
+  cadence more than 10% off the latched period.
+- `KL_JNI_UNIFORM_DT=0|1` — the **uniform guest frame clock**. Default **off**,
+  and nothing on this branch turns it on: it is only ever right for a guest
+  PINNED to a rate the panel does not run at, and no row here pins one. A port
+  that pins its guest arms it explicitly (`KL_JNI_UNIFORM_DT=1`, or a row
+  default where the branch carries row knobs). A guest told the panel's own
+  rate already has a uniform dt and must not be touched by this at all.
+  With it on, `kl_jni_tick_choreographer()` stamps the guest's
+  `doFrame(frameTimeNanos)` from a series that advances **exactly
+  `1/display_hz` per guest frame** instead of from a live `CLOCK_MONOTONIC`
+  read, and `kl_ovrp_predicted_display_time()` rides the same instant (promoted
+  at the frame boundary by `kl_ovrp_frame_latch`) instead of the compositor's
+  drawable presentation time. The series resyncs to the real clock only past
+  **four periods** out — a pause, a scene load, a stall — never on jitter.
+  *Why:* our 72 Hz wake-ups land on the panel's 8.33 ms slots, so a pinned
+  72 Hz guest integrates dt = 16.67 / 16.67 / 8.33 ms forever. Unity bakes that
+  into its view matrices, where reprojection cannot reach it, and the picture
+  alternates between two positions ~0.73 deg apart under a brisk head turn. On
+  a real Quest the panel runs at the title's own rate, so uniform is the correct
+  emulation rather than a smoothing hack. See `runtime/xr/kl_ovrp.h` and
+  `ett/FRESH-EYES-JITTER.md` §5 (mechanism M1).
+  *Read it with:*
+  `  [jni] doFrame clock: uniform 13.889 ms x N ticks, drift X ms, N resyncs`
+  and, in the same window,
+  `  [cp] guest publish phase over N publishes: gaps 0x .. 1x .. 2x .. 3+x ..`
+  (panel slots between guest publishes, `runtime/kl_rate.c`). **The walk still
+  reading 3:2 while the flicker is gone is the confirmation** — it is the one
+  reading no pacing hypothesis can produce. A walk that has gone to `2x 100%`
+  means the guest's rate moved and the experiment did not run.
 - `KL_XR_CAPTURE_LAYER=N` — which projection layer `KL_GLFB_OUT` reads (default
   0, `runtime/xr/kl_openxr.c`). Steam Link's VR client submits **four** projection
   layers a frame — two 1536x1536 pairs for its panels and two 2290x2400 pairs
@@ -1446,6 +2548,14 @@ that reports what came due since the frontend last asked. Platform-independent
   Left at 1 (the default), the extension is still withheld on a checkout with no
   MoltenVK vendored — the gate is `kl_vulkan_xr_supported()`, so a build that
   cannot back the promise never makes it.
+- `KL_XR_VULKAN2=1` — also advertise `XR_KHR_vulkan_enable2`
+  (`runtime/xr/kl_openxr.c`; same MoltenVK gate as `KL_XR_VULKAN`). Default: on
+  where upstream's defaults apply (`KL_UPSTREAM_DEFAULTS`), as upstream offers
+  it to every Vulkan guest; off on the measured rows, where a guest offered both
+  extensions would take enable2 (Unity's OpenXR plugin does) and move onto the
+  runtime-side `vkCreateInstance`/`vkCreateDevice` path it was not confirmed on. The Alyx
+  jailbreak host requires it ("Required Vulkan binding unavailable:
+  XR_KHR_vulkan_enable2"); a target that needs it sets it in its env string.
 - `KL_XR_EXTRA_EXTENSIONS="<name> [<name> ...]"` — append names to the
   extension list `xrEnumerateInstanceExtensionProperties` advertises
   (`runtime/xr/kl_openxr.c`). **Scouting only, and a lie by construction**: an
@@ -1571,15 +2681,33 @@ The composite/timewarp pass — one file, compiled by both compositors
   inside one session is the difference between settling it and arguing about
   it. `make reproject` gates the shader half (128 → 55).
 
+- `KL_PROJ_LAYER_GRID=<1..KL_REPROJECT_GRID_MAX>` — the per-layer composite's
+  grid density (KleptonCompositor `identityGrid`, kl_view_mtl). **Default 64
+  for every guest** (promoted from hla 2026-10-04; the tester confirmed the fix on
+  the headset): at 1x1 every vertex is on the outer ring the guard band pushes
+  out, so the whole picture was magnified by 1 + 2*guard and zoomed with head
+  speed. `1` restores the pre-fix grid for a port's A/B. Logged once as `[cp]
+  per-layer composite grid NxN`.
+
 ## Viewer (`runtime/gfx/kl_view.c`, `mains/m_boot.c`)
 
 - `KL_POKE_CAP=<n>` — at frame-pump start, overwrite libunity's texture-unit
   cap (the value its `SetTexture` path checks before logging "Invalid texture
-  unit!") with n. The raise is 64, matching the 32-sampler ANGLE rebuild:
-  Unity defaults the cap to 32 without ever querying GL for it, while its
-  HLSLCC-baked sampler bindings reach unit 35 on the post passes, so binds past
-  32 are refused and those samplers read stale unit-0 textures.
-  `KL_POKE_CAP_OFF=1` leaves the field alone.
+  unit!"; read via the singleton at libunity+0x122e340, field +0xe8) with n.
+  **Default is the driver's own `GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS` (96 from
+  the vendored ANGLE), clamped to the version row's measured maximum** — 64 for
+  Unity 2019.4 (Beat Saber 1.28), 96 for 2022.3.33f1 (Beat Saber 1.40). It
+  follows the driver rather than carrying its own copy — that copy is what
+  drifted and produced the 1.40 song-load fault — and it is CLAMPED because the
+  field bounds a fixed array inside libunity that Unity never sized from GL, so
+  "the driver allows it" does not mean the array does.
+
+  **Both Beat Saber rows are measured and NOT poked** (`use` 0 in the table):
+  Unity's own 32-unit check is load-bearing as a guard, and raising it trades
+  stale unit-0 textures for a later branch through a poisoned dispatch slot.
+  `KL_POKE_CAP_OFF=1` leaves the field alone; an explicit `KL_POKE_CAP=<n>` is
+  NOT clamped and forces the store on an unused or unlisted row, since raising
+  it deliberately is how the next row's maximum gets measured.
 
   **The singleton address and field offset are per-Unity-build and apply to no
   other**, so the store is GATED on the version stamp read out of the mapped
@@ -1722,6 +2850,48 @@ reads no knobs).
   for a head-mounted listener, and visionOS otherwise pans it a second time
   into a sound stage anchored to the app's scene — which is the sound following
   the window. Turn this on only to A/B that.
+- `KL_AUDIO_REPORT_SECS=<n>` — print `kl_audio_report` every n seconds during
+  the run (default 15; `0` disables). r12 closed this observability hole for
+  graphics and r13 closed it for audio, for the same reason: the exit report has
+  never run on hardware, because `KL_EXIT_ON_BACKGROUND=0` is baked for these
+  targets and a force quit is SIGKILL. Grep `[au] --- live`. The line that
+  matters is the second one — **whether the guest's PCM was ever anything but
+  zero**. On Tetris Effect it is `1627 of 1627 buffers all-zero`, which says the
+  restart storm above it shares a log with the real bug rather than being it.
+  The watchdog's own line and `restart ok` are now rate-limited to one every
+  five seconds (with a count of what went unsaid), because on that title they
+  printed 4,746 times in one worn session and buried everything else; and the
+  watchdog now names WHICH condition fired — "the render callback has stopped"
+  (the OS took the stream) against "the unit is not running" (it was stopped
+  underneath us, with the callback still recent). Tetris Effect is the second,
+  on host and on device.
+- `KL_AUDIO_SOURCE=<name>` / `KL_AUDIO_MIX_SOURCES=1` / `KL_AUDIO_STEAL_MS=<n>`
+  — **which guest audio backend owns the one output.** A title can bring up two
+  and run both: Tetris Effect gives UE4's own Android mixer an OpenSL ES
+  buffer-queue player at 44100 Hz *and* Wwise an AAudio stream at 48000 Hz, and
+  on hardware they were live together for a whole worn session. Everything under
+  `kl_audio_write` is single-producer by construction — one ring with a
+  non-atomic write cursor, one resampler position, one `realloc`'d scratch
+  buffer — so two of them meant a racing cursor, a scratch buffer reallocated
+  under a thread reading it, each backend resampled at whichever ratio the
+  other's `open()` last installed, and (because a ring draining at 48 kHz cannot
+  accept two 48 kHz streams) each producer blocked half the time while the
+  other's buffers were interleaved into the same output. It is audible as
+  constant stutter and that is what it sounded like.
+  So the sink picks ONE owner: the first source to produce a **non-silent**
+  buffer. Silence never claims — the silent backend is also the one that spins
+  up first here, because everything audible goes through Wwise — and the claim
+  is revocable after `KL_AUDIO_STEAL_MS` (default 2000) of owner silence, so a
+  wrong guess costs two seconds instead of the run. Non-owners are paced for
+  their own buffer's duration and dropped, which keeps their mixer's clock
+  honest and stops it wedging. `KL_AUDIO_SOURCE=opensl` or `=aaudio` forces the
+  choice outright. `KL_AUDIO_MIX_SOURCES=1` restores the unarbitrated
+  free-for-all for an A/B — that is the configuration that stuttered.
+  The `[au]` report breaks its counts down per backend, so "a third of the
+  buffers were silent" can never again be one number hiding two producers; and a
+  DROPPED source that is producing audible audio says so once, loudly, because
+  that is the one case this design gets wrong and it would mean the sink needs a
+  real mixer rather than an owner.
 - `KL_AUDIO_WATCHDOG=0` — stop the independent watchdog thread from running.
   **On by default, and it is the thing that keeps audio alive on visionOS.**
   This OS silently stops calling CoreAudio's render callback across a scene
@@ -1798,6 +2968,11 @@ reads no knobs).
   without ever checking saved state. It checks; the files simply do not exist.
 - `KL_TRACE_IMAGES=1` — log each loaded image's base and span, the stub pool
   mapping, and each emitted stub. Read by `kl_image.c`.
+- `KL_TRACE_MMAP=1` — log every guest `mmap`/`mprotect` (`[mm]` lines): the
+  request, the result or errno, and the caller as image+offset. Read by
+  `kl_libc.c`. The instrument for a guest that runs its own ELF loader (the
+  Alyx jailbreak host): which call left a page without the permission it
+  later needed.
 
 ## Steam Link (`runtime/guest/kl_slink.c`, `build_run_host.sh`)
 
@@ -1953,6 +3128,39 @@ front door is a knob, not a build. `build_run_host.sh`'s flags map onto these:
   more motion in the encoded frame at a fixed bitrate. Measured, so the knob is
   known to bite: `VTE_PROPS_STATIC_{L,R} was updated` appears **4 times** with
   it on and **0** with it off, same run otherwise.
+- `KL_XR_BOOT_GATE=0` / `=1`, `KL_XR_BOOT_GATE_MS=<n>` — the boot gate: the
+  FIRST `xrWaitFrame` of a session is held until a frontend has published a
+  head pose AND both hands, or the deadline (default **4000 ms**) expires.
+  Default **auto**: armed only where a display frontend is publishing (the
+  visionOS compositor sets the frame pacer; the host does not, so the host is
+  never held). `=1` arms it anywhere, `=0` disables it.
+
+  It closes the bring-up race behind an intermittent HL2VR launch: the guest
+  samples head and hands ONCE at bring-up and decides what kind of session it is
+  in. visionOS connects the Sense controllers within ~10 ms but only rebuilds
+  its spatial providers around them at **+2.2 s** (`[cp] spatial controllers:
+  []` then the real list), while hl2vr reaches `xrCreateSession` at about +6 s —
+  four seconds of margin that nothing enforced. Lose it and the head reads as
+  the identity orientation at eye height (a plausible pose, not a refusal) and
+  both hands read absent, so the guest banks a tilted origin and falls back to
+  its flat-screen aim: the floor runs downhill and the crosshair is pushed
+  around by the thumbstick. A relaunch cures it because a relaunch re-rolls the
+  race.
+
+  One line either way, at the first frame:
+  `[xr] boot gate: head pose +N ms, left hand +N ms, right hand +N ms, profile
+  +N ms; first frame held N ms of M ms` — offsets from `xrCreateSession`,
+  `NEVER` for a seam that did not arrive, and ` — TIMED OUT, the guest starts VR
+  without them (tilted floor / thumbstick crosshair)` when one did not. That
+  line is the proof on the next bad launch.
+- `KL_XR_HONEST_HEAD=0` — go back to reporting the head as
+  `ORIENTATION_VALID | POSITION_VALID | *_TRACKED` unconditionally. Default on:
+  before a frontend has published, `xrLocateSpace(VIEW)` and `xrLocateViews`
+  leave the valid bits OUT, which is OpenXR's only way to say "this is not a
+  measurement". The placeholder pose is still filled in, so a guest that ignores
+  the flags sees exactly what it saw before. Only applies where a frontend is
+  expected to publish at all (same frame-pacer test as the boot gate), so the
+  host's mono path — which never publishes a head pose — is unaffected.
 - `KL_CTRL_TRACE=1` — the controller-alignment trace, **off by default**. One
   line per (seam, hand): `[ctrl] published hand N: euler XYZ …`
   from kl_ovrp when the frontend publishes a pose, and `[ctrl] openxr grip hand
@@ -2155,6 +3363,104 @@ vendored the whole path refuses by name and none of these do anything.
   a frame and drew nothing — so this is the A/B for that whole failure. Always
   false for a GLES guest whatever this says: ANGLE-on-Metal has no multiview,
   and telling one yes is an eye texture it renders half of.
+- `KL_OVRP_EYE_LAYOUT=<n>` — force the `ovrpLayout` the eye layer is DESCRIBED
+  as, whatever the guest asked for (kl_ovrp.c, `klovrp_eye_layout`). Unset is
+  the default and means "honour the request unless this runtime cannot serve
+  it": an `ovrpLayout_Array` (3) request from a GLES guest is answered as
+  `ovrpLayout_Stereo` (0), because the GL gateway has no multiview and two 2D
+  textures bound as one two-slice array render to the wrong storage with no
+  error anywhere. The Vulkan path serves Array for real and is untouched.
+  Tetris Effect (UE4.26) asks for Array unconditionally — it is the Oculus
+  mobile plugin's Android default, not a capability it read back — and refusing
+  it leaves `EyeLayer_RenderThread`'s swap chain null, which faults inside
+  libUE4's RHI a long way from anything of ours. `3` restores the guest's own
+  request exactly, which is the A/B.
+- `KL_UE4_FORCE_QUIT=1` — obey `AndroidThunkJava_ForceQuit()`
+  (`runtime/jni/kl_jni_ue4.c`). That method's whole body in a UE4 GameActivity
+  is `System.exit(0)`, and the DEFAULT is to log it and keep running: exiting
+  mid-boot takes the host process down and loses the boot log's tail and every
+  end-of-run report — the evidence that would say why the guest wanted out.
+  Every request is logged and counted, never once-only.
+- `KL_UE4_QUIT_TRACE=1` — print a frame-pointer backtrace (as `<image>+<off>`)
+  for the first few `AndroidThunkJava_ForceQuit()` calls. UE4's arm64 build
+  keeps frame pointers, so the x29 chain is reliable; symbolise the offsets
+  offline against the APK's own libUE4. In libUE4 the thunk is reached from
+  exactly two places — `FAndroidMisc::RequestExit(true)` and
+  `FAndroidErrorOutputDevice::Serialize` (a Fatal UE_LOG) — and which one it is
+  decides everything. This is how Tetris Effect's 72 quits per run were traced
+  to `FOpenGLProgramBinaryCache::AddUniqueGLProgramToBinaryCache` complaining
+  that the program binary came back empty, rather than to any entitlement gate.
+- `KL_PLAT_USER=<ovrID>` — answer `ovr_GetLoggedInUserID` with this id instead
+  of 0 (`runtime/xr/kl_ovrplat.c`). **Off by default and an invented answer**:
+  there is no Oculus account here and 0 is the truth. It exists because UE4's
+  OnlineSubsystemOculus refuses to Init without a logged-in user, and a
+  subsystem that did not Init never Ticks — so it never calls `ovr_PopMessage`
+  and every completion this runtime queues sits in the queue forever. Measured
+  on Tetris Effect: 0 gives 9 platform calls and no pump; a non-zero id gives 15
+  and `ovr_PopMessage` x8697 with the entitlement completion actually delivered.
+- `KL_PLAT_INIT=1` — the synthetic Oculus platform reports itself **UP**
+  (`runtime/xr/kl_ovrplat.c`): the synchronous `ovr_PlatformInitialize*` calls
+  return Success and set the initialized flag, `ovr_GetLoggedInUserID` answers a
+  DECLARED local user (0x4B4C450000000001, "Player"), and
+  `ovr_User_GetLoggedInUser` / `ovr_User_GetAccessToken` deliver typed
+  completions through the pump that `ovr_Message_GetUser` / `ovr_User_GetID` /
+  `ovr_User_GetOculusID` read. Everything that DELIVERS content still refuses.
+  Baked per-target in the row's `env` — deadpool's (`KL_PLAT_INIT=1`), whose
+  UE4.27 boot ForceQuits on "platform unusable". Off everywhere else; read once.
+  (Was a `plat_init` table column on the deadpool branch before the 2026-10-09
+  crossing; wins over `KL_PLAT_USER` when both are set.)
+- `KL_OVRP_QUAD=0` — drop the guest's non-eye OVRPlugin layers at the source
+  instead of compositing them (default on). The escape hatch for deadpool's
+  UE4 loading-screen quad if the composite misbehaves. Its Quad arm's world
+  size is probed at union offset 0xb0 (older plugin, RE4) then 0xbc (newer,
+  deadpool); the winner is named once per run (`[ovrp] the Quad arm's Size is
+  at +0x...`).
+- `KL_OVRP_QUAD_FALLBACK_M=<m>` (default 1.20, `0` disables) /
+  `KL_OVRP_QUAD_FALLBACK_Z=<m>` (default 1.50) — a lone non-eye Quad whose size
+  is at NEITHER offset is composited head-locked, this long-edge size and this
+  far ahead, rather than dropped. Read once.
+- `KL_VK_PIPELINE_CACHE=<path>` — where MoltenVK's compiled pipelines are kept
+  between launches. `kl_app.c` points it at the app container beside
+  `klepton-boot.log`; unset, nothing is persisted. MoltenVK compiles MSL
+  **synchronously inside `vkCreateGraphicsPipelines`**, and Unity builds a
+  pipeline the first time a material is actually drawn — so the first time a
+  pointer lands on a menu item, its hover material compiles on the frame
+  thread. Unity creates a `VkPipelineCache` and never persists it, because on
+  Android the driver keeps its own; there is none here, so without this every
+  launch recompiles what the last one compiled. The blob carries a
+  device/driver UUID the implementation is required to check, so a MoltenVK
+  update starts from empty rather than loading something wrong. The
+  `[vk] pipelines:` report line says how many were created, how long they took
+  and how many crossed one 120 Hz frame.
+- `KL_VK_PIPELINE_CACHE_SECS=<s>` — **default 30** (kl_vulkan.c). The
+  pipeline cache is rewritten whole (it is one blob), at most this often and
+  only after 16+ new pipelines; the tail is flushed when the scene goes to the
+  background (`[vk] pipeline cache: flushed N ...`). 0 = every memory report,
+  the old behaviour — which on RE4 (15 new pipelines a second in gameplay)
+  wrote 1078 MB in 159 s and drew a `diskwrites_resource` report.
+- `KL_VK_LAZY_TRANSIENT=1` — **default 0** (kl_vulkan.c). Mask
+  `vkGetImageMemoryRequirements`' `memoryTypeBits` down to the
+  `LAZILY_ALLOCATED` (Metal `MTLStorageModeMemoryless`) types for images the
+  guest created with `VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT`. A tile GPU
+  never has to spill a depth buffer written and consumed inside one render
+  pass, and Unity asks for exactly that shape — but it picks the memory type
+  itself out of `memoryTypeBits`, and has picked a `DEVICE_LOCAL` one in every
+  launch so far. Legal (Vulkan requires a transient image's requirements to
+  offer a lazily-allocated type where one exists, and forbids such an image
+  from being a transfer source or destination), but OFF until a log says it is
+  worth taking: the `[vk] guest images:` line reports how many transient bytes
+  are live and whether the device has a memoryless type at all.
+- `KL_VK_RETIRE_FRAMES=<n>` — **default 120** (kl_vulkan.c). How many whole
+  guest frames a superseded eye / SpaceWarp / layer image waits in the
+  graveyard before its storage is released. A guest that re-sets-up its eye
+  layer at a new size (PTTR does, once, when Unity applies its render scale)
+  leaves a whole generation behind, and it used to stay resident for the life
+  of the process — 473 MiB on PTTR. It is not freed at the point of
+  replacement because the guest may still hold a Unity render texture wrapping
+  it and a compositor may be sampling it on another thread; it is freed from
+  `kl_vulkan_frame_done`, which is a queue-idle point, once this many of them
+  have passed. Lower it to make the release visible sooner; 1 is legal and is
+  the setting to reach for only when proving the sweep runs at all.
 - `KL_VK_FRAME_SYNC` — **default 1** (kl_vulkan.c). Wait for the guest's VkQueue
   to go idle at `ovrp_EndFrame4` before publishing the frame serial a compositor
   reads. That is a real CPU stall on the guest's frame thread, and it is there
@@ -2163,6 +3469,242 @@ vendored the whole path refuses by name and none of these do anything.
   VkQueue here, so nothing of ours is in its submissions. `0` keeps the serial
   and drops the wait — the A/B for "is the compositor showing a torn frame?",
   and the shape a timeline-semaphore version would have.
+- `KL_OVRP_FRAME_SYNC_FIRST` — **default 1** (kl_ovrp.c). *When* that drain
+  happens relative to the frame record being filed. The record is what makes a
+  stage eligible for a compositor to select and sample, so on the Vulkan path —
+  where the compositor encodes no GPU wait at all, because its wait is on the GL
+  fence and `kl_glfb_gpu_fence_value` stays 0 for a guest that never brings ANGLE
+  up — the drain is the *only* thing ordering the sampling against the guest's
+  rendering. Until round 11 of the Into the Radius port it ran one statement
+  after the call that filed the record instead of one statement before it, and
+  in between the stage was both eligible and still being written into.
+  **That window is 5.31 ms mean / 117 ms worst and over 1 ms on 26,186 of
+  26,237 frames** (`[vk] frame seam`, below). A compositor iterating every
+  8.3 ms lands inside a 5.3 ms window about one time in three and samples a
+  PARTIALLY DRAWN frame — objects whose draws had been issued present, the ones
+  later in the guest's order missing, a different cut every time. That is
+  ITR launch #3's *"lots of objects flicker in and out of visibility. floors,
+  some walls, some flowers, fences, some wood planks"*. `0` restores the old
+  order. **Measure the cost by INTERLEAVING**: consecutive long runs said the
+  new order cost 8.7% and that was this host's own drift, not the change —
+  interleaved 100 s runs off/on/off/on gave 14,912 / 20,934 / 9,601 / 19,547
+  frames.
+- **`KL_VK_DRAW_CENSUS=1`** — **default 1**, log-only (kl_vulkan.c, round 15).
+  Count every draw the guest records, by kind, and bucket them **per frame** as
+  a distribution rather than a total.
+
+  **It exists because the number that replaced it was wrong.** The index-buffer
+  guard had counted `vkCmdDrawIndexed` since round 11, and round 14 divided its
+  printed total by the frame counter and got **~14 indexed draws per frame** —
+  which is not a UE4 scene, and was quietly treated as evidence the layer was
+  blind. It was not blind; the *reading* was wrong. `[vk] indexed draws` prints
+  only at powers of two of the DROP count, so the total beside it is whatever it
+  happened to be at an unrelated trigger, not an end-of-run figure. The real
+  answer is **228-249 draws per frame, max 1345-2008**, over millions of calls.
+  **Read a counter's PRINT TRIGGER before dividing by anything.**
+
+  **THE BLINDNESS ARGUMENT, which is the point of the instrument.** A census
+  cannot prove it saw everything by counting what it saw. So the honesty comes
+  from a place it cannot influence: `klvk_GetDeviceProcAddr` sees every name the
+  guest resolves, and records any name beginning `vkCmdDraw` that we do **not**
+  hook, by name and with a count. On Into the Radius that table is **empty** —
+  the guest resolves no draw entry point this layer misses — and the kinds it
+  does use are `DrawIndexed` (essentially all of them) and 14 lone `Draw` calls.
+  `vkCmdDrawIndirect`, the indirect-count family and `vkCmdExecuteCommands` are
+  all hooked and all read **zero**, so there are no secondary command buffers
+  and no indirect draws to be blind to.
+
+  **AND IT WAS PROVEN TO MOVE.** A census that only ever prints a plausible
+  number is not yet an instrument. Under `-onethread` the same run reports
+  **6.8 draws/frame against a 228.3 baseline** — a 34x collapse when something
+  that must change geometry changed. That is what makes a null result from it
+  (the cvar experiments below) worth believing.
+
+  **What it cannot do:** it counts CALLS, not primitives or objects, so one
+  instanced call can be thousands of objects and a culled instance inside a
+  batch is invisible to it. A guest that reached a draw pointer by `dlsym` on
+  libMoltenVK rather than through our dispatch would bypass both the counter and
+  the name table; that is not detectable from here, and the per-frame
+  distribution is what would make an implausible number obvious. The per-frame
+  bucket closes at the ovrp frame seam, so the spread — not any single bucket —
+  is the quantity to read. `KL_VK_DRAW_CENSUS=0` removes the whole family from
+  the dispatch rather than leaving a pass-through hop on the hottest path.
+
+  **Round 16 added a second, resettable copy of the same distribution over a
+  WINDOW the caller closes** (`kl_vulkan_draw_window`, read-and-clear), because
+  the run-long mean cannot answer "did the draw count change when the view
+  changed" — both halves of that comparison live inside it. Its only caller is
+  `KL_OVRP_HEAD_SCAN`, which closes a window at every cell boundary. The two
+  sets are kept separate on purpose: sharing one and having the caller subtract
+  would make the end-of-run census depend on whether anyone had windowed it, and
+  a census whose number depends on who else read it is not an instrument. With
+  the census off the window returns 0 and says `UNAVAILABLE`, never "no draws".
+
+- **The UE4 command-line file, and the CVAR CHANNEL IS DEAD** (round 15).
+  UE4 reads `<files>/UE4Game/IntoTheRadius/UE4CommandLine.txt` from userdata —
+  on host `~/Library/Application Support/Klepton/userdata/itr/UE4Game/
+  IntoTheRadius/` — and `runtime/guest/kl_ue4.c` prints whatever is there on
+  every run. **Plain command-line switches ARE honoured** by this Shipping
+  build: `-onethread` takes the draw census from 228.3 to 6.8 per frame.
+
+  **Console variables are NOT.** Measured against the draw census with the
+  prediction stated in advance (`r.MinScreenRadiusForMeshes 1.0` against a
+  default of 0.03 must collapse the count):
+
+  | route | draws/frame | verdict |
+  |---|---|---|
+  | baseline | 228.3 | — |
+  | `-ExecCmds="r.MinScreenRadiusForMeshes 1.0"` | 226.8 | no effect |
+  | `-ini:Engine:[SystemSettings]:r.MinScreenRadiusForMeshes=1.0` | 226.4 | no effect |
+  | `Saved/Config/Android/Engine.ini` `[SystemSettings]` | 227.0 | no effect |
+  | `-onethread` (positive control) | **6.8** | **honoured** |
+
+  Three cvar routes produce nothing while a plain switch moves the same
+  instrument by 34x, so this is not a weak instrument or a badly chosen control.
+  **Do not plan an experiment around setting a UE4 cvar on this title.** The
+  remaining routes are repacking `pakchunk0-Android_ASTC.pak` (v11, zlib) or
+  patching `libUE4.so`'s cvar defaults — both far more expensive than anything
+  this port has needed so far. **Always delete `UE4CommandLine.txt` after a
+  run**; a line left behind silently configures every later run, which is the
+  failure the comment at `kl_ue4.c:104` already exists to prevent.
+
+- **`[vk] depth census`** — **always on, log-only** (kl_vulkan.c, round 14). At
+  `vkCreateGraphicsPipelines`, count the pipelines the guest creates by
+  `depthCompareOp`, and say plainly whether any of them tests **EQUAL**.
+
+  It exists because an EQUAL depth test means a **depth PRE-PASS**, and a
+  pre-pass is only correct if the vertex's clip-space position comes out
+  bit-identically in both passes. Vulkan and GLES give that implicitly for one
+  shader source; **Metal does not** — without position invariance the compiler
+  may fuse or reassociate the transform differently in two pipelines built from
+  the same SPIR-V, the EQUAL test fails by an ULP, and the surface is **simply
+  not drawn**. That is a per-object, both-eyes-identical, whole-object
+  disappearance with a scale-free trigger, which is the exact shape of the
+  flicker this port spent five rounds on.
+
+  **On Into the Radius it answers NO.** 3010 pipelines with the depth test on:
+  **GEQUAL 2907, LEQUAL 102, ALWAYS 1, EQUAL 0**, 44 with the test off, 0 with
+  no depth state, 0 dynamic. Plain reversed-Z with depth writes and no
+  pre-pass — so position invariance cannot be what drops this guest's geometry,
+  and the whole MoltenVK `preserveInvariance` question is moot here.
+
+  **What it cannot do.** It counts PIPELINES, not draws — one EQUAL pipeline
+  bound for a whole base pass and a thousand never bound both read as one. It
+  reads the pipeline's static state, so if the guest ever declares
+  `depthCompareOp` or `depthTestEnable` DYNAMIC the numbers are a lower bound;
+  the census counts that case and says so in its own line rather than letting
+  the reader assume. A NULL `pDepthStencilState` is legal (no depth attachment,
+  or rasterizer discard) and is counted separately, never as "not EQUAL". And
+  it **fails loudly**: if no graphics pipeline ever reached the layer it says
+  so instead of printing a zero that looks like an answer.
+
+  It prints from **both** report paths — the device's `kl_vulkan_memory_report`
+  and the host's `query_census_tick`, on its own 15 s clock and NOT gated on
+  `KL_VK_QUERY_CENSUS`. That is deliberate: nothing on the host run path calls
+  `kl_vulkan_memory_report`, and this round lost two full host runs to a census
+  that compiled, linked, and printed nowhere. Second time this tree has paid for
+  that lesson.
+
+- `KL_VK_QUERY_CENSUS=1` — **default 0** (kl_vulkan.c). Count the guest's
+  occlusion queries: pools created, `vkCmdBeginQuery` calls, result reads by
+  return code, and what fraction of the values read back are ZERO (the answer
+  that culls). Off by default because it sits on `vkCmdBeginQuery`, which is a
+  per-object call on the frame path, and `0` leaves no hop there at all. It
+  exists because per-object, head-correlated visibility flicker looks like a
+  culling decision, and hardware occlusion culling had never been observed here.
+  On Into the Radius it answers **the guest creates no query pool at all** — so
+  that whole family is ruled out on this title rather than argued about. The
+  same census prints the `[vk] frame seam` line: how long the guest's queue is
+  still busy when it declares the frame finished, which is the window above.
+
+  **It also prints the `[vk] queue census` (round 13), which is a different
+  question with the same shape.** `kl_vulkan_frame_done` drains exactly ONE
+  `VkQueue` — family 0, index 0 — and until round 13 nothing in this tree could
+  say whether that is all of them; if the guest submitted rendering anywhere
+  else, round 11's ordering fix would have closed only part of the window it was
+  built for. The census names every distinct `VkQueue` handle the guest ever
+  fetched or submitted on, with its family, index, whether that family carries
+  `VK_QUEUE_GRAPHICS_BIT`, its submit / batch / command-buffer counts, how many
+  batches were signal-only, and which threads submitted — then states plainly
+  whether any command buffer went anywhere the drain does not reach. The
+  interceptions (`vkGetDeviceQueue`, `vkGetDeviceQueue2`, `vkQueueSubmit`,
+  `vkQueueSubmit2` and their KHR aliases) are the real call plus a counter and
+  nothing else.
+
+  **What it cannot do, stated so a clean answer can be weighed:** it sees a
+  submit's command-buffer COUNT and does not decode a command buffer, so
+  "carries work" means "was handed command buffers" and the family's graphics
+  bit is printed beside it rather than inferred; a queue submitted on but never
+  fetched through our seam is reported as `family UNKNOWN` in capitals and the
+  verdict then says the drain's coverage is UNPROVEN rather than clean; a
+  process that submits to Metal directly is invisible to it; and it is a HOST
+  instrument unless a device build carries it, because MoltenVK decides the
+  queue layout and macOS and visionOS are two different MoltenVK runs. The
+  `[vk] queue family N: …` and `[vk] the guest asked for N queue(s) from family
+  M` lines print unconditionally at `vkCreateDevice`, on host and on device
+  both, so the enumeration half needs no knob — and a guest that creates more
+  than one queue says so there in capitals.
+
+  On Into the Radius it answers **one queue**: MoltenVK exposes four families of
+  one graphics queue each, UE4 asks for one queue from family 0, and every one
+  of 32,087 submits (32,087 command buffers, zero signal-only) went to the
+  handle the frame seam drains — from six or more different guest threads, which
+  a queue serialises anyway. Round 11's drain is complete, and the primary lead
+  round 12 left open is closed.
+- `KL_VK_OUT_FROM=<frame>` / `KL_VK_OUT_TO=<frame>` — the capture WINDOW, both
+  default 0 (off). Without them the only way to get *adjacent* frames is
+  `KL_VK_OUT_EVERY=1` from frame 0, and a full eye pair is ~21 MB — a run long
+  enough to reach a loaded level is then hundreds of gigabytes, which is why
+  every capture this port had taken was a sparse sample and no two of them were
+  neighbours. A per-frame question ("is this object in frame N and gone in
+  N+1?") needs adjacent frames and does not need many.
+- `KL_VK_IDX_GUARD` — **default 1** (kl_vulkan.c). Drop a `vkCmdDrawIndexed`
+  the guest recorded with no index buffer bound in that command buffer. That is
+  invalid usage (VUID-vkCmdDrawIndexed-None-07312); mobile drivers ignore it, so
+  a shipped Android title can carry one and never know, but MoltenVK reads the
+  binding at `vkQueueSubmit` and hands Metal a nil `MTLBuffer` — a SIGSEGV
+  inside `-[AGXG16XFamilyRenderContext drawIndexedPrimitives:...]`, hundreds of
+  frames and one thread away from the call that caused it. Into the Radius has
+  exactly one such draw (six indices, from `FRHICommandList::EndFrame`, into a
+  command buffer UE4 had just re-begun with its own index state still marked
+  clean), and it killed the run at ~370 frames every time. The guard tracks the
+  binding per command buffer, costs one lock-free hash probe on
+  `vkCmdBindIndexBuffer` / `vkCmdDrawIndexed` / `vkBeginCommandBuffer`, and
+  never touches a draw that has a binding. `0` takes the three hooks out of the
+  dispatch entirely — the A/B, and the way to see the crash again. Every drop
+  is logged (the first four with the guest's own call stack, then at each
+  doubling); a run with `0 DROPPED` has no invalid draws in it.
+- `KL_VK_LINEAR_REPAIR=0` — default **on** (`kl_vulkan.c`, `klvk_CreateImage`).
+  A `VK_IMAGE_TILING_LINEAR` vkCreateImage that MoltenVK REFUSES is retried as
+  OPTIMAL (Metal has no linear compressed or mipped texture), and any failed
+  create now NULLs the out handle. UE5.3's pixel-format sweep creates such an
+  image and never checks the result (Pinball FX: SIGSEGV in
+  `MVKImage::getMemoryRequirements` on every boot). A create that already
+  succeeds is untouched. One log line, the first time. `=0` restores the bare
+  refusal.
+- `KL_VK_MAX_SAMPLES=N` — **unset by default, and unset means untouched**
+  (`kl_vulkan.c`, `klvk_clamp_limits`). Masks the framebuffer and sampled-image
+  sample-count limits reported by `vkGetPhysicalDeviceProperties`/`…2`/`…2KHR`
+  down to the powers of two at or below `N`, so a guest that clamps its mobile
+  MSAA to what the device advertises builds single-sampled attachments. Baked to
+  `1` for pinballfx alone (`kl_app.c`): MoltenVK cannot compile the multisampled
+  arrayed subpass input UE's multiview scene-depth fetch asks for. Every other
+  target sees byte-identical properties because the clamp is skipped entirely
+  rather than computed to a no-op. Measured working on device 2026-08-21: the
+  clamp line appears and no multisampled image is ever created.
+- `KL_VK_SUBPASS_MS_DEMOTE=1` — **off by default** (`kl_vulkan.c`,
+  `klvk_CreateShaderModule`). Clears the `MS` field of every
+  `OpTypeImage … Dim=SubpassData` in a shader module's SPIR-V before MoltenVK
+  sees it. This exists because `KL_VK_MAX_SAMPLES` above **is not enough on its
+  own**: the MS-ness of `GENERATED_SubpassDepthFetchAttachment` is COOKED into
+  the pak by UE's offline Vulkan shader compiler, so no runtime CVar and no
+  device limit can reach it, and SPIRV-Cross then emits Metal's non-existent
+  two-argument `texture2d_ms_array::read(coord, layer)`. The two knobs are a
+  pair: the clamp makes the attachments genuinely single-sampled, which is what
+  makes the demote a correction rather than a lie — do not set this one alone.
+  A module in which any `OpImageRead`/`OpImageSparseRead` carries a `Sample`
+  image operand is **declined untouched and says so**, because clearing `MS`
+  under such a read produces a module `spirv-val` rejects outright.
 - `KL_VK_TRACE=1` — the loader's own chatter: which MoltenVK was opened, which
   extension names were dropped, acquire/submit failures.
 - `KL_VK_WIDTH` / `KL_VK_HEIGHT` — the synthetic Android surface's size
@@ -2170,7 +3712,390 @@ vendored the whole path refuses by name and none of these do anything.
   which BONELAB does not.
 - `KL_MVK_DIR=<dir>` — where to load MoltenVK from (default
   `vendor-moltenvk/out/macos`); `KL_MVK_DYLIB=<path>` names the file outright.
+- `KL_MVK_CONCURRENT_COMPILE` — set MoltenVK's
+  `MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION`, spreading the boot PSO
+  compiles over its concurrent pool. Default: on where upstream's defaults apply
+  (`KL_UPSTREAM_DEFAULTS`), off on the measured rows.
+- `KL_MVK_COMPILE_TIMEOUT` — bound MoltenVK's Metal compile at 10 s, so a
+  pipeline whose completion handler never fires fails instead of wedging the
+  render thread. Default: on for `wrath2`, off elsewhere.
+- `KL_MVK_NO_ARGBUF` — keep MoltenVK off Metal argument buffers (a SPIRV-Cross
+  codegen bug for materials with two dynamic uniform buffers). Default: on for
+  `wanderer`, off elsewhere.
+- `KL_VK_API_1_1` — raise a guest's 1.0 instance request to 1.1 (MoltenVK
+  reports the device at the instance version, and UE4's device gate needs
+  1.1). Default: on where upstream's defaults apply, off on the measured rows.
+- `KL_VK_UPSTREAM_LAYER=0/1` — force upstream's title layer
+  (`runtime/gfx/kl_vulkan_upstream.inc`) into or out of the dispatch. Default:
+  in when upstream's defaults apply, when the target is `wrath2`, `olar`,
+  `wanderer` or `intotheradius`, or when any of the layer's own knobs below is
+  set; out otherwise. Its wrappers sit above this file's own and continue into
+  them. The layer's knobs, each upstream's name and default:
+  `KL_OVERLAY_TEXL` / `KL_OVERLAY_SHADOW` / `KL_SHADOW_FROMCOPY` (the overlay
+  resolver behind `kl_vulkan_mtl_for_handle`, its shadow copies and
+  capture-on-copy; on where upstream's defaults apply), `KL_TEXL_DIAG`,
+  `KL_RT_DEBUG`, `KL_TRACE` (diagnostics, off), `KL_VK_IMG_ADOPT` (adopt an
+  unregistered image handle instead of refusing it, off),
+  `KL_VK_WILD_REDIRECT` (redirect a wild-handle copy onto the scratch instead
+  of dropping it, off), `KL_VK_FIX_PRIMRESTART` (force primitive restart on
+  strip pipelines MoltenVK would reject; on where upstream's defaults apply),
+  `KL_VK_RESOLVE_STORE` (force STORE on DONT_CARE resolve targets; same),
+  `KL_VK_MSAA_STORE` (STORE the multiview MSAA source; on for `wanderer`),
+  `KL_VK_EYE_RESOLVE_PROBE` (off), `KL_VK_PIPE_TRACE` (pipeline ENTER/DONE
+  trace; on for `wrath2`), `KL_VK_DRAW_GUARD` (skip an indexed draw whose index
+  buffer has no MTLBuffer; on for `intotheradius`), `KL_VK_EMU_TEXELBUF` (the
+  texel-buffer 2D-mirror emulation and its SPIR-V/descriptor rewrites; on for
+  `olar` and `wanderer`), `KL_VK_TEXELBUF_PROBE` / `KL_VK_TEXELBUF_PROBE_AT`,
+  `KL_VK_EMU_PROBE`, `KL_VK_DUMP_TEXELBUF`, `KL_VK_UV_CONST`,
+  `KL_VK_ASTC_RGBA8`, `KL_VK_TINT_DEFAULTS`, `KL_STRIP_INPUT_ATT`
+  (diagnostics and experiments, off), `KL_VK_SPOOF_ADRENO` (report an Adreno
+  740 identity to the guest's GPU check; on for `batman` only where upstream's
+  defaults apply — the measured `batman` row runs without it). The wild-handle
+  guard, the null-physical-device substitutions in the layer, the deviceLUID
+  agreement and the zero fragment-shading-rate answer follow
+  `KL_UPSTREAM_DEFAULTS`.
+- `KL_EYE_SHADOW=1` — copy the live eye image into a per-stage shadow on the
+  guest's queue at frame end and publish the shadow to the compositor. Off.
   Both are the A/B against a different MoltenVK build.
+
+### Single-sample resolves, depth bounds, Linux WSI (`kl_vulkan.c`)
+
+- `KL_VK_SS_RESOLVE=copy|drop` — a dynamic-rendering resolve FROM a
+  single-sample attachment (invalid Vulkan; Metal hangs the GPU on it) is
+  always taken off the pass. Default `copy`: the source is stored and the
+  same pixels are copied into the resolve target at `vkCmdEndRendering`
+  (barriers back to the guest's layouts). `drop` copies nothing. The `[vk]
+  dynamic rendering:` census line (riders clock) counts passes, rewrites,
+  resolves taken off / copied / not copyable, and image-ledger overflow (the
+  ledger is a 32768-row hash table now).
+- `KL_VK_SS_CONSUMERS=1` — diagnostic, off: which descriptors name a
+  single-sample resolve target (vkUpdateDescriptorSets + templates; out of
+  the dispatch when off).
+- `KL_VK_DEPTH_BOUNDS=real|fake|off` — what the guest reads for
+  `VkPhysicalDeviceFeatures.depthBounds` (default `real` = MoltenVK's answer;
+  logged once). `KL_VK_DEPTH_NOFILTER=1` (test) — the depth formats answer
+  without SAMPLED_IMAGE_FILTER_LINEAR, as MoltenVK does on the headset.
+- `KL_VK_RENDERING_TRACE_FROM=<pass>` — start `KL_VK_RENDERING_TRACE`'s
+  window at pass K instead of the first.
+- `kl_vulkan_set_linux_wsi(1)` / `kl_vulkan_frame_sync_external(1)` are API,
+  not env: a Linux guest's xcb/xlib/wayland instance extensions listed and
+  not enabled; a frontend that fences its own eyes skips the frame-end queue
+  drain. Both off unless a frontend asks (kl_openvr asks for the second).
+
+### Compute -> later work barriers (`kl_vulkan.c`)
+
+- `KL_VK_COMPUTE_BARRIER=0|1` — default **1, every Vulkan guest**. A command
+  buffer that recorded `vkCmdDispatch` / `DispatchIndirect` / `DispatchBase`
+  gets `COMPUTE_SHADER` + `SHADER_WRITE` added to the source scope of its next
+  `vkCmdPipelineBarrier[2]` that does not already name `COMPUTE_SHADER` or
+  `ALL_COMMANDS`. MoltenVK takes the guest's `srcStageMask` literally: Valve's
+  MSAA compute resolve (Half-Life: Alyx, `+vr_msaa` 2/4) records `0x1600` after
+  its dispatch, and the later passes read the previous frame's values in whole
+  threadgroup blocks ("vertical rectangles"). Log (at 1, 1000, 100000): `[vk]
+  compute barrier: N pipeline barrier(s) after a dispatch widened ...`. `0` =
+  the guest's masks unchanged (and the dispatch/barrier hooks out of the
+  dispatch table unless the hold census or the trace needs them). Inside
+  `KL_VK_RENDERING_TRACE`'s window every dispatch and barrier is printed (`dispatch
+  cb … after pass #N`, `barrier cb … stages 0xS -> 0xD …`).
+
+## Frame cost (`runtime/gfx/kl_perf.m`) — the `[perf]` line
+
+**OFF by default** — `KL_PERF=1` turns it on (a target may set it in its row
+env). Once a second, from the frame owner (`kl_perf_frame`; kl_openvr's
+WaitGetPoses, kl_ovrp's WaitToBeginFrame and kl_openxr's `xrWaitFrame` call it, so OpenXR guests get `[perf]` and the `fove` health
+field too):
+
+    [perf] 93.3 fps 10.7 ms (max 12.4) | ticks 1.00/f | gpu 10.7 ms/f busy 98%
+      (guest 10.5 copy 0.20 other 0.0; longest cb 12.1) | wait xr 0.0 fence 5.6 ms/f |
+      vkQueueSubmit 0.9 ms/f | cpu 17.3 ms/f, W 2.7 S 1.6 Q 0.9: hlvr#94385 8.5, ... |
+      mtl 2595 MiB foot 5360 MiB | fove ... | shc ...
+
+- GPU numbers are Metal's own clock (`GPUStartTime`/`GPUEndTime` of every
+  MTLCommandBuffer, via a completed handler added in a wrapped `-commit`).
+  `guest` = the guest's vkQueueSubmits, `copy` = kl_openvr's eye copy,
+  `other` = everything else (the compositor). `busy` = the union of all
+  command buffers over wall time: ~100% means GPU-bound. GPU ms is not
+  clock-invariant — compare only between runs that are both GPU-bound.
+  **Quote `busy`, not `gpu ms/f`, for how loaded the GPU is.** `gpu ms/f` sums
+  each command buffer's own GPUStart..GPUEnd span, so work that OVERLAPS on the
+  GPU (the guest's submits running beside the compositor's, or two guest
+  command buffers in flight) is counted twice and the sum can exceed the frame
+  period on a GPU that is not saturated. `busy` is the union, so it cannot.
+- `ticks` = display intervals the guest's clock advanced per frame; `wait
+  xr` = blocked in xrWaitFrame; `fence` = Submit waiting on the previous eye
+  copy; `vkQueueSubmit` = time inside the guest's submits.
+- `cpu` = all threads, the five busiest; W/S/Q = the WaitGetPoses / Submit /
+  vkQueueSubmit threads. `mtl` = MTLDevice currentAllocatedSize, `foot` =
+  phys_footprint.
+
+Knobs: `KL_PERF_GPU=0` (no -commit wrapper), `KL_PERF_SECS=<s>` (period,
+default 1), `KL_PERF_SUBMIT_SECS=<s>` (the per-submit-ordinal line, default
+10, 0 off), `KL_PERF_SPLIT_SUBMIT=1` (diagnostic: one vkQueueSubmit per guest
+command buffer), `KL_PERF_PASSES=1` (diagnostic: per-encoder GPU timestamps,
+a `[pass]` table every `KL_PERF_PASSES_SECS`, default 10), `KL_VK_DRAW_HIST=1`
+(diagnostic: indexed draws by instance count and log2 index count every 600
+frames). kl_vulkan also logs `MoltenVK config: ...` once for every Vulkan
+guest (the effective MVKConfiguration).
+
+## Fixed foveation (`runtime/gfx/kl_fove.m`) — Vulkan guests, OFF by default
+
+Confirmed on the headset with Half-Life: Alyx, then extended to the Unity and
+Unreal eye shapes below. Design, measured facts and known gaps:
+`docs/FOVEATION.md`. GLES guests foveate through `KL_VRR` instead.
+
+Three eye shapes are recognised (all need `KL_FOVEATION` on; with it unset
+nothing is installed, swizzled or handed out, and kl_vulkan's render-pass
+records are never written):
+
+1. **OpenVR double-wide** (Half-Life: Alyx): a `vkCmdBeginRendering` pass whose
+   colour and depth are both the extent of the texture the guest Submits.
+2. **The runtime's own eye images** (every Unity/Unreal Vulkan guest): a `vkCmdBeginRenderPass[2]` pass whose colour attachment 0 IS
+   an eye image kl_ovrp (or kl_openxr) handed the guest, or whose resolve
+   attachment 0 is (an eye-size MSAA target resolved into the eye in the pass),
+   with a depth attachment of the same extent and sample count. A 2-layer
+   ARRAY eye (multiview, viewMask 0x3) gets ONE rate map with two layers, layer
+   l centred on eye l's projection centre (`kl_ovrp_eye_tangents`, which
+   kl_openxr's xrLocateViews also answers from; inside the submitted
+   ViewportRect when one is recorded) and is foveated only as a LAYERED Metal
+   pass (renderTargetArrayLength 2 — MoltenVK's lowering of multiview on Apple
+   GPUs); a one-slice pass over the pair draws unfoveated (counted). Every
+   patched shader passes `[[render_target_array_index]]` to the decoder (an
+   existing argument or stage_in member is reused, else one is added; Metal
+   answers 0 when the vertex stage does not write it). An MSAA pass that
+   resolves in-pass is expanded on the single-sample image it resolves into
+   (MoltenVK opens it with storeAction Unknown + resolveTexture); the expand
+   runs per slice. Measured on GORN 2 (host): 4x MSAA multiview colour+depth
+   resolved into the kl_ovrp swapchain, one layered encoder per frame.
+3. **The guest's own eye-size intermediate** (Batman: Arkham Shadow's render
+   pipeline; UE's SceneColor -> tonemap is the same family). The scene pass's
+   colour is NOT an eye image but is eye-sized (2 layers / viewMask 0x3 for a
+   pair, depth of the same extent and samples). (a) **In-pass**: a later
+   subpass of the SAME render pass writes (or resolves into) a runtime eye
+   image (Batman: Arkham Shadow: `#0 depth x2, #1 colour x2 DONT_CARE-stored, #2
+   R8G8B8A8_SRGB x1 STORE`, 3 subpasses, the post subpass reads #1 as an input
+   attachment). Marked at once: every Metal encoder of the pass (scene
+   subpasses and the eye subpass) gets the SAME 2-layer map; the scene stays in
+   physical layout (it is transient — required: its storeOp is DONT_CARE, the
+   eye attachment is not LOADed, all subpasses share one view mask), subpass
+   inputs read it at the physical position (the MSAA-eye rule), and the EYE image is
+   expanded after the pass. (b) **Copied / sampled later**: the pass's colour is
+   a CANDIDATE, confirmed (sticky until vkDestroyImage) by a
+   vkCmdCopyImage[2] / vkCmdBlitImage[2] / vkCmdResolveImage[2] into an eye
+   image, or by the next render pass that draws into an eye image (sampled —
+   a heuristic: that pass is assumed to read it). The confirming frame stays
+   unfoveated; afterwards the intermediate is marked like an eye and expanded
+   before the next render, compute **or blit** encoder (so its copy into the
+   eye reads screen layout). A layered MSAA intermediate with no in-pass
+   resolve stays unfoveated (counted, as for eyes).
+   **Size slack (Deadpool):** the intermediate need not be exactly
+   eye-size — equal or up to +16 px per axis, never smaller
+   (`kl_fove_inter_extent_ok`), because Unreal rounds its scene target up
+   (Deadpool: 5088x3236 scene for a 5088x3234 eye; the exact match left it
+   silently unfoveated, `fove high 0%`). The map is sized to the intermediate
+   (`[fove] map 5088x3236, 2 layer(s)`) and the expand runs on it (or on what it
+   resolves into), so the eye being smaller changes nothing downstream.
+   **Transient MSAA scene (Deadpool):** UE4's
+   depth-read subpass pair — `#0 colour x2 CLEAR/DONT_CARE, #1 x1
+   DONT_CARE/STORE, #2 depth x2`, subpass 0 draws the MSAA scene, subpass 1
+   LOADs it (depth read as an input) and resolves #0 into #1. MoltenVK opens
+   subpass 0 as a layered encoder that STORES the samples with no resolve,
+   which the rule above refused (`layered MSAA … UNFOVEATED`), and subpass 1
+   then LOADed with nothing pending (`a pass LOADs the eye …`) — both every
+   frame, `fove 0%`. When kl_vulkan sees the confirmed intermediate's colour
+   is storeOp DONT_CARE and a later subpass resolves it into a single-sample
+   attachment (`kl_fove_note_ms_transient`), the layered no-resolve encoder is
+   marked and its pending entry HELD (no expand; the samples die with the
+   pass), the LOADing resolve encoder is marked with the same map, and the
+   x1 resolve target is what gets expanded (the layered single-sample
+   expand), before the pass that samples it. No per-sample expand is needed.
+   Proof lines: `[vk] [fove] intermediate …: MSAA x2 scene with storeOp
+   DONT_CARE, resolved by a later subpass into attachment #1 (x1) …`, `[fove]
+   intermediate slot N: MSAA scene is TRANSIENT …`, `[fove] transient MSAA
+   intermediate: first HELD … encoder` + `first RESOLVING … encoder`, `[fove]
+   first expand: … x2 slices`, and in the 10 s line `transient MSAA held N /
+   resolved N` with `eye LOADs left unfoveated 0`, `layered MSAA without
+   resolve … 0`, `eye subpasses UNMAPPED 0`. A LOAD of held samples left
+   unmapped is a `BROKEN FRAME` (counted as UNMAPPED). A layered MSAA store
+   whose samples ARE kept (not DONT_CARE) still draws unfoveated: the
+   per-sample expand remains one-slice only.
+- **Re-centre on the frame record.** A layered (ARRAY) map built before the first frame record used the
+   full image for each eye's straight-ahead point; Deadpool renders each eye
+   into a ~4012-wide sub-rect of a 5088 texture, so the fovea sat 682 px off
+   (a hard clear/blurry seam in both eyes). `kf_map_for` now recomputes an
+   ARRAY map's centres on lookup and rebuilds it in place when one moves more
+   than **4 px** — never while a pending expand refers to it, at most 8 times
+   per run (old maps kept alive for frames in flight). Line: `[fove] map WxH
+   RE-CENTRED (#n): it was built at x,y / x,y — the frame record moved the
+   straight-ahead point …`; after the 8th, `… re-centres were already made —
+   kept`. Full-image records (Into the Radius, Batman: Arkham Shadow) give the same centre as no record
+   and never rebuild. No knob.
+
+- `KL_FOVEATION=off|low|medium|high` — default **off**. Profiles (box / floor,
+  ramp 0.19 H): low 0.603 H / 0.333, medium 0.508 H / 0.22, high 0.381 H /
+  0.125. No rate-map support (visionOS Simulator) = off with one line; no
+  2-layer support = 2-layer eye pairs stay unfoveated (one line). Logs `[fove]`;
+  `[perf]` gains a `fove` field (with `KL_PERF=1`; an OVRPlugin guest's frame
+  clock is `ovrp_WaitToBeginFrame`).
+- **Lines that prove engagement on a Unity/OVRPlugin guest** (one run):
+  `[vk] [fove] EYE PASS (marked) render pass …: MSAA colour resolved into a
+  runtime eye image WxH x4 (2 layer(s), … viewMask 0x3) …`, `[fove] eye target
+  registered: … 2-layer eye pair`, `[fove] map WxH, 2 layer(s) (one per eye) …
+  layer 0 = eye 0 centre …` + `layer 1 = eye 1 centre …` (centres NOT 50%/50%
+  on the headset — asymmetric frusta; each centre names the
+  render viewport it came from, `…; viewport 0,0 WxH of WxH[, another
+  generation: scaled as a fraction]` or `…; no frame record: full image`),
+  `[fove] marked encoder #1: … + resolve
+  … array length 2`, `[fove] first expand: … x2 slices`, and every 10 s
+  `[fove] libraries …; encoders marked N (layered N) …, eye LOADs left
+  unfoveated 0, one-slice passes … 0, layered MSAA without resolve … 0;
+  expands N (… of a resolve target N marks …); refused 0 …`. A near miss is
+  named once with its full attachment table: `[vk] [fove] near miss, NOT
+  marked: … | why: …` (+ `[vk] [fove] near miss images: …`), and a transfer
+  into an eye image (the guest drew elsewhere) as `[vk] [fove] vkCmdBlitImage
+  INTO a runtime eye image …`.
+- **Map centre and the viewport generation.** The
+  per-eye centre is the frustum's straight-ahead fraction inside the guest's
+  render viewport, and that rect is now read as a FRACTION of the texture it
+  was measured against (`kl_ovrp_render_pose.viewport_of`), applied to the
+  image the map is built for. Read as pixels instead, a guest that re-creates
+  its eye images after the first frame (Into the Radius 5088x4081 -> 6784x4528;
+  Unity's ~1.2x resize and again on map entry) would get a map built from the
+  previous generation's rect — the fovea 848 px left / 204 px up, a blur band
+  on the right eye's outer edge. viewport_of 0 or a rect that does not fit it =
+  the full image. To check a guest that resizes its eye images: compare its
+  `[fove] map … centre` lines against W x fx, H x ~0.456 (the line's own
+  percentages), and the `of WxH` it names against the map's WxH.
+- `KL_FOVE_MSAA=0` — leave MSAA eyes UNFOVEATED (one `[vk] [fove] … MSAA`
+  line / near-miss reason). Default 1. MSAA paths: the depth-only
+  clear of a tiler-0 MSAA eye is mapped and leaves a depth_only pending entry;
+  2d_ms reads of an eye image at `gl_FragCoord` keep the PHYSICAL position;
+  an MSAA eye stored with no resolve is expanded per sample (resolve the
+  physical region, blit each fovea rectangle with all samples, periphery +
+  per-sample fovea back) — one slice only: a LAYERED MSAA pass that stores
+  its samples with no resolve draws unfoveated (counted). `KL_FOVE_MSAA_FOVEA=0`
+  (debug) — the per-sample fovea copy off.
+- `KL_FOVE_BOX=<fraction of H>`, `KL_FOVE_RAMP=<fraction of H>`,
+  `KL_FOVE_FLOOR=<rate 0.02..1>` — override the level's numbers (box 0.30 /
+  floor 0.08 was found invisible on the headset in Half-Life: Alyx).
+- `KL_FOVE_BUFFER=<1..30>` — the fragment buffer slot for the rate-map
+  parameters (default 20). A `[[position]]` shader already using it is
+  refused and foveation turns itself off; a clobber inside a foveated pass
+  does the same.
+- `KL_FOVE_FRAGCOORD=0|grid|gridraw` (debug) — unpatched shaders / a 64-px
+  position grid with or without the remap. `KL_FOVE_EXPAND=0` (debug) — leave
+  the eye in physical layout. `KL_FOVE_MSL_DUMP=<absolute dir>` (debug) —
+  every MSL source, as patched. `KL_FOVE_TRACE_ENC=<n>` (debug) —
+  the first n Metal render-pass descriptors after an eye is registered
+  (textures, types, sample counts, slices, load/store, resolve, array length).
+- `KL_FOVE_FENCE=0|1` — default **1** (confirmed on the headset with
+  Half-Life: Alyx). MoltenVK orders its passes with its own
+  MTLFences, so without this the guest's next reader of the eye can run
+  concurrently with the expand and see the raw physical (compressed) layout
+  (Half-Life: Alyx without it: shrunken copies of the scene in the top-left of
+  the left eye). Every expand path's last encoder updates a fence (`kl-fove-expand`;
+  the layered single-sample expand chains slice 0 -> slice 1 through a second
+  fence) and every render/compute/blit encoder opened afterwards on the same
+  queue waits on it (same command buffer at once; a later one once the
+  expand's buffer is committed). `0` = unordered (control). Proof lines:
+  `[fove] ON … expand ON (fenced: the guest's later passes wait for it)`,
+  `[fove] expand fence: the guest's encoders after an expand wait for it (first
+  wait: …)`, and with `KL_PERF=1` every 10 s `[fove] expand fence: encoders
+  after an expand: waited on its own buffer N, on a later buffer N; NOT waited:
+  other buffer while the expand's was uncommitted N, other queue N; expands
+  recorded at an encoder N, at commit N`. "other queue" = an encoder on a
+  different MTLCommandQueue (no fence can order it — Metal fences are
+  per-queue; the swizzle is class-wide, so the runtime's own Metal work, e.g.
+  the compositor, is counted there too); non-zero "uncommitted" means the
+  guest encodes the reader into another command buffer before committing the
+  expand's — read it before anything else. The first expand also logs the eye
+  image's hazard tracking mode.
+- `KL_FOVE_INTERMEDIATE=0|1` — default **1** whenever `KL_FOVEATION` is on.
+  `0` = shape 3 above is never marked (the near-miss line of shape 2 comes
+  back). Proof lines (Batman: Arkham Shadow, in-pass): `[vk] [fove] intermediate CONFIRMED:
+  VkImage … -> eye image … via subpass (attachment #2 of render pass …)`,
+  `[vk] [fove] EYE PASS (marked) render pass …: eye-size intermediate, a later
+  subpass writes a runtime eye image …`, `[fove] intermediate target
+  registered: … via subpass …`, `[fove] intermediate slot N: eye image … is
+  written in-pass from it` (one per swapchain stage), `[fove] intermediate:
+  first marked scene encoder` + `first marked EYE-SUBPASS encoder`, `[fove]
+  first expand: … x2 slices`, and in the 10 s line `intermediate marked N (eye
+  subpasses N, eye subpasses UNMAPPED 0, expands before a blit N)`. Copy /
+  sampled shape: `[vk] [fove] intermediate CONFIRMED: … via copy|blit|resolve
+  (vkCmd…)` or `via sampled (…)` and `[fove] intermediate: expanded before a
+  blit encoder`. **`[fove] BROKEN FRAME: the eye subpass of a foveated
+  intermediate was left UNMAPPED`** (UNMAPPED > 0) = the picture is wrong
+  that frame — set `KL_FOVE_INTERMEDIATE=0` and bring the line back. The
+  transfer census line (`vkCmd… INTO a runtime eye image …`) now also names
+  the first region's layers/offsets/extent and whether the source is a
+  candidate/confirmed intermediate; the copy_commands2 spellings are hooked
+  too.
+- `KL_FOVE_PROBE=1` (debug) — the first 4 transfers of each kind into an eye
+  image (not just the first), and the first 4 depth-less passes drawing into
+  an eye image with the last candidate intermediate. It also swizzles MoltenVK's
+  render/compute encoder classes and prints every fence wait/update,
+  useResource, memory barrier, texture bind and dispatch on the 2 encoders
+  after each of the first 4 expands (`(THE EYE)` marks the eye), plus 10 s
+  totals. `KL_FOVE_SLOW=<n>` (debug stress) — n busy
+  iterations per fragment of the MSAA periphery expand, to widen the race
+  window (no effect on single-sample expands).
+
+## Metal shader compile census + warm-up (`runtime/gfx/kl_shc.m`) — OFF by default
+
+Code only: **no headset confirmation yet**.
+`KL_SHC=1` installs it (after kl_fove, so its compiles go through kl_fove's
+patch); unset, nothing is swizzled and the pipeline split line is silent.
+
+- `KL_SHC_SLOW_MS=<ms>` — compiles slower than this are named (default 50);
+  `[perf]` gains a `shc` field and kl_vulkan logs `pipeline split: ... = Metal
+  lib + fn + pso + cps, MoltenVK/SPIRV-Cross ...` for every vkCreate*Pipelines
+  over 8.3 ms. `KL_SHC_TRACE=0` drops the per-library lines.
+- `KL_SHC_RECORD=<file>` — append every library source (MSL, zlib) and render
+  pipeline state the guest asks for that the file does not hold (crash-safe;
+  `t_shc`). `KL_SHC_SHIPPED=<file>` — a read-only list generated elsewhere.
+- `KL_SHC_WARM=0` — record only. Default on whenever a list has entries:
+  utility-QoS threads compile every entry from the guest's first library
+  compile on, holding off while a guest compile is in flight; a shipped list
+  that served none of 40 guest compiles is dropped. `KL_SHC_WARM_THREADS=1..8`,
+  `KL_SHC_WARM_YIELD=0`, `KL_SHC_WARM_PSO=0`, `KL_SHC_WARM_SYNC=1`
+  (measurement: warm everything before the guest goes on).
+
+## OpenVR runtime (`runtime/xr/kl_openvr*.c`) — libopenvr_api.so over kl_openxr
+
+Promoted from hla 2026-10-04. Only a guest that links libopenvr_api.so (a
+glibc OpenVR guest) reaches any of these.
+
+- `KL_OPENVR_RENDER_SCALE=<percent>` — the eye edge the guest is told,
+  relative to the recommended one (default 100).
+- `KL_OPENVR_EYE_SIZE=guest|...` — eye swapchains sized to the guest's eye
+  (default `guest`). `KL_OPENVR_LAYER_FOV=submit|...` — the projection
+  layer states the frustum the guest drew (default `submit`).
+- `KL_OPENVR_EYE_COPY_ASYNC=0` — wait on a fence per eye in Submit (default
+  1: asynchronous copy, one frame of settle). `KL_OPENVR_EYE_COPY=0`
+  (diagnostic) — skip the eye copy. `KL_OPENVR_SUBMIT_LAYOUT=<VkImageLayout>`.
+- `KL_OPENVR_PREDICTION_ID=vsync|...` — the pose prediction id counts display
+  intervals (default `vsync`; anything else is the pre-fix per-frame count, at
+  which the guest's world runs at fps/Hz).
+- `KL_OPENVR_HAND_POSE=<mode>` — hands as SteamVR `/pose/raw` (default).
+  `KL_OPENVR_HMD_VELOCITY=1` — report a head velocity (default 0).
+- `KL_OPENVR_HIDDEN_AREA=<fraction>` — `GetHiddenAreaMesh` returns a corner
+  mask hiding that fraction of each eye (0.02..0.30; default 0 = empty). Not a
+  measured lens profile.
+- Host/diagnostic: `KL_OPENVR_MOTION=<x,y,z...>` (scripted head motion; `0,0,0`
+  = still head at `KL_OVRP_EYE_HEIGHT`), `KL_OPENVR_DUMP=<dir>` +
+  `KL_OPENVR_DUMP_FROM` (1500) / `_N` (4) / `_FULL=1` (eye dumps),
+  `KL_OPENVR_FRAME_TIMING=1`, `KL_OPENVR_GAMETIME=<n>`,
+  `KL_OPENVR_FRAME_DELAY_MS=<ms>`, `KL_OPENVR_SKELETAL_SUMMARY=1`.
+- IVRInput reads the SteamVR action manifest through the frontend's
+  `flatten_manifest`; `kl_openvr_manifest_flatten` (kl_openvr_manifest.c) is
+  the stock one (actions.json + its oculus_touch binding).
+
+## glibc personality (`runtime/libc/kl_glibc.c`) and SysV IPC
+
+- `KL_GLIBC_SYSV=host` (macOS only) — pass a glibc guest's SysV sem*/shm*
+  through to Darwin's real SysV instead of the in-process emulation (A/B).
+- `KL_BIONIC_SYSV=0` — a BIONIC guest's sem*/shm* bind as before (sem* forwarded
+  to Darwin, which is SIGSYS on visionOS; shm* unresolved). Default: the same
+  in-process emulation as the glibc personality.
 
 ## MoltenVK vendoring gate (`tests/t_mvk.c`, `make mvk-check`)
 
@@ -2186,6 +4111,36 @@ these are the gate's own knobs.
   a new machine: it is the fastest answer to which GPU and which Metal feature
   set are present.
 
+## SDL2 door (`runtime/guest/kl_sdl.c`)
+
+- `KL_SDL_ARGS="..."` — the argv `nativeRunMain` is handed. Stock SDL passes an
+  empty array; a guest with a command line wants one.
+- `KL_SDL_SCREEN_RES=0|1|WxH` — whether the door calls
+  `SDLActivity.nativeSetScreenResolution`, and optionally the size to state.
+  Default: ON for every SDL guest except srceng (hl2vr), which has never been
+  launched with it. `SDL_GL_GetDrawableSize` answers zero without it, and a
+  guest that scissors to its drawable then discards every fragment it draws.
+- `KL_SHAR_RENDER_SCALE=<float>` — Simpsons Hit & Run only. Writes
+  `renderScale` into the guest's own `vrsettings.cfg` (under
+  `<files>/files/`), which `SharOpenXR::Initialize()` parses right after
+  installing its defaults. The eye swapchain is that scale times a fixed
+  2064x2208 base.
+
+  **Do NOT set this by calling `SharOpenXR::SetRenderScale()`.** Every
+  SharOpenXR setter tail-calls a common epilogue that rewrites the WHOLE
+  settings block to that file, and from the door the block is still zeroed
+  `.bss` — which is how round 10 shipped `smooth=0.0 snap=0 angle=0.0 csm=0
+  gtao=0 spatialHud=0` and took the right-stick turn, the shadows and the
+  spatial HUD away in one call.
+- `KL_SHAR_VRCFG=0` — do not touch `vrsettings.cfg` at all. The A/B for anything
+  that looks like a settings problem; with it off the guest keeps whatever is on
+  disk, including the render scale.
+
+  The write also REPAIRS a block this door damaged: a file carrying `smooth=0.0`
+  and `angle=0.0` cannot have been written after `Initialize()` (its defaults
+  are 120 deg/s and 45 deg), so the whole block goes back to the guest's own
+  defaults before `renderScale` is set.
+
 ## visionOS app (`visionos/Sources/*.swift`, `visionos/Sources/kl_app.c`)
 
 Read on the device/simulator; `visionos/run.sh` forwards every `KL_*` it sees
@@ -2199,6 +4154,57 @@ except its own control vars (next section).
   be A/B'd from one build without regenerating the project — but note the two
   apps embed **different guest frameworks**, so pointing one at the other's
   target fails at `kl_app_configure` with "missing guest libraries".
+- `KL_PRESENT_ORDER=strict` (default) or `=off` — how the compositor picks the
+  frame it presents. `strict` selects the stage AND its record out of **one**
+  lock (`kl_ovrp_last_complete_record`) and refuses a serial older than the one
+  already shown; `off` is the pre-session-15 arm — two separate reads, with a
+  window in which the guest's fence thread can commit later frames between
+  them, so a present can jump ahead of the true newest and the next present
+  come back to it. A convicted race, hence the default. Instrument, every 300
+  presents: `[cp] present order: N presents, serials monotonic N% |
+  regressions N (worst -K) | repeats N | tex/record mispairs N (worst +K) |
+  anchor misses N | held back N | no record N`. `repeats` is expected whenever
+  the guest runs slower than the panel; `regressions` and `mispairs` are not.
+- `KL_WARP=ours` (default here) or `=system` — **which reprojection actually
+  corrects the guest's picture.** There are two on this display: the system
+  warps whatever we present from the drawable's `deviceAnchor` to the pose at
+  scanout, and our pass corrects from the guest's render pose to the pose we
+  predict. `ours` stamps the drawable with the DISPLAY pose, which declares our
+  frame already correct and makes the system's warp a no-op, so ours is the
+  whole of it. `system` stamps the drawable with the pose the pixels actually
+  embody (`kl_ovrp_render_pose.pose_tag`, looked back out of a 128-entry ring
+  the frontend fills through `kl_ovrp_set_head_pose_tag`) and leaves our
+  model-view neutral, so the system does the one and only warp — exact, rather
+  than a rotation-only pass over a flat proxy. `system` is validated on Pistol
+  Whip and is a per-port decision: it reshapes the present path, so it is armed
+  per title on a round of its own rather than defaulted for everyone. A tag
+  miss falls back to the display anchor, i.e. to `ours`, and is counted as
+  `anchor misses` above.
+- `KL_GUEST_FPS_DIV=auto` (**pttr's default**, round 22) / `=N` / `=off` —
+  **an EVEN guest cadence.** `kl_app_guest_publish()` is what wakes the guest
+  for one frame, and this gate releases it only on a grid of `N` panel slots,
+  so every guest frame is held the SAME number of slots instead of a ragged
+  mix. Launch #20's evidence, one build, one warp arm: the menu ran 118-120
+  guest fps with every frame held ONE slot and was smooth; gameplay ran 45-60
+  fps with frames held TWO or THREE slots in a ragged mix and jittered, with
+  the frozen pose series' `alternation index` climbing from 0.28-0.46 to
+  1.17-1.59 across the same boundary. Neither warp arm touches that: both
+  correct rotation exactly, and what survives both is the residue that scales
+  with a frame's AGE (the eye quad is a flat proxy at `KL_REPROJECT_DEPTH`, so
+  reprojection has no parallax to give). A constant age reads as latency; an
+  alternating age reads as an image bouncing between two positions. `auto`
+  starts at 1 slot, raises the grid when more than a quarter of a 128-publish
+  window overran it, and lowers again after two windows under 3%; capped at 4.
+  A guest that overruns a grid tick waits for the NEXT one rather than
+  free-running, so holds are always `N`, `2N`, `3N`. A safety valve releases
+  the guest anyway after eight grid periods, so a scene load cannot starve it,
+  and the valve is counted. `=off` is the exact backout. Read it on the
+  present-order census: `holds 1x:.. 2x:.. 3x:..` (one bucket = even) and
+  `pace grid N slots, R released, O overran, V valve`.
+  **This, not `KL_DISPLAY_HZ`, is the pacing knob for Unreal OVRPlugin
+  guests** (released from `ovrp_WaitToBeginFrame` by the same publish): Pinball
+  FX's head-turn jitter was the ragged 1x/2x hold beat at 120 Hz, unchanged by
+  `KL_DISPLAY_HZ`, fove on/off and either warp arm, and cured by `=2`.
 - `KL_IMMERSIVE=0` — the immersive space is the default **for Beat Saber**;
   `=0` restores P4's window-and-report shape, which has to stay takeable because
   it is the measurement that localises a device regression. **For
@@ -2254,6 +4260,12 @@ except its own control vars (next section).
   whole frame as a quad and submits no projection layer at all (JKXR does, every
   frame) this is not a decoration on top of the picture, it IS the picture: with
   it off the display is black and the run is otherwise identical.
+- `KL_HANDS=1` / `KL_HANDS=0` — show / hide the wearer's real upper limbs over
+  the immersive scene (`upperLimbVisibility`). Default is per target too: hidden
+  for a guest that draws its own hands (`own_hands` in kl_app.c's TARGETS —
+  superhot, which models hands and puts guns in them), shown otherwise, which
+  is what visionOS does on its own and what Beat Saber has always had.
+  `KL_HANDS=1` is the A/B for "are the guest's hands where mine are?".
 - `KL_OVERLAYS=1` — put the system's persistent overlays back. Both immersive
   spaces pass `.persistentSystemOverlays(.hidden)` by default: the Home
   indicator and the hand-gesture affordance beneath it are drawn by the system
@@ -2338,12 +4350,57 @@ written down is a value found twice.
 - `KL_PINCH_TRACE=0` — silence the pinch trace, which is **on by default**
   during bring-up: one line every 2 s per hand — closest pinch reached, axis
   value produced, frames asserted, or `no skeleton`. Those four distinguish
-  the four ways "the trigger does not click" can be true.
+  the four ways "the trigger does not click" can be true. It silences the
+  `[cp] grab:` line below with it — the two gestures share a hand and are read
+  in one glance.
+- `KL_GRAB_OPEN=<m>` / `KL_GRAB_CLOSED=<m>` — the same two-point calibration
+  for the **grab**: thumb to MIDDLE fingertip, driving `handTrigger` (the grip
+  — what a Touch controller holds an object with, as opposed to the index
+  trigger, which selects). Defaults 0.05 / 0.03, i.e. the pinch's own numbers,
+  because no device round has measured the two fingers apart yet. The failure
+  to watch for is the middle finger trailing the index into an index pinch and
+  landing inside the grab threshold; the `[cp] grab:` trace reports the closest
+  middle-thumb distance actually reached, which is the number that settles it.
+- `KL_GRAB=0` — no grab gesture; `handTrigger` back to a paired accessory's
+  `Grip` button alone, as it was before. The measurement still runs and the
+  trace still reports, so this is "stop pressing", not "stop looking".
 - `KL_HAPTICS_OFF=1` — do not play the guest's haptics. The pull still runs
   (nothing backs up either way — the queue retires on the clock), so this is
   purely "is the buzzing the guest's, or ours". Playback is CoreHaptics on a
   `GCDeviceHaptics` engine per hand; **hands cannot be vibrated**, so a
   hand-tracked run drains the queue and drops it.
+- `KL_HAPTICS_COOLDOWN=<seconds>` — how long the CoreHaptics path stays down
+  after a bring-up that failed or took longer than 250 ms. Default **5**.
+  Every CoreHaptics call (`createEngine`, `start`, `makePlayer`,
+  `sendParameters`, `stop`) is a synchronous XPC round trip to
+  `com.apple.GameController.gamecontrollerd.haptics`, and when that service is
+  gone each one blocks for a **one second** XPC timeout. Without a cooldown the
+  engine is rebuilt on the very next frame and pays it again. Since round 21
+  all of it runs on `hapticQueue`, never on the frame loop — which is the fix
+  for the class below; the cooldown is what keeps the queue itself from
+  becoming an unbroken run of second-long calls.
+
+  **The class: the compositor watchdog kill.** visionOS kills an immersive app
+  whose `cp_layer_renderer_t` has not submitted a frame for **2.0 seconds**.
+  There is no crash report, no JetsamEvent, no fault report and no scene-phase
+  line — nothing faulted, the process was killed from outside — so the app's
+  own log simply ends. Only the system log names it:
+
+      wakeboardd: killing [<pid>] because it hasn't been sending frames for 2.0s
+      launchd: exit reason (namespace: 40 code: 0x0) - killing application
+               because one of its cp_layer_renderer_t didn't submit a frame
+               for over 2.0 seconds
+
+  and to read that you must collect an archive off the device (USB + root;
+  the UDID is the **lockdown** one, not the CoreDevice id):
+
+      sudo /usr/bin/log collect --device-udid <lockdown-udid> \
+           --start '2026-08-26 13:53:00' --output x.logarchive
+      log show x.logarchive --predicate 'processID == <pid>' --info --debug
+
+  PTTR launch #19 died exactly this way, behind a CoreHaptics call on the frame
+  thread. Any port can: **nothing called from the render loop may block.**
+  `KL_HAPTICS_OFF=1` is the blunt backout for the haptics half of it.
 - `KL_HAPTICS_GAIN=<0..1>` — scales every pulse's intensity. Default **0.25**,
   which is ALVR's own PSVR2 scale (it uses 0.7 for everything else): the Sense
   actuators are strong enough that a guest amplitude of 1.0 played at full
@@ -2393,10 +4450,36 @@ written down is a value found twice.
   ceiling costs memory and per-frame GPU time; the *running* quality is set
   separately by the render loop.
 
+### `Documents/klepton-env.txt` — settings without a rebuild
+
+`<container>/klepton-env.txt`: `NAME=VALUE` per line, `#` comments, read by
+`kl_app_configure` FIRST and applied with overwrite (it wins over the target
+row's `env` and every `setenv(...,0)` default); each line is logged as
+`[env-file]`. Absent = nothing happens. Because configure runs before the
+boot log opens, `kl_app_boot` repeats both into the log (promoted from
+hardbullet 2026-10-09): `[env-file] applied: NAME=VALUE …` (or `(none)`) and
+`[target] <name> env: <row env> (row; an env-file value wins over a row
+entry)` — so a Home View launch's log says what it ran with. Push it between
+launches:
+
+    xcrun devicectl device copy to --device <udid> --domain-type appDataContainer \
+      --domain-identifier <bundle id> --source klepton-env.txt \
+      --destination Documents/klepton-env.txt
+
 ## Wrapper-script control vars (`visionos/run.sh`, `build_run_vpro.sh`)
 
 Read by the scripts themselves, never forwarded to the app.
 
+- `KL_ANGLE_PREBUILT=1` — `run.sh` wraps the ANGLE already in
+  `vendor/out/<slice>` instead of relinking it (the device slice's relink
+  fails on the iOS 27 SDK; for a guest that never draws through ANGLE). Hard
+  fails if the slice is missing.
+- `KLEPTON_SIM_UDID=<udid>` — which booted simulator `run.sh` builds and
+  installs for (default: the first booted one, which may be another
+  session's).
+- `KLEPTON_BUILD_MODE` — exported by `run.sh` to `gen_xcodeproj.py`; with
+  `device`, a row's `device_libs` (targets.py, default empty) narrows the
+  guest libraries the device bundle embeds.
 - `KLEPTON_TARGET=<name>` — which guest to BUILD, read by `visionos/run.sh`,
   `mkguest.sh`, `stage_assets.sh` and `gen_xcodeproj.py` from the one table in
   `visionos/targets.py`. It decides the guest libraries, the APK and asset tree
@@ -2439,6 +4522,14 @@ Read by the scripts themselves, never forwarded to the app.
   for an hour with the right 1.3 GB OBB and a guest asking for 1.28's
   versionCode: the fix was in the build, the file was on the device, and
   nothing re-staged.
+- `KL_NO_LAUNCH=1` — **device only**: build, install and stage, then stop
+  before step 5/5. This is the shape of a first device round here — the tester
+  launches from the Home View *wearing* the headset and reports back, because a
+  `devicectl … process launch` at a device nobody is looking through opens the
+  immersive space against an unworn headset and is not the same run. A knob
+  rather than a hand-run `devicectl device install app`, so the staging step
+  between install and launch is not skipped along with the launch. Not
+  forwarded into the app (it is this script's, not the runtime's).
 - `KL_OBB_DIR=<dir>` — where `stage_assets.sh` finds the guest's OBB, default
   `~/Library/Application Support/Klepton/userdata/<guest>/obb` — the same
   directory a host run reads it from, since it is guest userdata and not part
@@ -2498,6 +4589,16 @@ Read by the scripts themselves, never forwarded to the app.
   outside the process can read them live; the in-window boot report and the
   after-the-fact pull both go empty in exchange, so this is set by the console
   path rather than by hand.
+## Oculus Platform shim (`runtime/kl_ovrplat.c`)
+
+- `ovr_AssetFile_GetList` answers an EMPTY list, `ovr_IAP_GetViewerPurchases`
+  an EMPTY purchase array, `ovr_AssetFile_Status*` a single AssetDetails
+  saying "available" / "not-entitled" with no path (for any name; nothing is
+  read from disk), and the application's own
+  `ovr_Entitlement_GetIsViewerEntitled` yes. `ovr_AssetFile_Download*`,
+  `_DownloadCancel*`, `_Delete*` and every IAP /
+  Purchase / Entitlement query beyond the app's own abort by name. `m_boot`'s
+  DRM guard asserts both directions. There is no knob for any of it.
 
 ## Host environment pass-through
 

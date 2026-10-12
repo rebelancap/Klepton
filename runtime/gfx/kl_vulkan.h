@@ -35,12 +35,25 @@
 #ifndef KL_VULKAN_H
 #define KL_VULKAN_H
 
+#include <stdio.h>   // kl_vulkan_memory_report writes to a FILE *
+
 // The synthetic-library quartet, same shape as kl_egl / kl_ovrp / kl_mediandk.
 // See kl_dl.c's klb_dlopen and kl_can_dlopen for why `claims` exists separately
 // from `dlopen`: an existence check the guest makes on its own behalf has to be
 // answerable without loading anything.
 void *kl_vulkan_dlopen(const char *soname);   // NULL if not one of ours
+// libadrenotools' adrenotools_open_libvulkan, answered with the handle above
+// (the Alyx jailbreak host asks through it). See kl_vulkan.c.
+void *kl_vulkan_adrenotools_open(int dlopen_mode, int feature_flags,
+                                 const char *tmp_lib_dir, const char *hook_lib_dir,
+                                 const char *custom_driver_dir,
+                                 const char *custom_driver_name,
+                                 const char *file_redirect_dir,
+                                 void **user_mapping_handle);
 int   kl_vulkan_claims(const char *soname);   // the same test, without opening
+// t_fove (round G10b): an indirect draw in a SECONDARY refuses the foveated
+// intermediate whose pass executes it. Failed checks, -1 if foveation is off.
+int   kl_vulkan_fove_g10b_selftest(void);
 int   kl_vulkan_is_handle(const void *h);
 void *kl_vulkan_sym(const char *name);        // dlsym semantics: NULL when absent
 
@@ -53,6 +66,24 @@ void *kl_vulkan_lookup(const char *name);
 // reported once, by name, at the point the guest asks — rather than as a NULL
 // symbol somewhere inside Unity's device selection.
 int   kl_vulkan_available(void);
+
+// A glibc/Linux guest (the native Alyx door): list VK_KHR_xcb_surface,
+// VK_KHR_xlib_surface and VK_KHR_wayland_surface in the global extension
+// enumeration and take them off vkCreateInstance's request. Off by default.
+void  kl_vulkan_set_linux_wsi(int on);
+
+// Feature audit of a VkDeviceCreateInfo (phys = VkPhysicalDevice, ci = const
+// VkDeviceCreateInfo *) against MoltenVK's vkGetPhysicalDeviceFeatures2: logs
+// the requested set once per `who`, CLEARS in place every flag MoltenVK does
+// not report (each named), returns how many. klvk_CreateDevice runs it on
+// every create and puts the cleared flags back after MoltenVK answers; a door
+// that must change what the guest's host SEES (the Alyx host samples its EDS3
+// bits before the create reaches us) calls this first, and those stay cleared.
+int   kl_vulkan_feature_audit(void *phys, const void *ci, const char *who);
+
+// The VkDevice an OpenXR session was created with (kl_openxr's xrCreateSession):
+// swapchain images are made on it. Unbound, the first device is used.
+void  kl_vulkan_xr_bind_device(void *vk_device);
 
 // ---------------------------------------------------------------------------
 // The eye-texture seam, for kl_ovrp.c
@@ -123,6 +154,25 @@ void *kl_vulkan_mtl_for_handle(unsigned long long h);
 void *kl_vulkan_layer_mtl_texture(int layer_key, int stage, int eye,
                                   int *w, int *h);
 
+// Application SpaceWarp's motion-vector storage — `ovrp_GetLayerTextureSpaceWarp`.
+//
+// A title that ships with Application SpaceWarp enabled makes the Unity Oculus
+// display provider allocate, per eye-swapchain stage, a MOTION VECTOR colour
+// target and a depth target alongside the eye texture. Nothing on this host
+// consumes them: the compositor reprojects from the eye layer and its own pose
+// history. They exist because the provider treats a failure to create them as a
+// failure to create the eye textures at all
+// (OculusDisplayProvider::CreateMotionVectorTexture returns 1, which
+// CreateEyeTextureStage propagates), and it then tears the whole display down.
+//
+// So this is storage the guest renders into and we never read, and the honest
+// shape for it is the same as the eye images': cached per (stage, eye) so the
+// handle a provider was given stays the handle it holds. `depth` picks the
+// depth-stencil image rather than the colour one; the two live in separate
+// slots and are asked for separately.
+unsigned long long kl_vulkan_spacewarp_image(int stage, int eye,
+                                             unsigned w, unsigned h,
+                                             int layers, int depth);
 // Rename a layer's slot in the image table. kl_ovrp calls this when a guest
 // destroys a layer and sets up an identical one (wrath2's "compiling shaders"
 // toast does it on every text update): the new id inherits the old id's
@@ -152,11 +202,153 @@ void kl_vulkan_capture_layers(void);
 // this one is a CPU stall and what would remove it.
 void kl_vulkan_frame_done(int stage);
 unsigned long long kl_vulkan_frame_serial(void);
+// A frontend whose eye pictures are already proven complete by a fence of its
+// own (kl_openvr's async eye copy) says so here: kl_vulkan_frame_done then
+// skips its queue drain — which on that path would stall the guest on its
+// whole next frame of GPU work — and only advances the serial. 0 restores the
+// drain. KL_VK_FRAME_SYNC=0 still turns the drain off for everyone.
+void kl_vulkan_frame_sync_external(int on);
+
+// The draw census's per-frame distribution over a WINDOW the caller closes —
+// read and clear. Returns 1 when the numbers are real and 0 when the census is
+// off (KL_VK_DRAW_CENSUS=0), in which case every output is zero and the caller
+// must report it as UNAVAILABLE, not as "no draws". `frames` is the number of
+// frame seams the window spanned; 0 means nothing closed inside it and the sum
+// must not be divided by it.
+//
+// It exists for the perturbation test: "does a sub-degree change in the head
+// pose change how many draws the guest records", which the run-long census
+// cannot answer because both halves of the comparison live inside its mean.
+int kl_vulkan_draw_window(unsigned long long *frames, unsigned long long *sum,
+                          unsigned long long *min, unsigned long long *max);
 
 // How many frames have been presented, and how many were written out. The
 // end-of-run report reads these; a run with a healthy frame loop and zero
 // captures is a different bug from one that never presented.
 void  kl_vulkan_stats(unsigned *presented, unsigned *captured);
+
+// One line naming every GPU byte Klepton holds, by kind, beside the whole
+// process's Metal footprint. Printed once a second by the heartbeat and once
+// inside the memory tripwire's dump.
+//
+// It exists because a vm_region walk cannot see GPU memory AT ALL: private
+// Metal storage is charged to phys_footprint in full and mapped into the
+// address space not at all, so the tripwire that fired on Paint the Town Red
+// VR could account for 1.5 GiB of a 6153 MiB process and had nothing to say
+// about the other four and a half. This is that half.
+void  kl_vulkan_memory_report(FILE *f);
+
+// Write the persisted VkPipelineCache now if anything was built since the last
+// save (which the memory report throttles to KL_VK_PIPELINE_CACHE_SECS). The
+// app calls it when the scene goes to the background. No-op without a cache.
+void  kl_vulkan_pipeline_cache_flush(void);
+
+// The GPU half of the memory budget, in bytes — what a memory HEAP is clamped
+// to before the guest is allowed to read its size. Defined whether or not
+// MoltenVK is vendored (it is arithmetic, not Vulkan), so a guard can assert it
+// on a bare checkout. See the definition for the whole argument; the short one
+// is that Unity reads the heap size straight into
+// SystemInfo.graphicsMemorySize, and until round 11 that answered 15737 on a
+// device this runtime had already told the guest was 6144.
+//
+// KL_VK_HEAP_MB overrides it; 0 or absent means "the CPU budget"
+// (kl_mem_budget_bytes).
+unsigned long long kl_vulkan_heap_budget_bytes(void);
+
+// ---------------------------------------------------------------------------
+// The FORMAT seam — what a guest may ask for, and what Metal actually has.
+// ---------------------------------------------------------------------------
+//
+// Launch #11 died on the first punch with a Metal assertion, not a Vulkan
+// error: `MTLTextureDescriptor has invalid pixelFormat (0)` inside
+// MVKImagePlane::initSubresources, reached from the guest's own vkCreateImage.
+// MoltenVK maps every VkFormat to an MTLPixelFormat and a handful of them have
+// no Metal spelling at all on this device — the 24-bit R8G8B8 / B8G8R8 family
+// most of all, which Adreno supports natively and every Quest build is
+// therefore free to use. When the mapping comes back MTLPixelFormatInvalid,
+// MoltenVK does not refuse: it builds a descriptor with pixelFormat 0 and
+// Metal's validation layer aborts the process.
+//
+// Both halves live above the MoltenVK `__has_include` split for the same
+// reason kl_vulkan_heap_budget_bytes does: they are tables, not Vulkan calls,
+// and m_boot has to assert them on a checkout that has never run `make mvk`.
+// Neither decides WHETHER a format is unsupported — that answer comes from
+// MoltenVK itself at runtime (a format it cannot map reports zero features in
+// all three masks). These say only what to reach for once it has.
+
+// "R8G8B8_UNORM" for 23, and so on for every core VkFormat 0..184. Returns a
+// static string; unknown values answer "VkFormat(N)" in a small ring of
+// buffers, so a log line may hold a few at once.
+const char *kl_vulkan_format_name(int fmt);
+
+// The nearest Metal-expressible VkFormat for one Metal cannot express, or 0
+// when there is no sensible replacement (including for every format that is
+// FINE — a mappable format must never be rewritten, so this answers 0 for it).
+//
+// `layout_differs` is set to 1 when the replacement's texels are a different
+// size or a different encoding, which is the whole difficulty: an RGB8 upload
+// packs 3 bytes per texel and an RGBA8 image expects 4, so a
+// vkCmdCopyBufferToImage recorded for the original would read past the end of
+// the guest's staging buffer. It is set to 0 for the substitutions that are
+// byte-safe in practice — the depth/stencil ones, which are attachments and
+// are never the destination of a buffer copy.
+int kl_vulkan_format_substitute(int fmt, int *layout_differs);
+
+// VkImageUsageFlagBits, spelled here so a checkout with no vulkan.h can still
+// assert the last-resort table. These values are frozen in the Vulkan 1.0 core
+// and cannot change.
+#define KL_VK_USAGE_TRANSFER_SRC                0x00000001u
+#define KL_VK_USAGE_TRANSFER_DST                0x00000002u
+#define KL_VK_USAGE_SAMPLED                     0x00000004u
+#define KL_VK_USAGE_STORAGE                     0x00000008u
+#define KL_VK_USAGE_COLOR_ATTACHMENT            0x00000010u
+#define KL_VK_USAGE_DEPTH_STENCIL_ATTACHMENT    0x00000020u
+#define KL_VK_USAGE_TRANSIENT_ATTACHMENT        0x00000040u
+#define KL_VK_USAGE_INPUT_ATTACHMENT            0x00000080u
+
+// What to reach for when a format has no FAMILY to widen inside — chiefly
+// VK_FORMAT_UNDEFINED, which is what Unity's GraphicsFormat table produces
+// when it has decided the format it wanted is unsupported. Chosen by USAGE,
+// because usage is the only description of the image that still means
+// something once the format does not: a depth-stencil attachment answers
+// D32_SFLOAT_S8_UINT (byte-safe), anything sampled or drawn into answers
+// R8G8B8A8_UNORM (texel size differs — nothing can be uploaded into it), and
+// anything else answers 0 and is refused as before.
+//
+// Consulted only behind MoltenVK's own unmappable verdict, and only after
+// kl_vulkan_format_substitute has answered 0.
+int kl_vulkan_format_last_resort(int fmt, unsigned usage, int *layout_differs);
+
+// ---------------------------------------------------------------------------
+// The usage bit that costs a gigabyte — kl_vulkan_lazy_transient_usage()
+// ---------------------------------------------------------------------------
+//
+// A transient attachment is written and consumed inside one render pass and
+// never spilled, so on a tile GPU it costs ZERO bytes. Metal spells that
+// MTLStorageModeMemoryless and MoltenVK exposes it as a LAZILY_ALLOCATED
+// memory type. Launch #16 had one on this device (`memory type 2 ->
+// DEVICE_LOCAL LAZILY_ALLOCATED`) and still put 1757 MiB of eye-size 2x MSAA
+// depth and colour attachments on ordinary DEVICE_LOCAL memory, because
+// MoltenVK never offered the type: it strips the lazily-allocated types unless
+// the usage is EXACTLY transient-and-not-input. Read out of
+// MVKImage::getMemoryRequirements in the vendored xrOS binary:
+//
+//   3db70: and  w9, w9, #0xc0      // usage & (TRANSIENT|INPUT_ATTACHMENT)
+//   3db74: cmp  w9, #0x40          // ...must be TRANSIENT with INPUT clear
+//   3db78: b.eq +0x10              // -> keep the lazily-allocated types
+//   3db7c: ldr  w8, [x8, #0x1708]  // _lazilyAllocatedMemoryTypes
+//   3db80: bic  w8, w10, w8        // -> otherwise take them away
+//
+// Unity's Vulkan backend sets VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT on every URP
+// attachment it creates, whether or not any subpass ever declares one. So this
+// returns the usage to hand MoltenVK: with the input bit dropped where doing so
+// can only change which memory type is offered, and untouched everywhere else.
+//
+// It is dropped ONLY for an image that is transient AND has no usage that reads
+// the texture outside the render pass. SAMPLED, STORAGE and either transfer bit
+// all mean somebody expects the contents to survive, and memoryless storage
+// would hand them a blank texture; those keep the bit and keep their memory.
+unsigned kl_vulkan_lazy_transient_usage(unsigned usage);
 
 // ---------------------------------------------------------------------------
 // The OpenXR seam, for kl_openxr.c — XR_KHR_vulkan_enable

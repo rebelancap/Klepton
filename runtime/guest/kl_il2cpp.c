@@ -1,9 +1,24 @@
-// IL2CPP pc -> managed method name resolver (Unity 2019.4, metadata v24).
+// IL2CPP pc -> managed method name resolver (metadata v24 and v31).
 //
 // Beat Saber 1.28 ships metadata version 24.0 (the layout below was verified
 // against its global-metadata.dat: header counts are *byte* sizes, and the
 // struct sizes fall out of them exactly — Il2CppTypeDefinition 92 B with no
 // rgctx fields, Il2CppMethodDefinition 32 B, Il2CppImageDefinition 40 B).
+//
+// GORN 2 (Unity 2022.3) ships metadata version 31 — verified the same way,
+// against its own global-metadata.dat (2026-08-14): the header's
+// offset/size pair table is unchanged (nothing before Il2CppImageDefinition
+// carries a version gate in any Unity release), Il2CppImageDefinition is
+// byte-identical to v24 (its own version-gated fields, exportedType*/token/
+// customAttribute*, are all already present in both), and only two structs
+// actually move: Il2CppTypeDefinition drops its last v24-era optional
+// 4-byte field (92 -> 88 B; methodStart 40 -> 36, method_count offset
+// 68 -> 64) and Il2CppMethodDefinition gains a new `returnParameterToken`
+// field right after `returnType` (32 -> 36 B; token offset 20 -> 24).
+// Cross-checked against GORN 2's real file two independent ways: every
+// image name decodes as a plausible assembly (`Cortopia.Scripts.Platform`
+// matches the game's own package), and summing method_count across all
+// 18739 type definitions equals methodsSize/36 exactly (134434 both ways).
 //
 // The half Il2CppDumper gets from the binary — which code pointer implements
 // which method — comes from libil2cpp's Il2CppCodeGenModule array:
@@ -35,27 +50,34 @@
 #include <sys/stat.h>
 #include "kl_il2cpp.h"
 
-// ---- global-metadata.dat v24.0 header: (offset, byteCount) pairs ----
+// ---- global-metadata.dat header: (offset, byteCount) pairs ----
 // Pair index p lives at header words [2p],[2p+1]. Only the tables we read.
+// The pair table itself is identical across every version supported here —
+// nothing before Il2CppImageDefinition in the header is version-gated in
+// any Unity release — so these four indices need no per-version variant.
 #define P_STRING      3
 #define P_METHODS     6
 #define P_TYPEDEFS   20
 #define P_IMAGES     21
 
-#define SZ_METHODDEF 32
-#define SZ_TYPEDEF   92
+// Il2CppImageDefinition is also byte-identical between v24 and v31 (see the
+// file comment), so it alone stays a plain #define; the two structs that
+// actually move (TypeDefinition, MethodDefinition) are resolved at init
+// time from the metadata's own version field — see g_sz_*/g_off_* below.
 #define SZ_IMAGEDEF  40
-
-// Field offsets within those structs.
-#define MDEF_NAME    0
-#define MDEF_TOKEN   20
-#define TDEF_NAME    0
-#define TDEF_NS      4
-#define TDEF_METHODSTART 40
-#define TDEF_METHODCOUNT 68
 #define IDEF_NAME    0
 #define IDEF_TYPESTART 8
 #define IDEF_TYPECOUNT 12
+
+#define TDEF_NAME    0
+#define TDEF_NS      4
+#define MDEF_NAME    0
+
+// Per-version struct sizes / field offsets, set once in
+// kl_il2cpp_resolver_init from the metadata header's own version field.
+static uint32_t g_sz_typedef, g_sz_methoddef;
+static uint32_t g_off_methodstart, g_off_methodcount;   // within Il2CppTypeDefinition
+static uint32_t g_off_token;                             // within Il2CppMethodDefinition
 
 static int g_state;   // 0 = not tried, 1 = up, -1 = failed
 
@@ -123,19 +145,26 @@ int kl_il2cpp_resolver_init(kl_image *libil2cpp, const char *metadata_path) {
 
     uint32_t sanity = meta_u32(0);
     int32_t  version = meta_i32(4);
-    if (sanity != 0xFAB11BAF || version != 24) {
+    if (sanity != 0xFAB11BAF || (version != 24 && version != 31)) {
         fprintf(stderr, "  [klepton] il2cpp: metadata sanity %#x version %d — "
-                        "resolver only knows v24\n", sanity, version);
+                        "resolver only knows v24 and v31\n", sanity, version);
         return 0;
+    }
+    if (version == 24) {
+        g_sz_typedef = 92; g_off_methodstart = 40; g_off_methodcount = 68;
+        g_sz_methoddef = 32; g_off_token = 20;
+    } else {   // 31
+        g_sz_typedef = 88; g_off_methodstart = 36; g_off_methodcount = 64;
+        g_sz_methoddef = 36; g_off_token = 24;
     }
     uint32_t m_off = meta_u32(P_METHODS * 8),  m_bytes = meta_u32(P_METHODS * 8 + 4);
     uint32_t t_off = meta_u32(P_TYPEDEFS * 8), t_bytes = meta_u32(P_TYPEDEFS * 8 + 4);
     uint32_t i_off = meta_u32(P_IMAGES * 8),   i_bytes = meta_u32(P_IMAGES * 8 + 4);
     g_str_off = meta_u32(P_STRING * 8);
-    if (m_bytes % SZ_METHODDEF || t_bytes % SZ_TYPEDEF || i_bytes % SZ_IMAGEDEF ||
+    if (m_bytes % g_sz_methoddef || t_bytes % g_sz_typedef || i_bytes % SZ_IMAGEDEF ||
         (uint64_t)i_off + i_bytes > g_meta_len) {
-        fprintf(stderr, "  [klepton] il2cpp: metadata tables do not divide by the "
-                        "v24.0 struct sizes — layout drifted\n");
+        fprintf(stderr, "  [klepton] il2cpp: metadata tables do not divide by v%d's "
+                        "struct sizes — layout drifted\n", version);
         return 0;
     }
     uint32_t n_images = i_bytes / SZ_IMAGEDEF;
@@ -150,7 +179,7 @@ int kl_il2cpp_resolver_init(kl_image *libil2cpp, const char *metadata_path) {
         uint32_t tc = meta_u32(id + IDEF_TYPECOUNT);
         uint32_t n = 0;
         for (uint32_t t = 0; t < tc; t++)
-            n += meta_u16(t_off + (uint64_t)(ts + t) * SZ_TYPEDEF + TDEF_METHODCOUNT);
+            n += meta_u16(t_off + (uint64_t)(ts + t) * g_sz_typedef + g_off_methodcount);
         want[i] = n;
     }
 
@@ -214,15 +243,15 @@ int kl_il2cpp_resolver_init(kl_image *libil2cpp, const char *metadata_path) {
         int32_t ts = meta_i32(id + IDEF_TYPESTART);
         uint32_t tc = meta_u32(id + IDEF_TYPECOUNT);
         for (uint32_t t = 0; t < tc; t++) {
-            uint64_t td = t_off + (uint64_t)(ts + t) * SZ_TYPEDEF;
+            uint64_t td = t_off + (uint64_t)(ts + t) * g_sz_typedef;
             const char *tns  = meta_str(meta_i32(td + TDEF_NS));
             const char *tnm  = meta_str(meta_i32(td + TDEF_NAME));
-            int32_t  ms = meta_i32(td + TDEF_METHODSTART);
-            uint16_t mc = meta_u16(td + TDEF_METHODCOUNT);
+            int32_t  ms = meta_i32(td + g_off_methodstart);
+            uint16_t mc = meta_u16(td + g_off_methodcount);
             for (uint32_t k = 0; k < mc; k++) {
-                uint64_t md = m_off + (uint64_t)(ms + k) * SZ_METHODDEF;
-                if (md + SZ_METHODDEF > m_off_end) continue;
-                uint32_t tok = meta_u32(md + MDEF_TOKEN);
+                uint64_t md = m_off + (uint64_t)(ms + k) * g_sz_methoddef;
+                if (md + g_sz_methoddef > m_off_end) continue;
+                uint32_t tok = meta_u32(md + g_off_token);
                 uint32_t rid = (tok & 0xffffff) - 1;
                 if (rid >= mods[m].count) continue;
                 uint64_t addr; memcpy(&addr, &mods[m].ptrs[rid], 8);
@@ -262,3 +291,10 @@ const char *kl_il2cpp_method_at(const void *pc) {
 }
 
 unsigned kl_il2cpp_method_count(void) { return g_nmethods; }
+
+void kl_il2cpp_methods_each(void (*cb)(uint64_t addr, const char *name, void *ctx),
+                            void *ctx) {
+    if (g_state != 1 || !cb) return;
+    for (unsigned i = 0; i < g_nmethods; i++)
+        cb(g_methods[i].addr, g_methods[i].name, ctx);
+}

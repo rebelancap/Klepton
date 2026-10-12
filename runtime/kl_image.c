@@ -19,12 +19,15 @@
 #include <mach/vm_map.h>
 #include <dlfcn.h>
 #include <limits.h>
+#include <dirent.h>
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <mach-o/loader.h>
 #include "klepton.h"
 #include "kl_x18.h"
 #include "kl_guestpatch.h"
+#include "kl_tls.h"
+#include "kl_glibc.h"      // kl_glibc_lookup_native: a glibc image's first answer
 
 
 // ---------- ELF64 subset ----------
@@ -43,9 +46,35 @@ typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offse
 #define SHT_PROGBITS  1
 #define SHT_DYNSYM    11
 #define SHF_EXECINSTR 0x4
+#define SHF_WRITE     0x1
+#define SHF_ALLOC     0x2
 #define SHT_NOBITS 8
+// The image behind an executable chunk, for the `br x18` jump-table rewrite —
+// see kl_x18_image in kl_x18.h. `bias` turns a MAPPED address back into the
+// ELF's own VA, because at load time the addresses handed to the veneer pass are
+// the mapping's own.
+struct x18_img_ctx { const Elf64_Shdr *sh; int shnum; uint64_t bias; };
+
+// Read-only ALLOC data only. Executable would let a mis-recognition write over
+// code; writable (.data.rel.ro) is rewritten by relocations at load, which would
+// undo the repointing silently. A jump table is in .rodata.
+static void *x18_img_data_at(void *vctx, uint64_t va, size_t len) {
+    struct x18_img_ctx *c = vctx;
+    uint64_t gva = va - c->bias;
+    for (int i = 0; i < c->shnum; i++) {
+        const Elf64_Shdr *s = &c->sh[i];
+        if (s->sh_type != SHT_PROGBITS) continue;
+        if (s->sh_flags & (SHF_EXECINSTR | SHF_WRITE)) continue;
+        if (!(s->sh_flags & SHF_ALLOC) || !s->sh_addr) continue;
+        if (gva < s->sh_addr || gva + len > s->sh_addr + s->sh_size) continue;
+        return (void *)(uintptr_t)va;      // the mapping is contiguous from `lo`
+    }
+    return NULL;
+}
+
 #define PT_LOAD 1
 #define PT_DYNAMIC 2
+#define PT_TLS 7
 #define PT_GNU_RELRO 0x6474e552
 #define PF_X 1
 #define PF_W 2
@@ -57,37 +86,71 @@ typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offse
 #define DT_SYMTAB 6
 #define DT_RELA 7
 #define DT_RELASZ 8
+// Android's packed relocations. The NDK links most modern .so files with
+// `--pack-dyn-relocs=android`, which REPLACES DT_RELA/DT_RELASZ with an
+// sleb128-compressed stream under these two tags. An image that carries them
+// has no DT_RELA at all, so a loader that only knows DT_RELA relocates NOTHING
+// and says nothing — see decode_android_relocs() for what that cost.
+#define DT_ANDROID_RELA   0x60000011
+#define DT_ANDROID_RELASZ 0x60000012
+// The other compressed form, RELR — a bitmap of R_AARCH64_RELATIVE sites and
+// nothing else, which is why it can hold a library's entire relative-relocation
+// population in a few hundred bytes.
+//
+// TWO NUMBERINGS, and knowing only one of them is worth a whole round. RELR was
+// shipped by Android under DT_ANDROID_RELR (0x6fffe000) before it was
+// standardised as DT_RELR (36), and the NDK still emits the Android numbers.
+// The avatar libraries here carry 0x6fffe000/1/3 — so a loader that knew the
+// standard tags alone saw NO relative relocations at all, said nothing (there
+// was no tag it recognised to refuse), and called a DT_INIT_ARRAY entry that
+// was still a link-time vaddr: `signal 11 at 0x805338`. Round 27 added the
+// refusal for the standard tags and hit exactly that crash through the ones
+// below, which is what named them.
+#define DT_RELR   0x24
+#define DT_RELRSZ 0x23
+#define DT_RELRENT 0x25
+#define DT_ANDROID_RELR    0x6fffe000
+#define DT_ANDROID_RELRSZ  0x6fffe001
+#define DT_ANDROID_RELRENT 0x6fffe003
+#define DT_INIT       12
+#define DT_SYMBOLIC   16
+#define DT_FLAGS      30
+#define DF_SYMBOLIC   0x2
 #define DT_INIT_ARRAY 25
 #define DT_FINI_ARRAY 26
 #define DT_INIT_ARRAYSZ 27
 #define DT_FINI_ARRAYSZ 28
 #define DT_JMPREL 23
 #define DT_PLTRELSZ 2
-// Relative-relocation tables this loader must also honour. A library built by a
-// current NDK ships NONE of its relative relocs in DT_RELA: they are packed into
-// RELR (a bitmap) or Android's APS2 stream, and DT_RELA carries only the handful
-// that need a symbol. Miss these and every relative pointer — vtables, GOT, and
-// fatally the .init_array function pointers — keeps its raw link-time offset;
-// the first constructor call then jumps to that offset and AMFI kills the
-// process (CODESIGNING, "Invalid Page"). libmrutilitykitshared (olar) is the
-// first guest to use them: 6962 relocs in RELR (all 29 init_array slots) plus 15
-// in APS2. RELR has both the standardised tags and the older Android-range ones
-// bionic still emits; a library uses one spelling or the other.
-#define DT_RELR    0x24
-#define DT_RELRSZ  0x23
-#define DT_RELRENT 0x25
-#define DT_ANDROID_RELR    0x6fffe000
-#define DT_ANDROID_RELRSZ  0x6fffe001
-#define DT_ANDROID_RELRENT 0x6fffe003
-#define DT_ANDROID_RELA    0x60000011
-#define DT_ANDROID_RELASZ  0x60000012
 #define ELF64_R_SYM(i)  ((uint32_t)((i) >> 32))
 #define ELF64_R_TYPE(i) ((uint32_t)(i))
 #define R_AARCH64_ABS64      257
 #define R_AARCH64_GLOB_DAT  1025
 #define R_AARCH64_JUMP_SLOT 1026
 #define R_AARCH64_RELATIVE  1027
+// A 16-byte TLS descriptor: word 0 the resolver, word 1 its argument. Served by
+// runtime/kl_tls.c — see kl_tls.h for how it maps onto S0.1's TLS model.
+#define R_AARCH64_TLSDESC   1031
+// A constant offset from the thread pointer into the image's STATIC TLS block
+// (initial-exec code). Served by kl_tls_static_block — see kl_tls.h.
+#define R_AARCH64_TLS_TPREL64 1030
+#define STB_LOCAL 0
 #define STB_WEAK 2
+#define STV_PROTECTED 3
+// glibc's "one definition process-wide" binding (libstdc++'s inline statics,
+// 106 of them; libphonon 9). Bound like STB_GLOBAL, except that in glibc mode a
+// DEFINED one still binds to the first definition in load order.
+#define STB_GNU_UNIQUE 10
+#define DT_SONAME   14
+#define DT_RPATH    15
+#define DT_RUNPATH  29
+// The GNU hash table, and the reason it is read at all: it is the ONLY symbol
+// table index in 131 of the Alyx payload's 133 ELFs (no DT_HASH), and without
+// one there is no honest .dynsym count — see gnu_hash_nsyms.
+#define DT_GNU_HASH 0x6ffffef5
+#define DT_VERSYM   0x6ffffff0
+#define DT_VERNEED    0x6ffffffe
+#define DT_VERNEEDNUM 0x6fffffff
 
 struct kl_image {
     uint8_t   *base;        // ELF vaddr V lives at base + V (V relative to the
@@ -101,11 +164,17 @@ struct kl_image {
     // The x18 veneer pool, reserved on the end of the same mapping so it is
     // within `b`'s reach of the code by construction. munmap frees both.
     size_t     x18_arena_size;
+    // ...and a same-sized second pool BEFORE the image, for the code the end
+    // pool cannot reach in a library wider than one b window. munmap covers
+    // it: the mapping starts this many bytes before base - map_off.
+    size_t     x18_pre_arena_size;
     Elf64_Sym *symtab;
     size_t     nsyms;       // from DT_HASH's nchain; 0 if the image had none
     const char *strtab;
     void     (**init_array)(void);
     size_t     init_count;
+    void      (*init_fn)(void);      // DT_INIT (glibc images run it before the array)
+    int        symbolic;             // DT_SYMBOLIC / DF_SYMBOLIC: own definitions first
     kl_stats   stats;
     char       path[512];
     const char **missing;      // unique unresolved import names
@@ -114,6 +183,28 @@ struct kl_image {
     unsigned    weak_n, weak_cap;
     void       *dl_handle;     // set when the image arrived as a translated
                                // Mach-O dylib; then dyld owns the mapping
+    // PT_TLS, read before the relocations so a TLSDESC can be served. `tlsmod`
+    // is registered lazily on the first TLSDESC — an image with a PT_TLS and no
+    // TLSDESC (most of them) costs nothing.
+    const void *tls_init;
+    uint64_t    tls_filesz, tls_memsz, tls_align;
+    int         has_tls;
+    kl_tlsmod  *tlsmod;
+    int64_t     stls_off;      // TPREL64's static block: its TP offset, 0 = none
+    // DT_GNU_HASH (kl_sym's index when present) and DT_VERSYM (glibc mode skips
+    // the hidden, non-default versions a versioned library carries beside the
+    // default one under the same name).
+    const uint32_t *gnu_hash;
+    const uint16_t *versym;
+    const uint8_t  *verneed;   // DT_VERNEED: which FILE each version index names
+    unsigned        verneednum;
+    int             bound;     // relocations applied (kl_map_dylib_unbound: not yet)
+    // A GLIBC image (the Alyx payload): imports resolve in glibc's order — the
+    // personality first — rather than bionic's. See sym_value_glibc.
+    int         glibc;
+    const char *soname;        // DT_SONAME, or NULL
+    const char *needed[48];    // DT_NEEDED, in order (into strtab)
+    unsigned    nneeded;
 };
 
 static void record_missing(kl_image *img, const char *nm) {
@@ -286,7 +377,17 @@ static void *unresolved_stub(const char *nm) {
     return kl_named_stub(nm, (void *)kl_unresolved_named);
 }
 
-static char g_err[512];
+// 4 KB, because one of the messages that lands here is dyld's, and dyld's is
+// not a sentence. A failed `dlopen` of a bundled framework reports the full
+// absolute path THREE times — once in our own prefix, once in dyld's echo of
+// the request, once per entry of the "tried: ... (reason)" search list — and on
+// the simulator every one of those paths carries a
+// /Users/.../CoreSimulator/Devices/<uuid>/data/Containers/Bundle/Application/
+// <uuid>/ prefix of ~200 characters. At 512 the message was cut off inside the
+// FIRST tried-path, so the run reported that libUE4 failed to load and threw
+// away the only half of the line that said why. The buffer is static and there
+// is exactly one, so the cost is 3.5 KB of bss against a diagnosis.
+static char g_err[4096];
 static void err(const char *fmt, ...) {
     va_list a; va_start(a, fmt); vsnprintf(g_err, sizeof g_err, fmt, a); va_end(a);
 }
@@ -355,6 +456,19 @@ static void rewrite_tls(uint8_t *p, size_t n, uint64_t va, const char *path,
             }
             w[i] |= 0x20u;
             st->tls_rewrites++;
+        } else if ((w[i] & 0xffffffe0u) == 0xd51bd040u && !kl_x18_is_data(w, n, i)) {
+            // `msr tpidr_el0, xN` -> `nop`. The guest's thread pointer is
+            // TPIDRRO_EL0 here (the read rewrite above), which user code cannot
+            // write; TPIDR_EL0 is Darwin's, and libmalloc reads its low byte as
+            // the CPU number for per-CPU zone state. The Alyx jailbreak host
+            // saves the "thread pointer" around every call into its guest and
+            // writes it back (479 sites) — the TSD base, into Darwin's CPU
+            // register — and the next xzone malloc indexed its per-CPU table
+            // with a pointer's low byte and faulted forever. A guest cannot
+            // switch its thread pointer on Darwin at all, so the write is
+            // dropped rather than performed wrongly.
+            w[i] = 0xd503201fu;
+            st->tp_writes++;
         } else if (w[i] == 0xd4000001u) { st->svc_sites++; }    // svc #0 — report only
     }
 }
@@ -363,11 +477,39 @@ static void rewrite_tls(uint8_t *p, size_t n, uint64_t va, const char *path,
 // Registered interposers, consulted for defined and undefined symbols alike.
 // Small and fixed: this is an instrument, and a table that has to grow is a sign
 // the question being asked wants a different tool.
-static struct { const char *name; void *fn; } g_interpose[8];
+//
+// It grew anyway, and the way it grew is the reason this now complains. The
+// SHAR interior probe alone installs nine rows (Render, three InteriorManager
+// entry points, rReleasePrintf, Place, Remove, MarkCameraVisible,
+// IsSphereInCone); against the old bound of eight, the NINTH was dropped on the
+// floor without a word, and the row that lost was whichever was registered
+// last. That is the worst possible failure for an instrument: the build looks
+// installed, the log looks normal, and one hook — round 27 nearly shipped with
+// IsSphereInCone as the casualty, taking round 24's force-accept and the whole
+// wall census with it — is simply not there. Sixteen rows, and a refusal that
+// says so.
+// 14 rows are live on the simpsons target as of round 37 (the SHAR interior,
+// streaming and radar probes plus kl_slink's two). The refusal below is loud
+// but it is still a dropped hook, and a dropped hook on a REPLACING
+// interposer silently changes behaviour — so the headroom is worth its 128
+// bytes.
+// hla needs 26 as of round 5 (its loader serving, locale boundary, guards,
+// the device-create audit and the guest-exit door) — 32. The native hla build
+// carries the door's name interposes over (V8 flags, LuaJIT's mmap, the Valve
+// log tap's spew names) on top of its own — 64.
+#define KL_INTERPOSE_MAX 64
+static struct { const char *name; void *fn; } g_interpose[KL_INTERPOSE_MAX];
 static unsigned g_interpose_n;
 
 void kl_interpose(const char *name, void *fn) {
-    if (!name || !fn || g_interpose_n >= 8) return;
+    if (!name || !fn) return;
+    if (g_interpose_n >= KL_INTERPOSE_MAX) {
+        fprintf(stderr, "  [klepton] interpose table FULL (%d rows) — \"%s\" is "
+                        "NOT installed and its hook will never run. Raise "
+                        "KL_INTERPOSE_MAX or install fewer probes.\n",
+                KL_INTERPOSE_MAX, name);
+        return;
+    }
     g_interpose[g_interpose_n].name = name;
     g_interpose[g_interpose_n].fn = fn;
     g_interpose_n++;
@@ -391,6 +533,124 @@ static uint64_t sym_value(kl_image *img, uint32_t idx, const char **name_out) {
     return (uint64_t)(uintptr_t)ext;      // 0 if unresolved
 }
 
+// ---------- glibc mode ----------
+// A GLIBC image (Valve's Alyx payload, linked by this loader with no host) binds
+// in the order a glibc process would, with the personality standing where
+// Valve's libc.so.6 would have been:
+//
+//   1. the personality (kl_glibc_lookup_native) — libc.so.6 / libm.so.6 /
+//      ld-linux. FIRST, ahead of every image, and that is load-bearing for one
+//      family above all: `hlvr`'s first DT_NEEDED is libmimalloc.so, which
+//      exports malloc/free/calloc/realloc/memalign/posix_memalign/strdup... A
+//      search that met libmimalloc before the personality would bind half the
+//      process to mimalloc's heap and the other half (everything the bionic
+//      table allocates for the guest — strdup, getline, fopen's buffers) to
+//      Darwin's, and the first cross free is heap corruption (round 5's
+//      fontconfig abort under the host was exactly that). NATIVE-PORT.md R6.
+//   2. interposes (kl_interpose) — the instrument, as for any image.
+//   3. the other GLIBC images, in load order (first definition wins);
+//   4. the kept BIONIC images (libalyxsdlcore, libalyxgnsbackend,
+//      libc++_shared), after every glibc one: libc++_shared exports the same
+//      __cxa_* / _Unwind_* names libstdc++ does, and a glibc image must get
+//      libstdc++'s;
+//   5. a replaced soname's runtime module (kl_glibc_claim_sym: libvulkan.so.1
+//      -> kl_vulkan, libopenxr_loader.so -> kl_openxr), only for an image that
+//      NEEDS that soname;
+//   6. unresolved: a named stub, as everywhere.
+//
+// NOT the bionic shim table directly: a name the personality does not list is
+// a name whose glibc ABI nobody has checked, and binding it to bionic's answer
+// would be a silent wrong rather than a named gap. The personality's GL_SAME
+// rows are how a name opts in to bionic's answer.
+//
+// `provider` (when non-NULL) says which step answered: "glibc", "interpose",
+// a provider image's soname, the claiming module's label, or NULL for
+// unresolved.
+static kl_bind_observer g_bind_observer;
+void kl_set_bind_observer(kl_bind_observer fn) { g_bind_observer = fn; }
+
+// The lookup scope for a glibc image's name: by default every registered glibc
+// image in load order (one global scope — the A1 sweep); the native door
+// installs ld.so's real one (the global scope, then the image's own dlopen
+// group) with kl_set_glibc_scope.
+static kl_glibc_scope_fn      g_glibc_scope;
+static kl_glibc_unresolved_fn g_glibc_unresolved;
+void kl_set_glibc_scope(kl_glibc_scope_fn fn) { g_glibc_scope = fn; }
+void kl_set_glibc_unresolved(kl_glibc_unresolved_fn fn) { g_glibc_unresolved = fn; }
+static void *glibc_scope(kl_image *img, const char *nm, const char **who) {
+    return g_glibc_scope ? g_glibc_scope(img, nm, who) : kl_guest_sym_ordered(nm, 1, who);
+}
+
+void *kl_interpose_lookup(const char *name) {
+    for (unsigned i = 0; name && i < g_interpose_n; i++)
+        if (!strcmp(name, g_interpose[i].name)) return g_interpose[i].fn;
+    return NULL;
+}
+
+static uint64_t sym_value_glibc(kl_image *img, uint32_t idx, const char **name_out,
+                                const char **provider) {
+    const Elf64_Sym *s = &img->symtab[idx];
+    const char *nm = img->strtab + s->st_name;
+    const char *who = NULL;
+    void *v = NULL;
+    if (name_out) *name_out = nm;
+    if (s->st_shndx != 0) {
+        // Defined here. Interposes still apply (the instrument), and a GNU
+        // unique symbol binds to the first definition anywhere — that is its
+        // whole meaning: libstdc++'s inline statics must be ONE object.
+        for (unsigned i = 0; i < g_interpose_n; i++)
+            if (!strcmp(nm, g_interpose[i].name)) {
+                if (provider) *provider = "interpose";
+                return (uint64_t)(uintptr_t)g_interpose[i].fn;
+            }
+        void *own = img->base + s->st_value;
+        if ((s->st_info >> 4) == STB_GNU_UNIQUE) {
+            v = glibc_scope(img, nm, &who);
+            if (v) {
+                if (v != own) img->stats.unique_shared++;
+                if (provider) *provider = who;
+                return (uint64_t)(uintptr_t)v;
+            }
+        }
+        // SYMBOL PREEMPTION, as ld.so does it: a reference through the GOT to a
+        // default-visibility global the image itself defines binds to the
+        // FIRST definition in the lookup scope, not to the image's own copy —
+        // unless the image was linked -Bsymbolic (DT_SYMBOLIC / DF_SYMBOLIC:
+        // the ffmpeg family, pango, libsteam_api) or the symbol is protected.
+        // The personality stands first here for the same reason it does for
+        // an import (NATIVE-PORT.md R6): the only payload image defining a
+        // name the personality answers is libmimalloc (its malloc family), and
+        // its own GOT references then meet the same heap as every caller's.
+        if (!img->symbolic && (s->st_other & 3) != STV_PROTECTED
+            && (s->st_info >> 4) != STB_LOCAL) {
+            if ((v = kl_glibc_lookup_native(nm))) who = "glibc";
+            else if ((v = glibc_scope(img, nm, &who)) == own) v = NULL;
+            if (v) {
+                img->stats.preempted++;
+                if (provider) *provider = who;
+                return (uint64_t)(uintptr_t)v;
+            }
+        }
+        if (provider) *provider = "self";
+        return (uint64_t)(uintptr_t)own;
+    }
+    if ((v = kl_glibc_lookup_native(nm))) { who = "glibc"; goto out; }
+    for (unsigned i = 0; i < g_interpose_n; i++)
+        if (!strcmp(nm, g_interpose[i].name)) { v = g_interpose[i].fn; who = "interpose"; goto out; }
+    if ((v = glibc_scope(img, nm, &who))) goto out;
+    if ((v = kl_guest_sym_ordered(nm, 0, &who))) goto out;
+    for (unsigned i = 0; i < img->nneeded; i++)
+        if ((v = kl_glibc_claim_sym(img->needed[i], nm, &who))) goto out;
+    // Nothing answers a STRONG import: the native door's named stand-ins (a
+    // replaced module not written yet, a library the payload does not carry).
+    if ((s->st_info >> 4) != STB_WEAK && g_glibc_unresolved
+        && (v = g_glibc_unresolved(img, nm, &who))) goto out;
+    who = NULL;
+out:
+    if (provider) *provider = who;
+    return (uint64_t)(uintptr_t)v;
+}
+
 static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
     for (size_t i = 0; i < count; i++, r++) {
         uint64_t *slot = (uint64_t *)(img->base + r->r_offset);
@@ -405,7 +665,14 @@ static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
         case R_AARCH64_ABS64:
         case R_AARCH64_GLOB_DAT:
         case R_AARCH64_JUMP_SLOT: {
-            uint64_t v = sym_value(img, sidx, &nm);
+            const char *prov = NULL;
+            uint64_t v = img->glibc ? sym_value_glibc(img, sidx, &nm, &prov)
+                                    : sym_value(img, sidx, &nm);
+            // Every import, and every definition that preemption bound elsewhere.
+            if (img->glibc && g_bind_observer
+                && (img->symtab[sidx].st_shndx == 0 || (prov && strcmp(prov, "self"))))
+                g_bind_observer(img, nm, prov, v,
+                                (img->symtab[sidx].st_info >> 4) == STB_WEAK);
             if (sidx == 0) {
                 // STN_UNDEF: a GLOB_DAT/ABS64 against symbol 0 resolves to 0
                 // (plus addend) per the ELF spec, exactly as bionic does — it is
@@ -442,6 +709,93 @@ static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
             else img->stats.jump_slot++;
             break;
         }
+        case R_AARCH64_TLSDESC: {
+            // The relocation covers a 16-byte descriptor: we own both words, and
+            // the addend is the variable's offset inside the DEFINING module's
+            // TLS block. Every one seen so far is sym 0 — a C++ `thread_local`
+            // with internal linkage — and a symbol that IS named must still be
+            // defined here, because a block belonging to another module is a
+            // different question (whose PT_TLS? loaded when?) and answering it
+            // by guessing would put a live thread's variable at someone else's
+            // address. Refuse that out loud instead.
+            uint64_t off = (uint64_t)r->r_addend;
+            if (sidx) {
+                if (img->symtab[sidx].st_shndx == 0) {
+                    err("TLSDESC against undefined symbol '%s' at %#llx — "
+                        "cross-module TLS is not served",
+                        img->strtab + img->symtab[sidx].st_name,
+                        (unsigned long long)r->r_offset);
+                    return -1;
+                }
+                off += img->symtab[sidx].st_value;
+            }
+            if (!img->has_tls) {
+                err("TLSDESC at %#llx but the image has no PT_TLS",
+                    (unsigned long long)r->r_offset);
+                return -1;
+            }
+            if (off >= img->tls_memsz) {
+                err("TLSDESC at %#llx wants offset %#llx of a %#llx-byte TLS block",
+                    (unsigned long long)r->r_offset, (unsigned long long)off,
+                    (unsigned long long)img->tls_memsz);
+                return -1;
+            }
+            if (!img->tlsmod) {
+                img->tlsmod = kl_tls_register(img->path, img->tls_init,
+                                              img->tls_filesz, img->tls_memsz,
+                                              img->tls_align);
+                // A descriptor whose resolver cannot find its per-thread slot
+                // resolves to a WRONG address, not to nothing — so a failed
+                // registration fails the load.
+                if (!img->tlsmod) { err("TLSDESC needs per-thread TLS and it is unavailable"); return -1; }
+            }
+            kl_tlsdesc_arg *a = calloc(1, sizeof *a);   // lives as long as the image
+            if (!a) { err("out of memory for a TLS descriptor"); return -1; }
+            a->mod = img->tlsmod;
+            a->off = off;
+            slot[0] = (uint64_t)(uintptr_t)&kl_tlsdesc_resolver;
+            slot[1] = (uint64_t)(uintptr_t)a;
+            img->stats.tlsdesc++;
+            break;
+        }
+        case R_AARCH64_TLS_TPREL64: {
+            // The image's own static TLS, at a constant TP offset: the block's
+            // home is a run of TSD slots (kl_tls_static_block), and the slot
+            // gets that home's offset plus the variable's. Like TLSDESC, a
+            // NAMED symbol must be this image's own — another module's static
+            // block is not served, and guessing would alias a live variable.
+            uint64_t off = (uint64_t)r->r_addend;
+            if (sidx) {
+                if (img->symtab[sidx].st_shndx == 0) {
+                    err("TPREL64 against undefined symbol '%s' at %#llx — another "
+                        "module's static TLS is not served",
+                        img->strtab + img->symtab[sidx].st_name,
+                        (unsigned long long)r->r_offset);
+                    return -1;
+                }
+                off += img->symtab[sidx].st_value;
+            }
+            if (!img->has_tls || off >= img->tls_memsz) {
+                err("TPREL64 at %#llx wants offset %#llx of a %#llx-byte TLS block",
+                    (unsigned long long)r->r_offset, (unsigned long long)off,
+                    (unsigned long long)img->tls_memsz);
+                return -1;
+            }
+            if (!img->stls_off) {
+                img->stls_off = kl_tls_static_block(img->path, img->tls_init,
+                                                    img->tls_filesz, img->tls_memsz,
+                                                    img->tls_align);
+                if (img->stls_off <= 0) {
+                    img->stls_off = 0;
+                    err("TPREL64 needs a static TLS block and none could be placed");
+                    return -1;
+                }
+                kl_thread_init_hook(kl_tls_static_seed);   // every later guest thread
+            }
+            *slot = (uint64_t)img->stls_off + off;
+            img->stats.tprel++;
+            break;
+        }
         default:
             err("unhandled relocation type %u at %#llx", type, (unsigned long long)r->r_offset);
             return -1;
@@ -450,75 +804,129 @@ static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
     return 0;
 }
 
-// RELR: a bitmap-packed table of nothing but R_AARCH64_RELATIVE relocations. An
-// even entry is an address to relocate and seeds `where` for the bitmaps after
-// it; an odd entry is a bitmap whose set bits (from bit 1) relocate the 63 words
-// starting at `where`. Every relocated slot holds a link-time offset that the
-// load bias (img->base, since lo is 0 for every guest here) is added to — the
-// same adjustment R_AARCH64_RELATIVE makes, which is why none of this needs a
-// symbol. This is where a current NDK puts the .init_array pointers.
-static void apply_relr(kl_image *img, const uint64_t *relr, size_t count) {
-    const uintptr_t bias = (uintptr_t)img->base;
+// ---------- RELR ----------
+// Every entry is a 64-bit word. An EVEN word is an address: relocate there, and
+// remember it as the place the next bitmap starts from. An ODD word is a
+// bitmap of the next 63 words after that place — bit 1 is the first of them —
+// after which the place advances by 63 words. Every site is an implicit
+// R_AARCH64_RELATIVE: *p += load bias. Nothing else can be encoded this way,
+// which is why the format needs no type field.
+static int apply_relr(kl_image *img, const uint64_t *entries, size_t count) {
     uint64_t *where = NULL;
     for (size_t i = 0; i < count; i++) {
-        uint64_t e = relr[i];
+        uint64_t e = entries[i];
         if ((e & 1) == 0) {
-            where = (uint64_t *)(bias + (uintptr_t)e);
-            *where++ += bias;
+            where = (uint64_t *)(img->base + e);
+            *where++ += (uint64_t)(uintptr_t)img->base;
             img->stats.relative++;
         } else {
-            uint64_t bits = e >> 1;
-            for (uint64_t *w = where; bits; bits >>= 1, w++)
-                if (bits & 1) { *w += bias; img->stats.relative++; }
+            if (!where) { err("RELR bitmap with no preceding address entry"); return -1; }
+            uint64_t *p = where;
+            for (e >>= 1; e; e >>= 1, p++)
+                if (e & 1) { *p += (uint64_t)(uintptr_t)img->base; img->stats.relative++; }
             where += 63;
         }
     }
+    return 0;
 }
 
-static int64_t read_sleb128(const uint8_t **pp, const uint8_t *end) {
-    int64_t r = 0; int shift = 0; uint8_t b = 0;
-    const uint8_t *p = *pp;
-    do {
-        if (p >= end) break;
-        b = *p++;
-        r |= (int64_t)(b & 0x7f) << shift;
+// ---------- Android packed relocations (APS2) ----------
+//
+// WHY THIS EXISTS, because "the loader was missing a relocation format" is the
+// kind of gap that reads as trivia until you see what it cost.
+//
+// Eleven Table Tennis' avatar selection screen could not be passed: NEXT did
+// nothing, forever. The chain ends here. `libovrbody.so` — the Meta Avatar
+// SDK's native half — is linked with `--pack-dyn-relocs=android`, so it carries
+// DT_ANDROID_RELA instead of DT_RELA. bind_dynamic() looked for DT_RELA, found
+// none, applied ZERO relocations and returned success; the first DT_INIT_ARRAY
+// entry was then an unrebased ELF vaddr, and calling it jumped to 0x805338 and
+// took the process. So the library was left out of the staged set, which left
+// `OvrAvatarManager.initialized:False`, which left the panel's preview avatar
+// never created, which is the null its unmount dereferences. Four layers, one
+// missing decoder. (ETT STATUS.md round 27.)
+//
+// THE FORMAT, as bionic writes and reads it: the magic "APS2", then a stream of
+// signed LEB128 values — relocation count, initial r_offset, then groups of
+// { size, flags, [offset delta], [r_info], [addend] } where the flags say which
+// of the three fields is shared by the whole group and which repeats per entry.
+// r_offset and r_addend are CUMULATIVE across the whole stream; r_info is not.
+// A grouped addend is added once per entry, not once per group.
+#define APS2_GROUPED_BY_INFO         1
+#define APS2_GROUPED_BY_OFFSET_DELTA 2
+#define APS2_GROUPED_BY_ADDEND       4
+#define APS2_GROUP_HAS_ADDEND        8
+
+// One signed LEB128, advancing *p. `end` bounds the read so a truncated or
+// mis-pointed stream stops rather than walking off the mapping.
+static int64_t sleb128(const uint8_t **p, const uint8_t *end) {
+    int64_t  v = 0;
+    unsigned shift = 0;
+    uint8_t  b = 0;
+    while (*p < end) {
+        b = *(*p)++;
+        v |= (int64_t)(b & 0x7f) << shift;
         shift += 7;
-    } while (b & 0x80);
-    if (shift < 64 && (b & 0x40)) r |= -((int64_t)1 << shift);
-    *pp = p;
-    return r;
+        if (!(b & 0x80)) break;
+    }
+    if (shift < 64 && (b & 0x40)) v |= -((int64_t)1 << shift);   // sign-extend
+    return v;
 }
 
-// APS2 (Android packed relocations): a group-compressed stream of RELA entries.
-// Each is decoded back to (r_offset, r_info, r_addend) and handed to apply_relocs
-// one at a time, so a packed RELATIVE / GLOB_DAT / ABS64 / symbol-0 entry is
-// treated exactly as the same entry would be in a plain DT_RELA table. The four
-// group flags say which fields are shared across the group vs. read per-entry.
-static int apply_android_packed(kl_image *img, const uint8_t *blob, size_t sz) {
-    const uint8_t *p = blob, *end = blob + sz;
-    if (sz < 4 || memcmp(p, "APS2", 4) != 0) { err("DT_ANDROID_RELA not APS2"); return -1; }
+// Expand a DT_ANDROID_RELA blob into a plain Elf64_Rela array. Returns the
+// array (caller frees) and writes the count; NULL on a malformed stream.
+static Elf64_Rela *decode_android_relocs(const uint8_t *blob, size_t size, size_t *count_out) {
+    const uint8_t *p = blob, *end = blob + size;
+    if (size < 4 || p[0] != 'A' || p[1] != 'P' || p[2] != 'S' || p[3] != '2') {
+        err("DT_ANDROID_RELA blob is not APS2 (magic %02x%02x%02x%02x)",
+            size > 0 ? blob[0] : 0, size > 1 ? blob[1] : 0,
+            size > 2 ? blob[2] : 0, size > 3 ? blob[3] : 0);
+        return NULL;
+    }
     p += 4;
-    int64_t count  = read_sleb128(&p, end);
-    int64_t offset = read_sleb128(&p, end);
-    int64_t info = 0, addend = 0;
-    enum { GRP_BY_INFO = 1, GRP_BY_OFF_DELTA = 2, GRP_BY_ADDEND = 4, GRP_HAS_ADDEND = 8 };
-    while (count > 0) {
-        int64_t gsz = read_sleb128(&p, end);
-        int64_t gf  = read_sleb128(&p, end);
-        int64_t goff_delta = (gf & GRP_BY_OFF_DELTA) ? read_sleb128(&p, end) : 0;
-        if (gf & GRP_BY_INFO) info = read_sleb128(&p, end);
-        if ((gf & GRP_HAS_ADDEND) && (gf & GRP_BY_ADDEND)) addend += read_sleb128(&p, end);
-        else if (!(gf & GRP_HAS_ADDEND)) addend = 0;
-        for (int64_t k = 0; k < gsz && count > 0; k++, count--) {
-            offset += (gf & GRP_BY_OFF_DELTA) ? goff_delta : read_sleb128(&p, end);
-            if (!(gf & GRP_BY_INFO)) info = read_sleb128(&p, end);
-            if ((gf & GRP_HAS_ADDEND) && !(gf & GRP_BY_ADDEND)) addend += read_sleb128(&p, end);
-            Elf64_Rela r; r.r_offset = (uint64_t)offset; r.r_info = (uint64_t)info;
-            r.r_addend = addend;
-            if (apply_relocs(img, &r, 1) != 0) return -1;
+
+    int64_t total = sleb128(&p, end);
+    if (total <= 0 || (uint64_t)total > (1u << 24)) {
+        err("DT_ANDROID_RELA claims %lld relocations", (long long)total);
+        return NULL;
+    }
+    Elf64_Rela *out = calloc((size_t)total, sizeof *out);
+    if (!out) { err("out of memory for %lld packed relocations", (long long)total); return NULL; }
+
+    int64_t offset = sleb128(&p, end);
+    int64_t addend = 0;
+    size_t  n = 0;
+
+    while (n < (size_t)total) {
+        if (p >= end) { err("DT_ANDROID_RELA truncated after %zu of %lld", n, (long long)total); free(out); return NULL; }
+        int64_t gsize  = sleb128(&p, end);
+        int64_t gflags = sleb128(&p, end);
+        if (gsize <= 0 || (uint64_t)(n + (size_t)gsize) > (uint64_t)total) {
+            err("DT_ANDROID_RELA group of %lld overruns the declared count", (long long)gsize);
+            free(out);
+            return NULL;
+        }
+        int64_t gdelta = 0, ginfo = 0, gaddend = 0;
+        if (gflags & APS2_GROUPED_BY_OFFSET_DELTA) gdelta = sleb128(&p, end);
+        if (gflags & APS2_GROUPED_BY_INFO)         ginfo  = sleb128(&p, end);
+        if ((gflags & (APS2_GROUP_HAS_ADDEND | APS2_GROUPED_BY_ADDEND))
+                   == (APS2_GROUP_HAS_ADDEND | APS2_GROUPED_BY_ADDEND))
+            gaddend = sleb128(&p, end);
+        else if (!(gflags & APS2_GROUP_HAS_ADDEND))
+            addend = 0;
+
+        for (int64_t i = 0; i < gsize; i++, n++) {
+            offset += (gflags & APS2_GROUPED_BY_OFFSET_DELTA) ? gdelta : sleb128(&p, end);
+            int64_t info = (gflags & APS2_GROUPED_BY_INFO) ? ginfo : sleb128(&p, end);
+            if (gflags & APS2_GROUP_HAS_ADDEND)
+                addend += (gflags & APS2_GROUPED_BY_ADDEND) ? gaddend : sleb128(&p, end);
+            out[n].r_offset = (uint64_t)offset;
+            out[n].r_info   = (uint64_t)info;
+            out[n].r_addend = addend;
         }
     }
-    return 0;
+    *count_out = n;
+    return out;
 }
 
 // Walk PT_DYNAMIC and bind the image: symtab/strtab, DT_INIT_ARRAY, and every
@@ -530,11 +938,87 @@ static int apply_android_packed(kl_image *img, const uint8_t *blob, size_t sz) {
 //
 // `lo` is the lowest PT_LOAD vaddr, so `img->base + p_vaddr - lo` addresses the
 // mapped copy in both cases (it is 0 for every guest library here).
-static int bind_dynamic(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t lo) {
+// ---------- the GNU hash table ----------
+// { nbuckets, symoffset, bloom_size, bloom_shift, bloom[bloom_size] (64-bit
+// words on ELF64), buckets[nbuckets], chain[] }. Symbols below `symoffset` are
+// not hashed (undefined and local); chain[i - symoffset] is symbol i's hash
+// with bit 0 set on the LAST entry of each bucket's run.
+static uint32_t gnu_hash_of(const char *s) {
+    uint32_t h = 5381;
+    for (; *s; s++) h = h * 33 + (uint8_t)*s;
+    return h;
+}
+
+// The .dynsym count, which DT_GNU_HASH encodes only implicitly: the highest
+// bucket start, walked to the end of its chain, is the last hashed symbol.
+// This is how glibc's own ld.so sizes the table when there is no DT_HASH, and
+// it is the only honest answer for a translated image (its section headers
+// are not mapped). The old fallback — the gap between DT_SYMTAB and DT_STRTAB —
+// is the wrong-layout bug kl_sym's comment describes.
+static size_t gnu_hash_nsyms(const uint32_t *h) {
+    uint32_t nbuckets = h[0], symoffset = h[1], bloom_size = h[2];
+    const uint32_t *buckets = (const uint32_t *)((const uint64_t *)(h + 4) + bloom_size);
+    const uint32_t *chain = buckets + nbuckets;
+    uint32_t last = 0;
+    for (uint32_t i = 0; i < nbuckets; i++) if (buckets[i] > last) last = buckets[i];
+    if (last < symoffset) return symoffset;
+    while (!(chain[last - symoffset] & 1)) last++;
+    return (size_t)last + 1;
+}
+
+static const Elf64_Sym *gnu_hash_find(const kl_image *img, const char *name) {
+    const uint32_t *h = img->gnu_hash;
+    uint32_t nbuckets = h[0], symoffset = h[1], bloom_size = h[2], shift = h[3];
+    if (!nbuckets || !bloom_size) return NULL;
+    const uint64_t *bloom = (const uint64_t *)(h + 4);
+    const uint32_t *buckets = (const uint32_t *)(bloom + bloom_size);
+    const uint32_t *chain = buckets + nbuckets;
+    uint32_t hv = gnu_hash_of(name);
+    uint64_t word = bloom[(hv / 64) % bloom_size];
+    uint64_t mask = (1ull << (hv % 64)) | (1ull << ((hv >> shift) % 64));
+    if ((word & mask) != mask) return NULL;
+    uint32_t i = buckets[hv % nbuckets];
+    if (i < symoffset) return NULL;
+    for (;; i++) {
+        uint32_t ch = chain[i - symoffset];
+        if ((ch | 1) == (hv | 1)) {
+            const Elf64_Sym *s = &img->symtab[i];
+            // glibc mode: a HIDDEN version (versym bit 15) is a compatibility
+            // copy only an explicitly versioned reference may bind; an
+            // unversioned search takes the default one beside it.
+            if (s->st_shndx != 0 && !strcmp(img->strtab + s->st_name, name)
+                && !(img->glibc && img->versym && (img->versym[i] & 0x8000)))
+                return s;
+        }
+        if (ch & 1) break;
+    }
+    return NULL;
+}
+
+// `apply` 0 parses the dynamic section only (symbols, NEEDED, SONAME) and
+// relocates nothing: a replaced library's real file, mapped so its export list
+// can say which names belong to it (kl_map_dylib_unbound), and never bound.
+static int bind_dynamic(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t lo,
+                        int apply) {
     const Elf64_Rela *rela = NULL, *jmprel = NULL;
-    size_t relasz = 0, pltsz = 0;
-    const uint64_t *relr = NULL; size_t relrsz = 0;
-    const uint8_t *arela = NULL; size_t arelasz = 0;
+    const uint8_t    *packed = NULL;
+    const uint64_t   *relr = NULL;
+    size_t relasz = 0, pltsz = 0, packedsz = 0, relrsz = 0, relrent = 8;
+    uint64_t needed_off[48], soname_off = 0;
+    unsigned nneeded = 0;
+    int has_soname = 0;
+
+    // PT_TLS first: a TLSDESC relocation below needs the block it describes, and
+    // the program headers are not visited again after this loop.
+    for (int i = 0; i < phnum; i++) {
+        if (ph[i].p_type != PT_TLS) continue;
+        img->tls_init   = img->base + ph[i].p_vaddr - lo;
+        img->tls_filesz = ph[i].p_filesz;
+        img->tls_memsz  = ph[i].p_memsz;
+        img->tls_align  = ph[i].p_align ? ph[i].p_align : 8;
+        img->has_tls    = 1;
+    }
+
     for (int i = 0; i < phnum; i++) {
         if (ph[i].p_type != PT_DYNAMIC) continue;
         const Elf64_Dyn *dp = (const Elf64_Dyn *)(img->base + ph[i].p_vaddr - lo);
@@ -549,20 +1033,65 @@ static int bind_dynamic(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t
             case DT_HASH:   img->nsyms = ((const uint32_t *)(img->base + dp->d_val))[1]; break;
             case DT_RELA:   rela   = (const Elf64_Rela *)(img->base + dp->d_val); break;
             case DT_RELASZ: relasz = dp->d_val; break;
+            case DT_ANDROID_RELA:   packed   = (const uint8_t *)(img->base + dp->d_val); break;
+            case DT_ANDROID_RELASZ: packedsz = dp->d_val; break;
+            // Both numberings (see the DT_RELR block above); an image carries
+            // one or the other, never both.
+            case DT_RELR: case DT_ANDROID_RELR:
+                relr = (const uint64_t *)(img->base + dp->d_val); break;
+            case DT_RELRSZ: case DT_ANDROID_RELRSZ:  relrsz  = dp->d_val; break;
+            case DT_RELRENT: case DT_ANDROID_RELRENT: relrent = dp->d_val; break;
             case DT_JMPREL: jmprel = (const Elf64_Rela *)(img->base + dp->d_val); break;
             case DT_PLTRELSZ: pltsz = dp->d_val; break;
+            case DT_INIT:         img->init_fn = (void (*)(void))(img->base + dp->d_val); break;
+            case DT_SYMBOLIC:     img->symbolic = 1; break;
+            case DT_FLAGS:        if (dp->d_val & DF_SYMBOLIC) img->symbolic = 1; break;
             case DT_INIT_ARRAY:   img->init_array = (void (**)(void))(img->base + dp->d_val); break;
             case DT_INIT_ARRAYSZ: img->init_count = dp->d_val / sizeof(void *); break;
-            case DT_RELR:
-            case DT_ANDROID_RELR:   relr   = (const uint64_t *)(img->base + dp->d_val); break;
-            case DT_RELRSZ:
-            case DT_ANDROID_RELRSZ: relrsz = dp->d_val; break;
-            case DT_ANDROID_RELA:   arela   = (const uint8_t *)(img->base + dp->d_val); break;
-            case DT_ANDROID_RELASZ: arelasz = dp->d_val; break;
+            case DT_GNU_HASH: img->gnu_hash = (const uint32_t *)(img->base + dp->d_val); break;
+            case DT_VERSYM:   img->versym = (const uint16_t *)(img->base + dp->d_val); break;
+            case DT_VERNEED:  img->verneed = img->base + dp->d_val; break;
+            case DT_VERNEEDNUM: img->verneednum = (unsigned)dp->d_val; break;
+            case DT_SONAME:   soname_off = dp->d_val; has_soname = 1; break;
+            case DT_NEEDED:
+                if (nneeded < sizeof needed_off / sizeof *needed_off)
+                    needed_off[nneeded++] = dp->d_val;
+                else if (img->glibc) {
+                    // Past the table a dependency would vanish without a word:
+                    // refuse the image by name instead (the payload's most is 13).
+                    // glibc mode only — the list is what its claims read; a
+                    // bionic image never consults it, so it loads as before.
+                    err("more than %zu DT_NEEDED entries — raise kl_image.needed",
+                        sizeof needed_off / sizeof *needed_off);
+                    return -1;
+                }
+                break;
             }
         }
     }
     if (!img->symtab || !img->strtab) { err("missing DT_SYMTAB/DT_STRTAB"); return -1; }
+    if (has_soname) img->soname = img->strtab + soname_off;
+    for (unsigned i = 0; i < nneeded; i++) img->needed[i] = img->strtab + needed_off[i];
+    img->nneeded = nneeded;
+    // No DT_HASH: size .dynsym from the GNU table. The ELF path overrides this
+    // from the section headers afterwards when it has them. glibc images only
+    // on driver: a bionic guest keeps the count it has always had (the
+    // promotion from hla changed no existing target's symbol search).
+    if (!img->nsyms && img->gnu_hash && img->glibc) img->nsyms = gnu_hash_nsyms(img->gnu_hash);
+    if (!apply) return 0;
+    img->bound = 1;
+
+    // REFUSE rather than relocate nothing. A table we cannot read is
+    // indistinguishable, downstream, from an image that needed no relocations at
+    // all — and the difference only shows up as a jump to an unrebased address
+    // several seconds later, in whatever ran first. RELR's entry size is the
+    // one thing about it that could ever change, so it is checked rather than
+    // assumed: a different stride would silently relocate the wrong words.
+    if (relr && relrent != 8) {
+        err("DT_RELRENT is %zu, not 8 — this loader reads 8-byte RELR entries only", relrent);
+        return -1;
+    }
+    if (relr && apply_relr(img, relr, relrsz / 8) != 0) return -1;
 
     // Order is independent — RELA, RELR and APS2 relocate disjoint slots — but
     // every relative table must run before kl_run_init: the .init_array pointers
@@ -570,8 +1099,44 @@ static int bind_dynamic(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t
     if ((rela   && apply_relocs(img, rela,   relasz / sizeof(Elf64_Rela)) != 0) ||
         (jmprel && apply_relocs(img, jmprel, pltsz  / sizeof(Elf64_Rela)) != 0))
         return -1;
-    if (relr) apply_relr(img, relr, relrsz / sizeof(uint64_t));
-    if (arela && apply_android_packed(img, arela, arelasz) != 0) return -1;
+
+    if (packed) {
+        size_t      n = 0;
+        Elf64_Rela *r = decode_android_relocs(packed, packedsz, &n);
+        if (!r) return -1;
+        int rc = apply_relocs(img, r, n);
+        free(r);
+        if (rc != 0) return -1;
+    }
+
+    // A static-TLS block's template is relocated by now: give the loading
+    // thread its copy (later threads get theirs from kl_thread_init).
+    if (img->stls_off) kl_tls_static_seed();
+
+    // Say what was left NULL, by name, once per image.
+    //
+    // A missing STRONG import gets a named stub, so calling it aborts with the
+    // symbol in the message and the log reads like a bug report. A weak one
+    // gets nothing — deliberately, that is what weak means — and calling it is
+    // `br` to zero: pc=0, EXC_BAD_ACCESS, no frame of ours in the crash report,
+    // and not one line anywhere saying which symbol it was. Arkham Shadow's
+    // cape-glide tutorial died exactly that way on AMediaDataSource_new, and
+    // the only reason it took a disassembly of the PLT stub and the ELF's own
+    // relocation table to find out is that this list existed and was never
+    // printed. kl_weak_imports() had no callers at all.
+    //
+    // It is one line per image and it is the difference between a round and a
+    // grep, so it is unconditional rather than behind a debug flag.
+    if (img->weak_n) {
+        fprintf(stderr, "  [klepton] %s: %u weak import(s) left NULL — the guest "
+                        "must null-test each before calling it:\n", img->path,
+                img->weak_n);
+        for (unsigned i = 0; i < img->weak_n; i++)
+            fprintf(stderr, "  [klepton]     %s\n", img->weak[i]);
+    }
+    if (img->missing_n)
+        fprintf(stderr, "  [klepton] %s: %u unresolved import(s), each behind a "
+                        "stub that aborts by name\n", img->path, img->missing_n);
     return 0;
 }
 
@@ -588,7 +1153,74 @@ static int bind_dynamic(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t
 // The mach_header is located by matching the dylib against dyld's loaded-image
 // list. dlsym would be the obvious route and is precisely what we cannot use —
 // the translated dylib deliberately exports nothing.
-kl_image *kl_load_dylib(const char *path) {
+// `mode`: 0 an ordinary (bionic) guest; KL_LOAD_GLIBC binds in glibc's order
+// (sym_value_glibc); KL_LOAD_UNBOUND maps and reads the symbol table only and
+// applies NO relocation — a replaced library's real file, kept for its export
+// list, which nothing may call (its GOT is unrelocated).
+enum { KL_LOAD_GLIBC = 1, KL_LOAD_UNBOUND = 2 };
+static kl_image *load_dylib(const char *path, int mode);
+
+kl_image *kl_load_dylib(const char *path) { return load_dylib(path, 0); }
+kl_image *kl_load_dylib_glibc(const char *path) { return load_dylib(path, KL_LOAD_GLIBC); }
+kl_image *kl_map_dylib_unbound(const char *path) { return load_dylib(path, KL_LOAD_UNBOUND); }
+int       kl_image_is_glibc(const kl_image *img) { return img && img->glibc; }
+const char *kl_image_soname(const kl_image *img) { return img ? img->soname : NULL; }
+const char *const *kl_image_needed(const kl_image *img, unsigned *count) {
+    if (count) *count = img ? img->nneeded : 0;
+    return img ? img->needed : NULL;
+}
+int64_t   kl_image_static_tls(const kl_image *img) { return img ? img->stls_off : 0; }
+
+// The second half of a two-phase load: relocate an image kl_map_dylib_unbound
+// mapped. glibc's ld.so maps a whole NEEDED closure first and relocates it
+// afterwards, which is what lets a dependency CYCLE bind both ways (the
+// payload's loader-cycle fixture is exactly that) and what makes the global
+// search order the load order rather than the order relocation happened in.
+int kl_bind_mapped(kl_image *img) {
+    if (!img || img->bound) return img ? 0 : -1;
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)img->base;
+    const Elf64_Phdr *ph = (const Elf64_Phdr *)(img->base + eh->e_phoff);
+    uint64_t lo = UINT64_MAX;
+    for (int i = 0; i < eh->e_phnum; i++)
+        if (ph[i].p_type == PT_LOAD && ph[i].p_vaddr < lo) lo = ph[i].p_vaddr;
+    return bind_dynamic(img, ph, eh->e_phnum, lo == UINT64_MAX ? 0 : lo, 1);
+}
+
+// Which FILE an undefined import's symbol version names (its DT_VERNEED entry:
+// `__libc_start_main@GLIBC_2.34` -> "libc.so.6"), or NULL for an unversioned
+// import. This is the one place an ELF records which library a name was
+// linked against, so it is how the native door buckets what is left.
+const char *kl_import_version_file(const kl_image *img, const char *name) {
+    if (!img || !img->versym || !img->verneed || !name) return NULL;
+    size_t n = img->nsyms;
+    const char *lo_p = (const char *)img->base, *hi_p = lo_p + img->span;
+    for (size_t i = 0; i < n; i++) {
+        const Elf64_Sym *s = &img->symtab[i];
+        if ((const char *)(s + 1) > hi_p) break;
+        if (s->st_shndx != 0 || !s->st_name) continue;
+        const char *nm = img->strtab + s->st_name;
+        if (nm < lo_p || nm >= hi_p || strcmp(nm, name)) continue;
+        uint16_t ver = img->versym[i] & 0x7fff;
+        if (ver < 2) return NULL;                    // local / global: unversioned
+        const uint8_t *vn = img->verneed;
+        for (unsigned k = 0; k < img->verneednum && vn; k++) {
+            uint16_t cnt = *(const uint16_t *)(vn + 2);
+            uint32_t file = *(const uint32_t *)(vn + 4), aux = *(const uint32_t *)(vn + 8);
+            uint32_t next = *(const uint32_t *)(vn + 12);
+            const uint8_t *va = vn + aux;
+            for (unsigned a = 0; a < cnt && va; a++) {
+                if (*(const uint16_t *)(va + 6) == ver) return img->strtab + file;
+                uint32_t an = *(const uint32_t *)(va + 12);
+                va = an ? va + an : NULL;
+            }
+            vn = next ? vn + next : NULL;
+        }
+        return NULL;
+    }
+    return NULL;
+}
+
+static kl_image *load_dylib(const char *path, int mode) {
     char real[PATH_MAX];
     if (!realpath(path, real)) snprintf(real, sizeof real, "%s", path);
 
@@ -623,6 +1255,7 @@ kl_image *kl_load_dylib(const char *path) {
     kl_image *img = calloc(1, sizeof *img);
     img->base      = elf;
     img->dl_handle = h;
+    img->glibc     = (mode & (KL_LOAD_GLIBC | KL_LOAD_UNBOUND)) != 0;
     snprintf(img->path, sizeof img->path, "%s", real);
 
     const Elf64_Phdr *ph = (const Elf64_Phdr *)(elf + eh->e_phoff);
@@ -636,7 +1269,9 @@ kl_image *kl_load_dylib(const char *path) {
                             free(img); dlclose(h); return NULL; }
     img->span = (size_t)(hi - lo);
 
-    if (bind_dynamic(img, ph, eh->e_phnum, lo) != 0) { free(img); dlclose(h); return NULL; }
+    if (bind_dynamic(img, ph, eh->e_phnum, lo, !(mode & KL_LOAD_UNBOUND)) != 0) {
+        free(img); dlclose(h); return NULL;
+    }
 
     // The TLS rewrite and the x18 veneers were applied offline, so there is
     // nothing left in this image to count — which is precisely why klepton-ld
@@ -683,6 +1318,32 @@ kl_image *kl_load_dylib(const char *path) {
                 free(img); dlclose(h); return NULL;
             }
         }
+        // WHAT THE TRANSLATION DID, on the record, on the device.
+        //
+        // Round 20 of pttr. Launch #19 was a SIGKILL with no crash report, no
+        // JetsamEvent and no fault report — the signature of a `br x18`
+        // branching through a zeroed shadow, which is a codesigning kill that
+        // cannot report itself. Ruling that class in or out needs one number:
+        // how many sites this target's veneer pass REFUSED. It was recorded by
+        // klepton-ld, it was read into img->stats right above, and it was
+        // printed NOWHERE — so the question could only be asked of `make check`
+        // on the host, which patches at runtime and is a different pass over a
+        // different set of libraries than the device ever runs.
+        //
+        // Refusals first and unconditionally when non-zero, because a refused
+        // site that WRITES x18 leaves the shadow stale and poisons every later
+        // read of it. The clean case gets one quiet line too: "0 refused" is
+        // the evidence that matters when a crash has no other evidence at all,
+        // and a line that only appears when something is wrong cannot be used
+        // to prove that nothing is.
+        if (rec->sites || rec->refused)
+            fprintf(stderr, "  [klepton] %s: x18 translated offline — %u site(s), "
+                            "%u patched, %u REFUSED%s\n",
+                    real, rec->sites, rec->patched, rec->refused,
+                    rec->refused ? "  <-- refused sites read Darwin's x18; a "
+                                   "refused WRITE poisons every later read"
+                                 : "");
+
         // The CTR_EL0 constant is self-contained — the veneer answers it and
         // nothing here has to agree — so a difference is reported rather than
         // refused. It is reported at all because "the CTR_EL0 value in this
@@ -776,6 +1437,16 @@ int kl_can_load(const char *path) {
     char cand[1024];
     if (dylib_candidate(path, cand, sizeof cand, NULL, 0)) return 1;
     return access(path, R_OK) == 0;
+}
+
+// The file that IS this guest library on this platform. `kl_can_load` answers
+// the yes/no; this one hands back the path, for the caller that has to do more
+// than decide — stat(2), notably: a guest asking whether its own libdir holds
+// libfoo.so wants a struct back, and on device the only real file behind that
+// name is the translation in Frameworks/. Returns 0 when `path` is not a guest
+// library we carry, leaving `out` untouched.
+int kl_library_file(const char *path, char *out, size_t cap) {
+    return dylib_candidate(path, out, cap, NULL, 0);
 }
 
 // ---------- segment protection, when the HOST page is coarser than p_align ----------
@@ -1036,6 +1707,11 @@ kl_image *kl_load(const char *path) {
         if (sh[i].sh_type != SHT_PROGBITS || !(sh[i].sh_flags & SHF_EXECINSTR)) continue;
         if (sh[i].sh_offset + sh[i].sh_size > (uint64_t)sb.st_size) continue;
         x18_arena += (size_t)kl_x18_count(file + sh[i].sh_offset, (size_t)sh[i].sh_size);
+        // ...plus the jump-table rewrite's worst case per `br x18`, the one site
+        // shape whose veneer grows a thunk per table target.
+        x18_arena += (size_t)kl_x18_count_termbr(file + sh[i].sh_offset,
+                                                 (size_t)sh[i].sh_size)
+                   * (KLX_JT_MAX_INSN / KLX_VEN_MAX_INSN + 2);
     }
     if (x18_arena) {
         // Per-chunk pools each round up to 64 KB and one section can be several
@@ -1046,11 +1722,22 @@ kl_image *kl_load(const char *path) {
     }
     img->x18_arena_size = x18_arena;
 
-    uint8_t *map = mmap(NULL, img->map_size + x18_arena, PROT_READ | PROT_WRITE,
+    // A second arena of the same size BEFORE the image. The end-of-image arena
+    // is within b's +/-128 MB of the top of the code only; for a library wider
+    // than one window (deadpool's libUE4 is 262 MB) the bottom half needs a
+    // pool below the image just as much, and "somewhere free nearby" is luck —
+    // one ASLR roll gives a 436 MB gap below, the next gives 15 MB and every
+    // veneer is REACH-refused (r15 vs r16). Reserved here, it is in reach by
+    // construction, which is the whole argument the end arena was added on.
+    // Virtual-address space only; untouched pages are never committed.
+    size_t x18_pre_arena = x18_arena;
+    uint8_t *map = mmap(NULL, x18_pre_arena + img->map_size + x18_arena,
+                        PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANON, -1, 0);
     if (map == MAP_FAILED) { err("mmap image: %s", strerror(errno));
                              free(img); munmap(file, sb.st_size); return NULL; }
-    img->base = map + img->map_off;
+    img->x18_pre_arena_size = x18_pre_arena;
+    img->base = map + x18_pre_arena + img->map_off;
     if (img->map_off)
         fprintf(stderr, "  [klepton] %s: placed %#zx into its mapping so a host "
                         "page boundary falls between the executable bytes and "
@@ -1063,7 +1750,7 @@ kl_image *kl_load(const char *path) {
 
     // ---- PT_DYNAMIC, then relocate ----
     // Every relocation target is in the RW segment; __TEXT is never written.
-    if (bind_dynamic(img, ph, eh->e_phnum, lo) != 0) {
+    if (bind_dynamic(img, ph, eh->e_phnum, lo, 1) != 0) {
         munmap(file, sb.st_size); return NULL;
     }
 
@@ -1128,6 +1815,18 @@ kl_image *kl_load(const char *path) {
     uint8_t *x18_arena_base = img->x18_arena_size
                             ? img->base - img->map_off + img->map_size : NULL;
     size_t   x18_arena_used = 0;
+    uint8_t *x18_pre_base = img->x18_pre_arena_size
+                          ? img->base - img->map_off - img->x18_pre_arena_size : NULL;
+    size_t   x18_pre_used = 0;
+
+    // The image behind each chunk, so the `br x18` jump-table rewrite can reach
+    // the table it has to repoint. Here the chunk addresses ARE the mapped
+    // addresses, so resolving is only a bounds check against the section that
+    // owns the VA — and the section must be read-only ALLOC data: executable
+    // would let a mis-recognition write over code, and writable is rewritten by
+    // relocations, which would undo the repointing without a word.
+    struct x18_img_ctx ictx = { sh, eh->e_shnum, (uint64_t)(uintptr_t)img->base - lo };
+    kl_x18_image ximg = { x18_img_data_at, &ictx };
 
     for (int i = 0; sh && i < eh->e_shnum; i++) {
         if (sh[i].sh_type != SHT_PROGBITS || !(sh[i].sh_flags & SHF_EXECINSTR)) continue;
@@ -1138,13 +1837,60 @@ kl_image *kl_load(const char *path) {
             uint8_t *p = img->base + cva - lo;
             rewrite_tls(p, csz, cva, path, &img->stats);
             if (!veneer) continue;
+            // One more split on top of kl_x18_next_code's. A veneer pool has to
+            // sit within b's +/-128 MB of EVERY site it serves, and a single
+            // executable section of a 262 MB libUE4 is wider than two of those
+            // windows put together: one pool per section is in reach of the
+            // section's ends only, and deadpool lost all 4141 of its sites to
+            // exactly that (trap 0, second shape). Slicing gives each slice its
+            // own pool — the arena's where the arena is near enough,
+            // klx_place_pool's search elsewhere — so a pool only has to reach
+            // its own slice's sites. 32 MB keeps a slice's window wide enough
+            // that the pool search has somewhere to land.
+            for (size_t off = 0; off < csz; ) {
+            size_t slice = csz - off;
+            if (slice > (32u << 20)) slice = 32u << 20;
+            // Pick the arena whose next slot this slice can actually branch to:
+            // the end arena for the top of the image, the pre-image arena for
+            // the bottom. 120 MB rather than the exact 128 — the pool grows
+            // past the slot and kl_x18_patch re-checks the extremes itself,
+            // falling back to klx_place_pool's search when neither arena
+            // answers (the unservable middle band of a >256 MB image).
+            void   *arena = NULL; size_t *aused = NULL, asize = 0;
+            int64_t slo = (int64_t)(uintptr_t)(p + off);
+            int64_t shi = slo + (int64_t)slice;
+            const int64_t REACH = 120LL << 20;
+            if (x18_arena_base) {
+                int64_t slot = (int64_t)(uintptr_t)(x18_arena_base + x18_arena_used);
+                if (slot - shi < REACH && slot - shi >= 0) {
+                    arena = x18_arena_base; aused = &x18_arena_used;
+                    asize = img->x18_arena_size;
+                }
+            }
+            if (!arena && x18_pre_base) {
+                int64_t slot = (int64_t)(uintptr_t)(x18_pre_base + x18_pre_used);
+                if (slo - slot < REACH && slo - slot >= 0) {
+                    arena = x18_pre_base; aused = &x18_pre_used;
+                    asize = img->x18_pre_arena_size;
+                }
+            }
             kl_x18_stats xs;
-            if (kl_x18_patch(p, csz, x18_arena_base, img->x18_arena_size,
-                             &x18_arena_used, &xs) != 0) {
+            if (kl_x18_patch(p + off, slice, arena, asize,
+                             aused, &ximg, &xs) != 0) {
                 fprintf(stderr, "  [klepton] %s: x18 veneering failed to start\n", path);
                 veneer = 0;
-                continue;
+                break;
             }
+            // The jump-table rewrite, both halves. A CONVERTED `br x18` no
+            // longer branches through x18 at all and cannot be killed by the
+            // kernel zeroing it; a FALLBACK one still can, and that residual is
+            // what killed Arizona Sunshine 2 three launches running — so it is
+            // printed rather than left to be inferred from silence.
+            if (xs.jt_sites || xs.jt_fallback)
+                fprintf(stderr, "  [klepton] %s: br x18 — %u converted to thunk "
+                                "dispatch (%u targets), %u on the guarded veneer%s\n",
+                        path, xs.jt_sites, xs.jt_thunks, xs.jt_fallback,
+                        xs.jt_fallback ? " (residual x18 window)" : "");
             // A REFUSED x18 site runs against Darwin's reserved x18, which is
             // zero after any exception return, and it has no other error
             // surface: libUE4's 8038 sites all refused for REACH surface as an
@@ -1155,7 +1901,7 @@ kl_image *kl_load(const char *path) {
             // own distance beside it, because the two refusal kinds want
             // different fixes and only one of them is about the decoder.
             if (xs.refused) {
-                int64_t d = (int64_t)xs.pool_va - (int64_t)(uintptr_t)p;
+                int64_t d = (int64_t)xs.pool_va - (int64_t)(uintptr_t)(p + off);
                 fprintf(stderr,
                         "  [klepton] %s: x18 REFUSED %u of %u sites (%u for REACH"
                         " — pool at %#llx, %+lld MB from the code at %p). Those "
@@ -1163,7 +1909,7 @@ kl_image *kl_load(const char *path) {
                         "after any exception return.\n",
                         path, xs.refused, xs.sites, xs.far_refused,
                         (unsigned long long)xs.pool_va,
-                        (long long)(d / (1024 * 1024)), (void *)p);
+                        (long long)(d / (1024 * 1024)), (void *)(p + off));
             }
             img->stats.x18_sites   += xs.sites;
             img->stats.x18_patched += xs.patched;
@@ -1172,6 +1918,8 @@ kl_image *kl_load(const char *path) {
             img->stats.ctr_sites   += xs.ctr_sites;
             img->stats.ctr_patched += xs.ctr_patched;
             img->stats.ctr_refused += xs.ctr_refused;
+            off += slice;
+            }
         }
     }
     // Measured guest patches, here because this is the last moment the image is
@@ -1181,6 +1929,10 @@ kl_image *kl_load(const char *path) {
     struct gp_ctx { uint8_t *base; uint64_t lo, span; } gpc = {
         img->base, lo, (uint64_t)img->span
     };
+    if (img->stats.tp_writes)
+        fprintf(stderr, "  [klepton] %s: %u `msr tpidr_el0` write(s) dropped — the guest's "
+                        "thread pointer is TPIDRRO_EL0 here and TPIDR_EL0 is Darwin's\n",
+                path, img->stats.tp_writes);
     kl_guest_patch_apply(path, gp_at, &gpc);
 
     sys_icache_invalidate(img->base, img->span);
@@ -1195,6 +1947,14 @@ kl_image *kl_load(const char *path) {
     munmap(file, (size_t)sb.st_size);
     return img;
 }
+
+void kl_image_initializers(const kl_image *img, void (**init)(void),
+                           void (***array)(void), size_t *count) {
+    if (init)  *init  = img ? img->init_fn : NULL;
+    if (array) *array = img ? img->init_array : NULL;
+    if (count) *count = img ? img->init_count : 0;
+}
+int kl_image_symbolic(const kl_image *img) { return img && img->symbolic; }
 
 void kl_run_init(kl_image *img) {
     for (size_t i = 0; i < img->init_count; i++)
@@ -1212,6 +1972,17 @@ void *kl_sym(kl_image *img, const char *name) {
     // of .dynsym into the hash tables, reads their words as st_name offsets and
     // dereferences strtab + garbage — a fault inside strcmp during a
     // cross-image import bind, and a wrong answer under a different layout.
+    //
+    // A GLIBC image is searched through its GNU hash table instead: the same
+    // first match a linear scan finds (a bucket's chain runs in symbol order),
+    // in a few probes rather than thousands of strcmps — which stopped being an
+    // economy with the Alyx payload, ~65k import relocations across 130 images
+    // each searching every image loaded before it. Bionic guests keep the scan
+    // they have always had.
+    if (img->glibc && img->gnu_hash) {
+        const Elf64_Sym *s = gnu_hash_find(img, name);
+        return s ? img->base + s->st_value : NULL;
+    }
     size_t n = img->nsyms;
     if (!n)     // neither sections nor DT_HASH: infer, rather than bind nothing
         n = ((const char *)img->strtab - (const char *)img->symtab) / sizeof(Elf64_Sym);
@@ -1238,122 +2009,243 @@ void *kl_sym(kl_image *img, const char *name) {
 void kl_unload(kl_image *img) {
     if (!img) return;
     if (img->dl_handle) dlclose(img->dl_handle);   // translated: dyld owns it
-    else                munmap(img->base - img->map_off,
-                               img->map_size + img->x18_arena_size);
+    else                munmap(img->base - img->map_off - img->x18_pre_arena_size,
+                               img->x18_pre_arena_size + img->map_size +
+                               img->x18_arena_size);
     free(img);
 }
 
 // Read an image's DT_NEEDED sonames straight out of the file, without loading
 // it. kl_load_recursive uses this to pull the dependency chain in before the
 // image that imports it, so relocation-time binding (sym_value's global guest
-// search) has the exports in place. d_val entries are vaddrs; converting them
-// to file offsets goes through the PT_LOAD table, which on these libraries is
-// identity-mapped (p_vaddr == p_offset) but is not required to be.
-// Map an ELF vaddr to a pointer inside an in-memory image. Two layouts, because
-// the two sources below present the ELF differently: a raw .so on disk is in FILE
-// layout (index by the containing PT_LOAD's p_offset), while the ELF baked into a
-// translated dylib's __klelf is in LOAD/vaddr layout — the same one kl_load_dylib
-// and bind_dynamic read with `base + p_vaddr - lo`. Getting this wrong resolves
-// DT_STRTAB to garbage and every DT_NEEDED reads back empty.
-static const uint8_t *elf_vptr(const uint8_t *img, const Elf64_Phdr *ph, int phnum,
-                               uint64_t lo, int vaddr_layout, uint64_t va) {
-    if (vaddr_layout) return img + (va - lo);
-    for (int i = 0; i < phnum; i++)
-        if (ph[i].p_type == PT_LOAD && va >= ph[i].p_vaddr &&
-            va < ph[i].p_vaddr + ph[i].p_filesz)
-            return img + ph[i].p_offset + (va - ph[i].p_vaddr);
+// search) has the exports in place.
+//
+// Everything the walk needs is addressed by GUEST VADDR — PT_DYNAMIC's, and
+// DT_STRTAB's — and the two shapes an unloaded image comes in answer that
+// question differently, which is what the view below exists to hide:
+//
+//   a guest .so on disk — vaddr -> file offset through the PT_LOAD table.
+//   a translated dylib  — klepton-ld does NOT embed the file. __TEXT,__klelf is
+//     the read-only PT_LOAD GROUP laid out by VADDR, and __DATA,__kldata is the
+//     writable one; each group's bytes start at that group's vlo, not at zero.
+//
+// Group 0 is identity-mapped on these guests (p_vaddr == p_offset), so a
+// file-offset walk reads the ELF header and the program headers correctly —
+// and then follows PT_DYNAMIC, which lives in the WRITABLE group, off the end
+// of __klelf into whatever the Mach-O laid down next. No DT_STRTAB is found
+// there, so every translated library reported ZERO dependencies. That is a
+// topological sort with no edges, which emits its input unchanged: hl2vr's
+// device chain loaded in Frameworks-directory order, libsoundemittersystem
+// initialised before libtier0, its g_pMemAlloc import never bound, and its
+// first operator new dereferenced the unbound slot — SIGSEGV inside
+// DT_INIT_ARRAY, two seconds into launch #2. The host never saw it: there the
+// .so tree is present, so the file path answers.
+typedef struct { uint64_t vlo, vhi, foff; } elf_span;
+typedef struct {
+    const uint8_t *file;
+    size_t         size;
+    elf_span       s[8];
+    int            n;
+} elf_view;
+
+static void ev_add(elf_view *v, uint64_t vlo, uint64_t vhi, uint64_t foff) {
+    if (v->n < (int)(sizeof v->s / sizeof v->s[0]) && vhi > vlo)
+        v->s[v->n++] = (elf_span){ vlo, vhi, foff };
+}
+
+static const void *ev_at(const elf_view *v, uint64_t vaddr) {
+    for (int i = 0; i < v->n; i++) {
+        if (vaddr < v->s[i].vlo || vaddr >= v->s[i].vhi) continue;
+        uint64_t off = v->s[i].foff + (vaddr - v->s[i].vlo);
+        return off < v->size ? v->file + off : NULL;
+    }
     return NULL;
 }
 
-// DT_NEEDED out of an in-memory AArch64 ELF64 image. vaddr_layout selects how the
-// dynamic section and its string table are addressed (see elf_vptr).
-static int elf_list_needed(const uint8_t *img, int vaddr_layout, char names[][128], int max) {
-    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)img;
+// The DT_NEEDED walk itself, over an ELF image that is already in memory.
+// `elf` points at the ELF header; `v` maps guest vaddrs to bytes, and an empty
+// one means "this is a plain file", where the PT_LOAD table is that map.
+// `soname`/`runpath` (either may be NULL) come back as DT_SONAME and
+// DT_RUNPATH (DT_RPATH when there is no RUNPATH), or empty.
+// DT_NEEDED names past the caller's `max` (a dependency that would vanish
+// silently): counted here, named with the file by kl_list_dynamic.
+static __thread unsigned g_needed_dropped;
+static int elf_needed(const uint8_t *elf, elf_view *v, char names[][128], int max,
+                      char *soname, char *runpath, size_t cap) {
+    if (soname && cap) soname[0] = 0;
+    if (runpath && cap) runpath[0] = 0;
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)elf;
     if (memcmp(eh->e_ident, "\x7f" "ELF", 4) != 0 || eh->e_machine != 183) return 0;
-    const Elf64_Phdr *ph = (const Elf64_Phdr *)(img + eh->e_phoff);
-    uint64_t lo = UINT64_MAX;
-    for (int i = 0; i < eh->e_phnum; i++)
-        if (ph[i].p_type == PT_LOAD && ph[i].p_vaddr < lo) lo = ph[i].p_vaddr;
-    if (lo == UINT64_MAX) lo = 0;
+    const Elf64_Phdr *ph = (const Elf64_Phdr *)(elf + eh->e_phoff);
+
+    if (!v->n)
+        for (int i = 0; i < eh->e_phnum; i++)
+            if (ph[i].p_type == PT_LOAD)
+                ev_add(v, ph[i].p_vaddr, ph[i].p_vaddr + ph[i].p_filesz, ph[i].p_offset);
 
     const Elf64_Dyn *dyn = NULL;
     for (int i = 0; i < eh->e_phnum; i++)
-        if (ph[i].p_type == PT_DYNAMIC) {
-            dyn = (const Elf64_Dyn *)elf_vptr(img, ph, eh->e_phnum, lo, vaddr_layout, ph[i].p_vaddr);
-            break;
-        }
+        if (ph[i].p_type == PT_DYNAMIC) { dyn = ev_at(v, ph[i].p_vaddr); break; }
+    if (!dyn) return 0;
+
     const char *strtab = NULL;
-    if (dyn)
-        for (const Elf64_Dyn *dp = dyn; dp->d_tag != DT_NULL; dp++)
-            if (dp->d_tag == DT_STRTAB) {
-                strtab = (const char *)elf_vptr(img, ph, eh->e_phnum, lo, vaddr_layout, dp->d_val);
-                break;
-            }
-    int n = 0;
-    if (dyn && strtab)
-        for (const Elf64_Dyn *dp = dyn; dp->d_tag != DT_NULL && n < max; dp++)
-            if (dp->d_tag == DT_NEEDED) { snprintf(names[n], 128, "%s", strtab + dp->d_val); n++; }
+    for (const Elf64_Dyn *dp = dyn; dp->d_tag != DT_NULL && dp - dyn < 4096; dp++)
+        if (dp->d_tag == DT_STRTAB) { strtab = ev_at(v, dp->d_val); break; }
+    if (!strtab) return 0;
+
+    int n = 0, have_runpath = 0;
+    for (const Elf64_Dyn *dp = dyn; dp->d_tag != DT_NULL && dp - dyn < 4096; dp++) {
+        if (dp->d_tag == DT_NEEDED && n < max) snprintf(names[n++], 128, "%s", strtab + dp->d_val);
+        else if (dp->d_tag == DT_NEEDED) g_needed_dropped++;     // said aloud by the caller
+        else if (dp->d_tag == DT_SONAME && soname) snprintf(soname, cap, "%s", strtab + dp->d_val);
+        else if (dp->d_tag == DT_RUNPATH && runpath) {
+            snprintf(runpath, cap, "%s", strtab + dp->d_val);
+            have_runpath = 1;
+        } else if (dp->d_tag == DT_RPATH && runpath && !have_runpath)
+            snprintf(runpath, cap, "%s", strtab + dp->d_val);
+    }
     return n;
 }
 
-// The DT_NEEDED sonames of an image, without loading it. Two sources, because the
-// ELF .so tree is on disk for a HOST run but NOT bundled on DEVICE — there only
-// the translated frameworks ship, with the original ELF baked into their
-// __TEXT,__klelf. Read the .so directly when it exists; otherwise resolve the
-// framework the same way kl_load_auto will and read DT_NEEDED out of __klelf.
-// Missing this second source silently dropped every bundled dependency on device
-// (vicecity/libmiamivr's libc++_shared.so was never loaded, and its first
-// allocation aborted in kl_unresolved_named on operator new / _Znwm).
-int kl_list_needed(const char *path, char names[][128], int max) {
-    int fd = open(path, O_RDONLY);
-    if (fd >= 0) {
-        struct stat sb;
-        if (fstat(fd, &sb) == 0) {
-            uint8_t *file = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-            close(fd);
-            if (file != MAP_FAILED) {
-                const Elf64_Ehdr *eh = (const Elf64_Ehdr *)file;
-                if (memcmp(eh->e_ident, "\x7f" "ELF", 4) == 0 && eh->e_machine == 183) {
-                    int n = elf_list_needed(file, 0, names, max);   // raw .so: file layout
-                    munmap(file, (size_t)sb.st_size);
-                    return n;
-                }
-                munmap(file, (size_t)sb.st_size);   // a Mach-O at this path: fall through
+// The embedded guest image inside a MAPPED klepton-ld dylib, by walking the
+// load commands to __TEXT,__klelf (and __DATA,__kldata beside it).
+// getsectiondata() answers the same question for a LOADED image; this one is
+// asked about a file, before anything is loaded, which is what a dependency
+// sort needs. `sec_off`/`sec_size`, when given, come back as {klelf, kldata}.
+static const uint8_t *macho_klelf(const uint8_t *file, size_t size,
+                                  uint64_t sec_off[2], uint64_t sec_size[2]) {
+    if (size < sizeof(struct mach_header_64)) return NULL;
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)file;
+    if (mh->magic != MH_MAGIC_64) return NULL;
+    const uint8_t *klelf = NULL;
+    const uint8_t *p = file + sizeof *mh;
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmdsize < sizeof *lc || (size_t)(p - file) + lc->cmdsize > size) break;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)p;
+            const struct section_64 *sec = (const struct section_64 *)(sg + 1);
+            for (uint32_t j = 0; j < sg->nsects; j++, sec++) {
+                int which = !strncmp(sec->sectname, "__klelf", 16)  ? 0 :
+                            !strncmp(sec->sectname, "__kldata", 16) ? 1 : -1;
+                if (which < 0 || sec->offset >= size) continue;
+                if (!which) klelf = file + sec->offset;
+                if (sec_off)  sec_off[which]  = sec->offset;
+                if (sec_size) sec_size[which] = sec->size;
             }
-        } else close(fd);
-    }
-    // Device: no .so on disk. Read DT_NEEDED from the translated dylib's __klelf.
-    char cand[1024];
-    if (!dylib_candidate(path, cand, sizeof cand, NULL, 0)) return -1;
-    int mfd = open(cand, O_RDONLY);
-    if (mfd < 0) return -1;
-    struct stat sb;
-    if (fstat(mfd, &sb) != 0) { close(mfd); return -1; }
-    uint8_t *mo = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_PRIVATE, mfd, 0);
-    close(mfd);
-    if (mo == MAP_FAILED) return -1;
-    int n = -1;
-    const struct mach_header_64 *mh = (const struct mach_header_64 *)mo;
-    if ((size_t)sb.st_size >= sizeof *mh && mh->magic == MH_MAGIC_64) {
-        const uint8_t *lc = mo + sizeof *mh;
-        for (uint32_t i = 0; i < mh->ncmds && n < 0; i++) {
-            const struct load_command *cmd = (const struct load_command *)lc;
-            if (cmd->cmd == LC_SEGMENT_64) {
-                const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
-                if (strcmp(seg->segname, "__TEXT") == 0) {
-                    const struct section_64 *sec = (const struct section_64 *)(lc + sizeof *seg);
-                    for (uint32_t s = 0; s < seg->nsects; s++)
-                        if (strcmp(sec[s].sectname, "__klelf") == 0) {
-                            // __klelf is in LOAD/vaddr layout (see elf_vptr / how
-                            // kl_load_dylib reads it), not raw file layout.
-                            n = elf_list_needed(mo + sec[s].offset, 1, names, max);
-                            break;
-                        }
-                }
-            }
-            lc += cmd->cmdsize;
         }
+        p += lc->cmdsize;
     }
-    munmap(mo, (size_t)sb.st_size);
+    return klelf;
+}
+
+// The view over a translated dylib's embedded groups. klepton-ld groups
+// consecutive PT_LOADs by writability and emits group 0 as __klelf and group 1
+// as __kldata, each starting at its own vlo — so reconstructing the same
+// grouping from the guest's program headers is what pairs the two.
+static void klelf_view(const uint8_t *elf, elf_view *v,
+                       const uint64_t sec_off[2], const uint64_t sec_size[2]) {
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)elf;
+    if (memcmp(eh->e_ident, "\x7f" "ELF", 4) != 0) return;
+    const Elf64_Phdr *ph = (const Elf64_Phdr *)(elf + eh->e_phoff);
+    int g = -1, gw = -1;
+    uint64_t vlo = 0, vhi = 0;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type != PT_LOAD) continue;
+        int w = (ph[i].p_flags & PF_W) != 0;
+        if (g >= 0 && w == gw) {
+            if (ph[i].p_vaddr + ph[i].p_filesz > vhi) vhi = ph[i].p_vaddr + ph[i].p_filesz;
+            continue;
+        }
+        if (g >= 0 && g < 2 && sec_size[g]) ev_add(v, vlo, vlo + sec_size[g], sec_off[g]);
+        g++; gw = w;
+        vlo = ph[i].p_vaddr;
+        vhi = ph[i].p_vaddr + ph[i].p_filesz;
+    }
+    // Groups past the second have no section of their own — klepton-ld emits
+    // two — so they stay unmapped and ev_at answers NULL for them.
+    if (g >= 0 && g < 2 && sec_size[g]) ev_add(v, vlo, vlo + sec_size[g], sec_off[g]);
+    (void)vhi;
+}
+
+int kl_list_needed(const char *path, char names[][128], int max) {
+    return kl_list_dynamic(path, names, max, NULL, NULL, 0);
+}
+
+int kl_list_dynamic(const char *path, char names[][128], int max,
+                    char *soname, char *runpath, size_t cap) {
+    // The translation FIRST, by the same rule kl_can_load answers existence
+    // with: on device the ELF tree is deliberately not in the bundle, so the
+    // .so path is a name rather than a file and reading DT_NEEDED off it would
+    // report "no dependencies" for every library — which is a topological sort
+    // that silently degrades to directory order, and directory order is what
+    // put libfilesystem_stdio before libtier0.
+    char cand[1024];
+    const char *real = path;
+    if (dylib_candidate(path, cand, sizeof cand, NULL, 0)) real = cand;
+
+    int fd = open(real, O_RDONLY);
+    if (fd < 0) return -1;
+    struct stat sb;
+    if (fstat(fd, &sb) != 0) { close(fd); return -1; }
+    uint8_t *file = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (file == MAP_FAILED) return -1;
+
+    elf_view view = { file, (size_t)sb.st_size, {{0}}, 0 };
+    const uint8_t *elf = file;
+    if (memcmp(elf, "\x7f" "ELF", 4) != 0) {
+        uint64_t sec_off[2] = { 0, 0 }, sec_size[2] = { 0, 0 };
+        elf = macho_klelf(file, (size_t)sb.st_size, sec_off, sec_size);
+        if (elf) klelf_view(elf, &view, sec_off, sec_size);
+    }
+    g_needed_dropped = 0;
+    int n = elf ? elf_needed(elf, &view, names, max, soname, runpath, cap) : 0;
+    if (g_needed_dropped)
+        fprintf(stderr, "  [klepton] %s: %u DT_NEEDED name(s) past the reader's %d DROPPED — "
+                        "raise the caller's table\n", path, g_needed_dropped, max);
+    munmap(file, (size_t)sb.st_size);
+    return n;
+}
+
+// Every guest library the bundle's translations carry, as .so names — the
+// device's answer to "list the guest libdir", which on device is a directory
+// that does not exist.
+//
+// The test for "is this one of the guest's" is the __klelf section itself, not
+// a name list: KL_DYLIB_DIR is the app's Frameworks/, which also holds ANGLE,
+// MoltenVK and whatever else the bundle links, and none of those carry an
+// embedded guest image. A name filter would have to be updated every time the
+// bundle gains a framework; this cannot go stale.
+unsigned kl_list_translations(char names[][64], unsigned max) {
+    const char *dir = kl_env_str("KL_DYLIB_DIR", NULL);
+    if (!dir || !*dir || !max) return 0;
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    unsigned n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) && n < max) {
+        char stem[256], path[1200];
+        const char *dot = strstr(e->d_name, ".framework");
+        if (dot && !dot[10]) {
+            snprintf(stem, sizeof stem, "%.*s", (int)(dot - e->d_name), e->d_name);
+            snprintf(path, sizeof path, "%s/%s/%s", dir, e->d_name, stem);
+        } else if ((dot = strstr(e->d_name, ".dylib")) && !dot[6]) {
+            snprintf(stem, sizeof stem, "%.*s", (int)(dot - e->d_name), e->d_name);
+            snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        } else continue;
+
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+        struct stat sb;
+        if (fstat(fd, &sb) != 0) { close(fd); continue; }
+        uint8_t *file = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (file == MAP_FAILED) continue;
+        if (macho_klelf(file, (size_t)sb.st_size, NULL, NULL))
+            snprintf(names[n++], 64, "%s.so", stem);
+        munmap(file, (size_t)sb.st_size);
+    }
+    closedir(d);
     return n;
 }

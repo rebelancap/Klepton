@@ -1,4 +1,4 @@
-// IL2CPP pc -> managed method name resolver (Unity 2019.4, metadata v24).
+// IL2CPP pc -> managed method name resolver (metadata v24 and v31).
 //
 // Turns a guest pc inside libil2cpp.so's generated code into
 // "Namespace.Type::Method", using the same structures Il2CppDumper reads
@@ -24,5 +24,11 @@ const char *kl_il2cpp_method_at(const void *pc);
 
 // How many methods the resolver knows (0 when not initialised).
 unsigned kl_il2cpp_method_count(void);
+
+// The inverse of kl_il2cpp_method_at: every known method, in address order.
+// Built for name -> address lookups (find the method, then disassemble it)
+// rather than the pc -> name direction the resolver exists for.
+void kl_il2cpp_methods_each(void (*cb)(uint64_t addr, const char *name, void *ctx),
+                            void *ctx);
 
 #endif

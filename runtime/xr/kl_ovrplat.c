@@ -1,15 +1,23 @@
 // libovrplatformloader.so — see kl_ovrplat.h for why this is a replacement and
 // where the DRM line is drawn.
+//
+// ovr_IAP_GetViewerPurchases is ANSWERED with an EMPTY purchase array — the
+// viewer owns nothing, which is the truthful state on a host with no Oculus
+// Store account. It grants no access, unlocks no content and names no SKU; see
+// the carve-out comment below.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <dirent.h>
 #include <pthread.h>
 #include <sys/stat.h>              // the cloud-save directory is created
 #include "klepton.h"
 #include "kl_jni.h"
 #include "guest/kl_driver.h"   // target name, for the per-target KL_PLAT_USER default
 #include "kl_env.h"
+#include "kl_jni.h"                        // kl_jni_files_dir, for the save directory
+#include "kl_target.h"                     // the per-target platform-gate answer
 #include "kl_ovrplat.h"
 
 #define KL_OVRPLAT_MAX 512
@@ -42,52 +50,110 @@ static void plat_hit(const char *name) {
 //
 // What is covered and why:
 //   Entitle*  — "is this user allowed to run this", the licence check. Note the
-//               g_plat_absent carve-out below: the APP's own entitlement is
-//               answered, everything else in the family still refuses.
-//   IAP       — purchases and their ownership records.
+//               carve-out below: the APP's own entitlement is answered,
+//               everything else in the family still refuses.
+//   IAP       — purchases and their ownership records. Note the carve-out
+//               below: the request-shaped calls answer 0, "the request could
+//               not be made"; every accessor over a purchase still refuses.
 //   AssetFile — download and unlock of purchasable DLC; the delivery half of the
 //               same question. ovr_AssetFile_* is how paid content arrives.
-//               Note the g_plat_absent carve-out above: the pure *enumeration*
-//               call is answered with "nothing here", which grants no access.
+//               Note the carve-outs below: the pure *enumeration* call is
+//               answered — "nothing here" — the per-file Status calls are
+//               answered as enumerations too, and Delete joins the request
+//               carve-out. Download and DownloadCancel stay fatal; they are
+//               the delivery itself.
 //   Purchase  — belt and braces for the SDK's other spelling of IAP.
 static const char *const g_drm_markers[] = {
     "Entitle", "Entitlement", "IAP", "Purchase", "AssetFile", "AssetDetails",
 };
 
 // The carve-outs: names in the ownership families that we ANSWER rather than
-// refuse. There are exactly two, they earn it for two DIFFERENT reasons, and
-// neither reason generalises to the rest of the family — which is why these are
-// exact names, not substrings, and are checked BEFORE the markers below, so the
-// marker list keeps its fail-closed default and anything new still lands on the
-// refusal.
+// refuse. Exact names, not substrings, and checked BEFORE the markers below, so
+// the marker list keeps its fail-closed default and anything new still lands on
+// the refusal.
 //
-//   ovr_AssetFile_GetList — enumerates the DLC asset files present on this
-//     device. There are none, and saying so is a fact about this host rather
-//     than a licence decision. It unlocks nothing and is strictly MORE
-//     restrictive than the truth: no content is reachable through a run that
-//     answers it which was not reachable through a run that aborted on it. It
-//     carries no entitlement flag — the ownership question is asked by the
-//     Entitlement/IAP families, and everything that could DELIVER content
-//     (ovr_AssetFile_Download*) stays refused.
+// Two of them are upstream's:
 //
 //   ovr_Entitlement_GetIsViewerEntitled — the APPLICATION's own licence check,
-//     and the one question in this family we can actually answer. Klepton runs
-//     an APK the user unpacked from a device they own, i.e. from a copy of the
-//     app they already bought; answering yes describes that, it does not
-//     manufacture it. This is a deliberate move of the line and it is confined
-//     to the app: DLC ownership stays refused because it is genuinely
-//     unanswerable here — paid content is out-of-band asset data plus a licence
-//     held by a platform that is absent from this host, so neither half is
-//     present to check, and claiming it IS the circumvention. It is answered
-//     for real (klplat_Entitlement_GetIsViewerEntitled) rather than through the
-//     request path below, because it returns its answer directly.
+//     and the one question in this family that can actually be answered: the
+//     user unpacked an APK from a device they own, i.e. from a copy of the app
+//     they already bought; answering yes describes that, it does not
+//     manufacture it. Upstream keeps DLC ownership refused — paid content is
+//     out-of-band asset data plus a licence held by a platform absent here.
 //
-// The remaining entries are answered through klplat_init_fails, i.e. request id
-// 0: the platform request APIs are asynchronous and ovr_PopMessage never
-// produces a message, so a plausible id would leave the caller polling forever
-// for a completion that cannot come. 0 puts it on the error path it already has.
-static const char *const g_plat_absent[] = {
+//   ovr_AssetFile_GetList — enumerates the DLC asset files present on this
+//     device; answered "nothing here", which grants no access.
+//
+// A THIRD is answered here, and it is a NEGATIVE answer rather than a
+// permissive one:
+//
+//   ovr_IAP_GetViewerPurchases — "what has this viewer bought?" Answered with a
+//     ZERO-LENGTH purchase array: nothing. That is the truthful state of a host
+//     with no Oculus Store account and no purchase history, it is the same
+//     shape as upstream's GetList carve-out ("nothing here"), and it grants
+//     exactly nothing — no SKU is named, no entitlement is reported, no content
+//     is unlocked. Into the Radius asks it on its way to the first frame (its
+//     Supporter Pack check) and the refusal aborted the run before any frame
+//     could land. Answering "you own nothing"
+//     lets the game take its own no-DLC path — or gate itself, which is the
+//     honest outcome and the answer to whether this target is viable at all.
+//     The accessors over the array come with it, and they can only ever
+//     describe an empty array: GetSize is 0, GetElement is NULL, HasNextPage
+//     false, GetNextUrl NULL.
+//     **ovr_Purchase_GetSKU is deliberately NOT carved out** — it reads a field
+//     off a purchase, and there are no purchases. It is unreachable from an
+//     empty array, so leaving it on the refusal costs nothing and keeps the
+//     fail-closed default exactly where it should be: the moment anything here
+//     ever produced a purchase to describe, the run would stop and say so.
+//     Every IAP call that could DELIVER or BUY (ovr_IAP_LaunchCheckoutFlow,
+//     _ConsumePurchase, _GetProductsBySKU, the next-page fetches) still aborts
+//     through the "IAP" marker.
+//
+// A FOURTH, negative too: the per-file status spellings of the GetList
+// question (ovr_AssetFile_Status / _StatusById / _StatusByName). Some titles
+// never enumerate — Arkham Shadow asks about its language packs by name, one
+// at a time — and a refusal there stops the game at its first frame. They are
+// answered with a single AssetDetails saying "available" / "not-entitled" and
+// no path, WHATEVER the name and whatever is on disk: the platform has it in
+// its catalogue, this device does not have it, this user has no claim on it.
+// Nothing is read from the filesystem, so nothing can be asserted from it.
+//
+// Everything that could DELIVER content (ovr_AssetFile_Download*,
+// _DownloadCancel*, _Delete*) and every ownership / purchase query beyond the
+// app's own stays refused.
+static const char *const g_plat_enumeration[] = {
     "ovr_AssetFile_GetList",
+    "ovr_AssetFile_Status",
+    "ovr_AssetFile_StatusById",
+    "ovr_AssetFile_StatusByName",
+    "ovr_Message_GetAssetDetails",
+    "ovr_AssetDetails_GetAssetId",
+    "ovr_AssetDetails_GetAssetType",
+    "ovr_AssetDetails_GetAssetType_Native",
+    "ovr_AssetDetails_GetDownloadStatus",
+    "ovr_AssetDetails_GetDownloadStatus_Native",
+    "ovr_AssetDetails_GetFilepath",
+    "ovr_AssetDetails_GetFilepath_Native",
+    "ovr_AssetDetails_GetIapStatus",
+    "ovr_AssetDetails_GetIapStatus_Native",
+    "ovr_AssetDetails_GetLanguage",
+    "ovr_AssetDetails_GetMetadata",
+    "ovr_AssetDetails_GetMetadata_Native",
+
+    // The EMPTY purchase answer and the accessors over it. See the
+    // carve-out comment above: the array is always length 0, so none of these
+    // can describe a purchase, and ovr_Purchase_* stays refused.
+    "ovr_IAP_GetViewerPurchases",
+    "ovr_Message_GetPurchaseArray",
+    "ovr_PurchaseArray_GetSize",
+    "ovr_PurchaseArray_GetElement",
+    "ovr_PurchaseArray_GetNextUrl",
+    "ovr_PurchaseArray_HasNextPage",
+};
+
+// The app-level licence check: answered yes, upstream's move of the line
+// (e8089c7), which this branch inherits unchanged.
+static const char *const g_plat_app_entitled[] = {
     "ovr_Entitlement_GetIsViewerEntitled",
     // The GetList completion's readers. They match the "AssetDetails"/"AssetFile"
     // DRM markers by substring, but they only READ the empty list GetList
@@ -101,9 +167,15 @@ static const char *const g_plat_absent[] = {
     "ovr_AssetDetailsArray_GetSize",
 };
 
-static int plat_is_absent_ok(const char *name) {
-    for (size_t i = 0; i < sizeof g_plat_absent / sizeof g_plat_absent[0]; i++)
-        if (strcmp(name, g_plat_absent[i]) == 0) return 1;
+static int plat_is_enumeration(const char *name) {
+    for (size_t i = 0; i < sizeof g_plat_enumeration / sizeof g_plat_enumeration[0]; i++)
+        if (strcmp(name, g_plat_enumeration[i]) == 0) return 1;
+    return 0;
+}
+
+static int plat_is_app_entitled(const char *name) {
+    for (size_t i = 0; i < sizeof g_plat_app_entitled / sizeof g_plat_app_entitled[0]; i++)
+        if (strcmp(name, g_plat_app_entitled[i]) == 0) return 1;
     return 0;
 }
 
@@ -140,22 +212,95 @@ static int plat_is_iap_owned_query(const char *name) {
            strcmp(name, "ovr_IAP_GetViewerPurchasesDeltaAsync") == 0;
 }
 
+// ---------------------------------------------------------------------------
+// The ownership families' REQUEST half: the requests fail honestly, the
+// accessors still refuse.
+//
+// Decided 2026-08-20, on the Pinball FX VR crash. Pinball FX is
+// free-to-play and fetches its store catalogue during online init; the guest
+// called ovr_IAP_GetProductsBySKU and klplat_drm() aborted, on every launch,
+// at the splash. The line that moves is narrow and it is stated here so it can
+// be read rather than inferred:
+//
+//   A call under this list RETURNS AN ovrRequest and completes through a
+//   message. It is not an answer — it is a question asked of a service. On a
+//   host with no Oculus platform the request genuinely CANNOT BE MADE, and 0
+//   is how that is spelled (see g_plat_request below, which has drawn the same
+//   distinction for RichPresence and the init calls all along). It reports no
+//   product, no purchase, no price, no asset and no ownership. It grants
+//   access to nothing.
+//
+//   NOTHING ELSE MOVES. Every accessor that would ASSERT or DELIVER ownership
+//   keeps the unconditional abort: ovr_Purchase_*, ovr_Product_*,
+//   ovr_AssetDetails_* beyond the enumeration carve-out above, and every
+//   AssetFile Download / DownloadCancel spelling. Those are where a fabricated
+//   0 would read as an ANSWER ("you own this", "this asset is installed"), and
+//   that is the circumvention klplat_drm's paragraph is about. Keeping them
+//   fatal costs nothing: a request that answered 0 queues no message, so no
+//   accessor in these families is ever reachable from here.
+//
+// Exact names, taken from the export table of the guest's own
+// libovrplatformloader.so — not a prefix — so the marker list keeps its
+// fail-closed default and a future SDK's new ovr_IAP_* still lands on the
+// refusal. The IAP family is listed whole because every one of its eight
+// exports is request-shaped, including the two array-page walkers (which can
+// only be reached with an array we never produce). AssetFile is listed by
+// name: Status and Delete ask a service a question, Download and
+// DownloadCancel are the delivery half and are deliberately absent.
+//
+// KL_PLAT_DRM_ABORT=1 restores the abort for these names, as the A/B.
+static const char *const g_plat_drm_request[] = {
+    "ovr_IAP_ConsumePurchase",
+    "ovr_IAP_GetNextProductArrayPage",
+    "ovr_IAP_GetNextPurchaseArrayPage",
+    "ovr_IAP_GetProductsBySKU",
+    "ovr_IAP_GetViewerPurchases",
+    "ovr_IAP_GetViewerPurchasesDurableCache",
+    // NOT ovr_IAP_LaunchCheckoutFlow: buying stays on the abort (driver's
+    // guard asserts it), and a game whose catalogue is answered never needs it.
+    "ovr_AssetFile_Delete",
+    "ovr_AssetFile_DeleteById",
+    "ovr_AssetFile_DeleteByName",
+    "ovr_AssetFile_Status",
+    "ovr_AssetFile_StatusById",
+    "ovr_AssetFile_StatusByName",
+};
+
+static int plat_is_drm_request(const char *name) {
+    if (kl_env_on("KL_PLAT_DRM_ABORT", 0)) return 0;   // the A/B: refuse as before
+    // An enumeration carve-out (AssetFile_Status*, the EMPTY
+    // ovr_IAP_GetViewerPurchases) has a real answer below; it is not a
+    // request-that-could-not-be-made.
+    if (plat_is_enumeration(name)) return 0;
+    for (size_t i = 0; i < sizeof g_plat_drm_request / sizeof g_plat_drm_request[0]; i++)
+        if (strcmp(name, g_plat_drm_request[i]) == 0) return 1;
+    return 0;
+}
+
 static int plat_is_drm(const char *name) {
-    if (plat_is_absent_ok(name)) return 0;
+    if (plat_is_enumeration(name)) return 0;
+    if (plat_is_app_entitled(name)) return 0;
     if (plat_is_iap_catalog(name)) return 0;
     if (plat_is_iap_owned_query(name)) return 0;
+    if (plat_is_drm_request(name)) return 0;
     for (size_t i = 0; i < sizeof g_drm_markers / sizeof g_drm_markers[0]; i++)
         if (strstr(name, g_drm_markers[i])) return 1;
     return 0;
 }
 
-// Ownership and licence queries — everything the carve-out above does NOT name,
-// which after it is the CONTENT half: IAP, purchase records, asset details, and
-// the delivery calls. This aborts unconditionally — KL_PERMISSIVE is a scouting
-// knob for things we intend to implement, and this is not one of them. Answering
-// 0 would be worse than useless here: for a call shaped like ovr_IAP_GetProducts
-// or ovr_AssetFile_DownloadById a fabricated answer is the circumvention itself,
-// and a permissive run would produce it silently.
+// Ownership and licence ANSWERS — everything the carve-outs above do NOT name:
+// purchase records, asset details, product descriptions, and every call that
+// would deliver content. This aborts unconditionally — KL_PERMISSIVE is a
+// scouting knob for things we intend to implement, and this is not one of them.
+// Answering 0 would be worse than useless here: for a call shaped like
+// ovr_Purchase_GetExpirationTime or ovr_AssetFile_DownloadById a fabricated
+// answer is the circumvention itself, and a permissive run would produce it
+// silently.
+//
+// The request half of the same families is a different question and has a
+// different answer — see klplat_drm_request below. Asking a question of an
+// absent service and being told "the request could not be made" grants nothing;
+// being handed a purchase record does.
 static uint64_t klplat_drm(const char *name) {
     int s = plat_slot(name);
     if (s >= 0) { g_plat[s].calls++; g_plat[s].drm = 1; }
@@ -174,20 +319,99 @@ static uint64_t klplat_drm(const char *name) {
     abort();
 }
 
-// Everything else: named, so the guest says which of the 1335 it wants.
+// Set by ovr_PlatformInitializeAndroid on a plat_init target: "this run has
+// told the guest the platform came up". Declared here rather than beside the
+// message queue because the refusal paths below are its first readers.
+static int g_platform_up;
+
+// Issue a request that FAILED, and queue the error completion that retires it.
+// Defined below, next to the other request issuers; declared here because the
+// two refusal paths above it are the ones that need it. See the long comment on
+// its definition for why an unretired request is a process-lifetime hang.
+static uint64_t klplat_request_error(const char *name, const char *why);
+static int klplat_init_target(void);   // KL_PLAT_INIT, below
+
+// ...and the request half of those same families, which does NOT abort: it
+// reports FAILURE, because there is no Oculus service here to make the request
+// of. See g_plat_drm_request above for the full statement of the line and for
+// the 2026-08-20 decision that moved it.
+//
+// This is deliberately NOT klplat_init_fails: on a plat_init target that
+// function reports the PLATFORM up and returns ovrPlatformInitializeResult
+// Success, which is a different claim entirely. Here the platform's state is
+// not in question — the request's is.
+//
+// **The policy line is unchanged by the round-16 error completion.** An error
+// asserts nothing: it reports no product, no purchase, no price, no asset and
+// no ownership, and every payload accessor in these families
+// (ovr_Message_GetProductArray, ovr_Message_GetPurchaseArray, ovr_AssetFile_*)
+// is still absent from both tables, so it is still unreachable and still fatal
+// by name. What changes is only that the guest is TOLD its request finished.
+static uint64_t klplat_drm_request(const char *name) {
+    int s = plat_slot(name);
+    if (s >= 0) g_plat[s].calls++;
+    int first = (s < 0 || g_plat[s].calls == 1);
+    // Gated on KL_PLAT_INIT (the Unreal plat_init targets), NOT on
+    // g_platform_up alone: a Unity guest also brings the platform up
+    // (ovr_UnityInitWrapper / the async init), and for Unity a type-0 queued
+    // error stalls the SDK's message pump — see "Why this branch does NOT
+    // queue an ERROR message" below. Unity keeps driver's bare 0.
+    if (g_platform_up && klplat_init_target())
+        return klplat_request_error(name, first
+            ? "no Oculus service on this host. No product, purchase, price, "
+              "asset or ownership is reported; the accessors still refuse"
+            : NULL);
+    if (first)
+        fprintf(stderr, "  [plat] %s -> 0 (request NOT made, and the platform has "
+                        "not been declared up: no Oculus service on this host. No "
+                        "product, purchase, price, asset or ownership is reported; "
+                        "the accessors still refuse)\n", name);
+    return 0;
+}
+
+// Everything else: named, answered 0, and COUNTED — the terminal tier.
+//
+// This used to abort, and the abort was costing a launch per name. Paint the
+// Town Red stopped on ovr_Leaderboard_GetEntries after a boot that had already
+// composited its picture, and the surface behind it is 700 names wide in this
+// guest's own metadata: the SDK's whole C binding is compiled into libil2cpp.so
+// whether the title calls it or not, so "the next unimplemented name" is a well
+// that does not run dry one launch at a time.
+//
+// Zero is the honest answer for the overwhelming majority of what lands here,
+// and it is the SAME answer the classified tiers above give: an ovrRequest of 0
+// is "the request could not be made" (and on a Unity guest the SDK completes it
+// client-side with a synthesized error — measured, see the note above
+// g_plat_request_prefix), an ovrID of 0 is "no such user", a size of 0 is an
+// empty array, and NULL is "no string / no sub-object". The classified tiers
+// are still worth having: they say WHICH of those a name is, in the log and in
+// the census, and this one cannot.
+//
+// What is deliberately NOT softened: plat_is_drm runs FIRST in kl_ovrplat_sym
+// and still aborts unconditionally. The ownership line is a policy, not a work
+// list, and nothing here is a way around it.
+//
+// The cost is that a name whose contract needs a non-NULL handle gets a NULL.
+// Every such name in this guest's surface is classified above — the options
+// cookie, the launch-details cookie, and the three device creators — so the
+// residue is getters and commands. A run that answers any of these says so
+// loudly, once per name, and kl_ovrplat_report counts them, which is what makes
+// the next round's log a work list instead of a single tombstone.
+static unsigned g_plat_unclassified;
+
 static uint64_t klplat_called(const char *name) {
     plat_hit(name);
-    if (kl_permissive()) {
-        int s = plat_slot(name);
-        if (s >= 0 && g_plat[s].calls == 1)
-            fprintf(stderr, "  [plat] call (permissive, returning 0): %s\n", name);
-        return 0;
+    int s = plat_slot(name);
+    if (s < 0 || g_plat[s].calls == 1) {
+        g_plat_unclassified++;
+        fprintf(stderr, "  [plat] %s -> 0 (UNCLASSIFIED Oculus Platform entry "
+                        "point: no service here, and this name is not yet sorted "
+                        "into a request / accessor / command tier. Zero is a "
+                        "request that could not be made, an empty array and a "
+                        "NULL string all at once; if this guest wanted something "
+                        "else, this line is where to start)\n", name);
     }
-    fprintf(stderr, "\n[klepton] fatal: guest called unimplemented Oculus Platform "
-                    "entry point '%s'\n", name);
-    kl_ovrplat_report(stderr);
-    kl_fatal_prepare();
-    abort();
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -239,39 +463,87 @@ static uint64_t klplat_called(const char *name) {
 #define KLPLAT_MSG_ACCESS_TOKEN     0x06A85ABEu  // .User_GetAccessToken (Message<string>)
 #define KLPLAT_MSG_ACHIEVEMENT_DEFS 0x03D3458Du  // .Achievements_GetAllDefinitions (empty array)
 #define KLPLAT_MSG_LOGGED_IN_USER  0x436F345Du  // .User_GetLoggedInUser (Message<User>)
+// The same two completions as the KL_PLAT_INIT declared-user surface issues
+// them (see klplat_init_User_GetLoggedInUser): the type numbers that surface
+// was verified with. Unreal dispatches on the request id, not the type.
+#define KLPLAT_MSG_INIT_LOGGED_IN_USER 0x1D81AC88u  // .User_GetLoggedInUser
+#define KLPLAT_MSG_INIT_ACCESS_TOKEN   0x06B85AB8u  // .User_GetAccessToken
 #define KLPLAT_INIT_SUCCESS        0            // PlatformInitializeResult.Success
 #define KLPLAT_AGE_ADULT           3            // AccountAgeCategory.Ad
 
-// A ring, because the guest holds a message only until it has read it and calls
-// ovr_FreeMessage; three per run is the whole traffic, so 16 slots cannot wrap
-// under a live message. The mutex is not defensive — the requests are issued
-// from managed code on the main thread and the pump runs there too, but nothing
-// in the API promises that.
-#define KLPLAT_MSGQ 16
+// The declared local user, served to targets that bake KL_PLAT_INIT=1 — and a
+// DECLARATION in exactly the UserAgeCategory "Ad" sense above: nothing here
+// discovered this person; the user running their own copy is the only user
+// there is, and the id and name are a stand-in issued locally, the way a real
+// headset issues them from its signed-in account. Non-zero is the whole point
+// of the id: 0 is ovrID's own "no such user" and UE4's OnlineSubsystem reads
+// it as "nobody is signed in", which is a quit. The name is what
+// ovr_User_GetOculusID hands the HUD.
+#define KLPLAT_USER_ID   0x4B4C450000000001ull  // "KLE\0..." + 1
+// One token and no space, which is what an Oculus ID actually is — the field is
+// a handle, not a display name, and every guest that shows it filters it the
+// way a handle gets filtered. This was "Klepton User" until Pinball FX VR put
+// it in a high-score name box, where the game's own filter dropped the space
+// and truncated the rest into an unreadable smear. Nothing here discovered a
+// person and nothing here should pretend to have one, so the honest stand-in is
+// the generic word for the person holding the controller.
+#define KLPLAT_USER_NAME "Player"
+// ...and its "access token", which UE4's identity login pairs with the user
+// id to build its credentials. This is NOT a credential: it authenticates
+// against no service (there is none here), it is never sent anywhere, and its
+// value says so. UE4's login flow only checks that one EXISTS before it will
+// report the local player as logged in, so the string is a placeholder in the
+// same sense the user id is a placeholder — declared, and visibly so.
+#define KLPLAT_USER_TOKEN "klepton-local-not-a-real-token"
+
+// A malloc'd list, because two of the message shapes own variable-sized
+// payloads (an item array, the cloud directory's string)
+// and ovr_FreeMessage is where that ownership ends. The mutex is not defensive
+// — the requests are issued from managed code on the main thread and the pump
+// runs there too, but nothing in the API promises that.
+//
 // `str` is the STRING payload, for the messages whose managed wrapper is a
 // `Message<string>` — it is read through ovr_Message_GetString rather than
 // through the int payload above, and a message carries one or the other.
+// `items`/`count` are an array payload (the empty purchase array is the only
+// one, and it is empty); both are NULL/0 for every other shape. Everything
+// pointed to is malloc'd and freed by ovr_FreeMessage.
 typedef struct {
-    uint32_t type; uint64_t request; int32_t payload; const char *str;
+    uint64_t  asset_id;
+    char     *filepath;                    // absolute, malloc'd
+} klplat_asset;
+
+typedef struct klplat_msg {
+    uint32_t            type;
+    uint64_t            request_id;
+    int32_t             payload;
+    size_t              count;
+    klplat_asset       *items;
+    char               *str;               // ovr_Message_GetString payload, malloc'd
+    // A FAILED request's completion. `is_error` is what ovr_Message_IsError
+    // answers; `err` is a static string (never freed) that ovr_Error_GetMessage
+    // hands back. An error message carries no payload of any other kind, which
+    // is the whole of what makes it safe — see klplat_request_error.
+    int                 is_error;
+    const char         *err;
+    struct klplat_msg  *next;
 } klplat_msg;
-static klplat_msg      g_msgq[KLPLAT_MSGQ];
-static unsigned        g_msg_head, g_msg_tail;
+static klplat_msg     *g_msg_head, *g_msg_tail;
 static uint64_t        g_next_request = 1;
-static int             g_platform_up;
 static pthread_mutex_t g_msg_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t        klplat_enqueue(klplat_msg *m);
 
 // Issue a request and queue its completion. Returns the ovrRequest the guest
 // will wait on — non-zero, and matched by the message, which together are the
 // whole point.
 static uint64_t klplat_request_str(const char *what, uint32_t type,
                                    int32_t payload, const char *str) {
-    pthread_mutex_lock(&g_msg_mu);
-    uint64_t id = g_next_request++;
-    if (g_msg_tail - g_msg_head < KLPLAT_MSGQ) {
-        klplat_msg *m = &g_msgq[g_msg_tail++ % KLPLAT_MSGQ];
-        m->type = type; m->request = id; m->payload = payload; m->str = str;
-    }
-    pthread_mutex_unlock(&g_msg_mu);
+    klplat_msg *m = calloc(1, sizeof *m);
+    if (!m) return 0;
+    m->type = type;
+    m->payload = payload;
+    if (str) m->str = strdup(str);
+    uint64_t id = klplat_enqueue(m);
     fprintf(stderr, "  [plat] %s -> request %llu, completion queued "
                     "(type 0x%08x, payload %d%s%s)\n",
             what, (unsigned long long)id, type, payload,
@@ -284,17 +556,77 @@ static uint64_t klplat_request(const char *what, uint32_t type, int32_t payload)
     return klplat_request_str(what, type, payload, NULL);
 }
 
-// The message pump. NULL still means "no messages queued", which is the
-// documented way to say it and is the steady state for all but three calls a
-// run — what changed is that it is no longer the ONLY thing this can say.
-static void *klplat_PopMessage(void) {
-    plat_hit("ovr_PopMessage");
-    void *out = NULL;
-    pthread_mutex_lock(&g_msg_mu);
-    if (g_msg_head != g_msg_tail) out = &g_msgq[g_msg_head++ % KLPLAT_MSGQ];
-    pthread_mutex_unlock(&g_msg_mu);
-    return out;
+// ---------------------------------------------------------------------------
+// A request that FAILED — and the round-16 finding, which is that answering 0
+// and queueing nothing is not the cheap end of the same behaviour. It is a
+// PERMANENT LEAK in the guest, and on Pinball FX it is a process-lifetime hang.
+//
+// The old reasoning was "a fabricated request id would have the caller polling
+// ovr_PopMessage for a completion that cannot come". The premise is false: a
+// completion CAN come — an error one. What actually cannot come is the thing
+// the old answer promised, which is nothing at all.
+//
+// What the guest does with 0, measured on the device (round 16, 2026-08-22):
+// UE's FOnlineSubsystemOculus registers a completion delegate under the
+// ovrRequest it is handed, WITHOUT checking it against 0, and retires it only
+// when a message carrying that id is popped. `ovr_Leaderboard_WriteEntry -> 0,
+// no completion queued` therefore leaves a delegate — and the pending-request
+// object it keeps alive — resident for the life of the process. Zen Studios'
+// Exit-Table teardown ends in an unbounded drain on the game thread:
+//
+//     while (__atomic_load_8(&outstanding) != 0) FPlatformProcess::Sleep(0.1f);
+//
+// (libUnreal.so+0x4a67748, reached from the teardown at +0x4d57e2c through the
+// Blueprint VM). Nothing of ours is held and nothing of ours is blocked; the
+// compositor keeps re-presenting the last guest frame, which is the black
+// square. Four stall dumps twenty seconds apart show the identical stack and an
+// ovrp call total flat at 3530217. The guest does not die. It never leaves.
+//
+// So on a run that has DECLARED THE PLATFORM UP, every request must complete.
+// That is not a courtesy, it is the contract the declaration created: a real
+// initialised platform never answers 0 to a request — it answers a request id
+// and delivers a message, which for an unreachable service is an ERROR message.
+// Returning 0 after init succeeded is the one shape a real platform cannot
+// produce, and it is the shape that strands the caller.
+//
+// **This grants nothing.** An error message has no payload: `payload` is 0,
+// `str` is NULL, `items` is NULL, and every typed accessor a guest might reach
+// for over it (ovr_Message_GetLeaderboardEntryArray, ovr_Message_GetProductArray,
+// ovr_Message_GetPurchaseArray, ovr_Message_GetAchievementProgressArray, ...)
+// is absent from both name tables and still lands on klplat_called, which is
+// still fatal by name. The ownership carve-out is untouched: klplat_drm still
+// aborts on every entitlement ANSWER, and this changes only whether a REQUEST
+// that was already refused is allowed to finish being refused.
+//
+// Gated on g_platform_up rather than made unconditional, because a run that has
+// truthfully reported the platform DOWN owes nobody a completion and its guest
+// is on its own documented error path (klplat_init_fails). Only a plat_init
+// target reaches here — deadpool and pinballfx today, both UE.
+//
+// ovr_Message_GetType answers 0 (ovrMessage_Unknown) rather than a fabricated
+// per-request type: UE dispatches on the REQUEST ID and removes the delegate
+// before it ever looks at the type, so the type is not load-bearing, and
+// claiming to be a Leaderboard_WriteEntry completion would be the invention
+// this deliberately avoids. Note for a future Unity plat_init target: Unity's
+// SDK also dispatches on request id, but it builds a typed Message<T> from the
+// type first, so that port should revisit this line before it ships.
+static uint64_t klplat_request_error(const char *name, const char *why) {
+    klplat_msg *m = calloc(1, sizeof *m);
+    if (!m) return 0;
+    m->type = 0;                     // ovrMessage_Unknown — see above
+    m->is_error = 1;
+    m->err = "Klepton: there is no Oculus platform service on this host, so the "
+             "request could not be made. Nothing was reported.";
+    uint64_t id = klplat_enqueue(m);
+    if (why)
+        fprintf(stderr, "  [plat] %s -> request %llu, ERROR completion queued "
+                        "(%s). The request is reported FAILED rather than left "
+                        "outstanding — a request the guest never retires is a "
+                        "leak it waits on at teardown\n",
+                name, (unsigned long long)id, why);
+    return id;
 }
+
 
 // The accessors the SDK's Message base class and the two payload wrappers call
 // on that handle. Real functions rather than named trampolines, because these
@@ -310,12 +642,41 @@ static uint64_t klplat_Message_GetType(const klplat_msg *m) {
 }
 static uint64_t klplat_Message_IsError(const klplat_msg *m) {
     plat_hit("ovr_Message_IsError");
+    return m && m->is_error;
+}
+// The error handle IS the message, for klplat_Message_GetPayload's reason:
+// there is one error per message, so a second allocation would only be a second
+// thing to keep alive. NULL for a message that is not an error, which is what
+// the SDK's own contract says and what a caller that checks IsError first will
+// never see.
+static void *klplat_Message_GetError(klplat_msg *m) {
+    plat_hit("ovr_Message_GetError");
+    return (m && m->is_error) ? m : NULL;
+}
+static const char *klplat_Error_GetMessage(const klplat_msg *m) {
+    plat_hit("ovr_Error_GetMessage");
+    return m ? m->err : NULL;
+}
+static const char *klplat_Error_GetDisplayableMessage(const klplat_msg *m) {
+    plat_hit("ovr_Error_GetDisplayableMessage");
+    return m ? m->err : NULL;
+}
+// A code and an HTTP code, because a guest that logs the error usually reads
+// them and an unimplemented name here would trade the hang for an abort. Both
+// report "this did not work"; neither reports anything about the request.
+static uint64_t klplat_Error_GetCode(const klplat_msg *m) {
+    plat_hit("ovr_Error_GetCode");
     (void)m;
-    return 0;
+    return 1;                        // ovrError_Unknown
+}
+static uint64_t klplat_Error_GetHttpCode(const klplat_msg *m) {
+    plat_hit("ovr_Error_GetHttpCode");
+    (void)m;
+    return 0;                        // no transport was involved at all
 }
 static uint64_t klplat_Message_GetRequestID(const klplat_msg *m) {
     plat_hit("ovr_Message_GetRequestID");
-    return m ? m->request : 0;
+    return m ? m->request_id : 0;
 }
 // The payload handle IS the message: there is one payload per message here, so
 // a separate allocation would only be a second thing to keep alive.
@@ -334,11 +695,6 @@ static uint64_t klplat_payload_int(const klplat_msg *m) {
 static const char *klplat_Message_GetString(const klplat_msg *m) {
     plat_hit("ovr_Message_GetString");
     return m ? m->str : NULL;
-}
-static uint64_t klplat_FreeMessage(klplat_msg *m) {
-    plat_hit("ovr_FreeMessage");
-    (void)m;                      // the ring owns it; see the KLPLAT_MSGQ note
-    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -410,12 +766,12 @@ static uint64_t klplat_UnityInitWrapper(const char *app_id) {
     return 1;
 }
 
-// The app's own licence check — see the g_plat_absent carve-out above for why
-// this one is answered and the rest of the family is not: the user unpacked
-// their own APK, so a licence to the application itself is something we can
-// assert, while DLC needs out-of-band asset data and a licence we genuinely
-// cannot verify. Non-zero is load-bearing rather than incidental — 0 here is
-// the guest's licence-FAILURE path, not a neutral answer — so m_boot's
+// The app's own licence check — see the carve-out comment above for why this
+// one is answered and the rest of the family is not: the user unpacked their
+// own APK, so a licence to the application itself is something we can assert,
+// while DLC needs out-of-band asset data and a licence we cannot verify.
+// Non-zero is load-bearing rather than incidental — 0 here
+// is the guest's licence-FAILURE path, not a neutral answer — so m_boot's
 // check_drm_guard asserts the value, in both directions along with the
 // refusals it sits beside.
 // It is a REQUEST, not a predicate — `Entitlements.IsUserEntitledToApplication()`
@@ -570,22 +926,6 @@ static uint64_t klplat_Entitlement_GetIsViewerEntitled(void) {
 // not exist fails that test — which is the same stall wearing a different hat.
 // It sits beside the guest's files directory, so it is per-target and follows
 // KL_FILES_DIR like everything else the guest writes.
-static const char *klplat_cloud_dir(void) {
-    static char dir[1024];
-    if (!*dir) {
-        const char *env = kl_env_str("KL_PLAT_CLOUD_DIR", NULL);
-        if (env && *env) snprintf(dir, sizeof dir, "%s", env);
-        else snprintf(dir, sizeof dir, "%s/cloudstorage", kl_jni_files_dir());
-        mkdir(dir, 0755);
-    }
-    return dir;
-}
-
-static uint64_t klplat_CloudStorage2_GetUserDirectoryPath(void) {
-    plat_hit("ovr_CloudStorage2_GetUserDirectoryPath");
-    return klplat_request_str("ovr_CloudStorage2_GetUserDirectoryPath",
-                              KLPLAT_MSG_CLOUD_DIR, 0, klplat_cloud_dir());
-}
 
 // The age category, and the ONE answer in this file that is a declaration
 // rather than a measurement. See the completion-queue comment above: the user
@@ -683,9 +1023,8 @@ static const char *const g_plat_unity[] = {
     // so 0 is "none here" — which is what the real loader says by not exporting
     // it. Same answer, same reasoning, as kl_ovrp.c's copy.
     "UnityGetAudioEffectDefinitions",
-    // ovr_FreeMessage used to sit here, under "ovr_PopMessage never hands out a
-    // message, so there is never anything to free". It does now, so it has a
-    // real implementation above.
+    // ovr_FreeMessage is NOT here: it has real work to do (the enumeration
+    // messages are heap-allocated), so it routes to a real free above.
 };
 
 static int plat_is_unity_hook(const char *name) {
@@ -705,14 +1044,88 @@ static int plat_is_unity_hook(const char *name) {
 //
 // Returning a plausible request id instead would be a lie with a tail: the caller
 // would then poll ovr_PopMessage forever for a completion that cannot come.
+//
+// EXCEPT on a target that bakes KL_PLAT_INIT=1 (deadpool — see targets.py).
+// There the truthful failure is the title's whole boot: PILO calls the
+// SYNCHRONOUS ovr_PlatformInitializeAndroid, reads the user id, and
+// ForceQuits when OnlineSubsystemOculus reports the platform unusable — a
+// guest that quits before it can ask its own entitlement question is not a
+// guest being refused; it is one that never got to the question. So for such a
+// target this reports the platform UP: g_platform_up is set so
+// ovr_IsPlatformInitialized agrees, and the RETURN VALUE — 0 — is already
+// Success, because the ovr_PlatformInitialize* family returns an
+// ovrPlatformInitializeResult whose Success IS 0. No completion is owed: the
+// synchronous spelling's contract is the return value, not a message. Content
+// delivery still refuses, and check_drm_guard still asserts both directions.
+//
+// (Was a `plat_init` column on the deadpool branch; driver's table carries
+// per-target policy as the row's `env` string, so it crossed as a knob — the
+// name PORTING.md already gave it. Read once: resolution happens after
+// kl_target_use / the env file have applied the row.)
+static int klplat_init_target(void) {
+    static int v = -1;
+    if (v < 0) v = kl_env_int("KL_PLAT_INIT", 0) ? 1 : 0;
+    return v;
+}
 static uint64_t klplat_init_fails(const char *name) {
     plat_hit(name);
-    static int said;
-    if (!said) {
-        said = 1;
+    if (klplat_init_target()) {
+        g_platform_up = 1;
+        static int said_up;
+        if (!said_up) {
+            said_up = 1;
+            fprintf(stderr, "  [plat] %s -> Success (KL_PLAT_INIT: the "
+                            "synthetic platform reports it came up, so the app's "
+                            "own entitlement check can be asked and answered; "
+                            "every ownership query still refuses)\n", name);
+        }
+        return KLPLAT_INIT_SUCCESS;
+    }
+    int s = plat_slot(name);
+    if (s < 0 || g_plat[s].calls == 1)
         fprintf(stderr, "  [plat] %s -> 0 (no Oculus platform service on this host; "
                         "reporting failure rather than inventing success)\n", name);
-    }
+    return 0;
+}
+
+// ...and the ordinary request calls, which share the return value (0) but NOT
+// the claim. klplat_init_fails answers for the ovr_PlatformInitialize* family,
+// where 0 is Success and a plat_init target has to report the platform up. A
+// leaderboard fetch or a rich-presence set is not an init call: its 0 means
+// "the request could not be made", it owes no completion, and it must never be
+// the thing that declares the platform up — which it silently was, for any
+// request that happened to be asked before the init call on a plat_init target.
+//
+// Same distinction klplat_drm_request draws for the ownership families' request
+// half, for the same reason: the platform's state is not what is in question
+// here, the request's is. One line per NAME rather than one for the whole set,
+// because the next round reads this log to find out which call came last.
+//
+// Round 16: on a run that has declared the platform up, this now reports the
+// request FAILED rather than leaving it outstanding — see klplat_request_error
+// for the device evidence and for why 0-with-no-message is the one answer a
+// real initialised platform never gives. Nothing is reported either way; the
+// accessors over it stay unreachable either way. The only difference is that
+// the guest gets to retire its own pending request.
+static uint64_t klplat_request_fails(const char *name) {
+    int s = plat_slot(name);
+    if (s >= 0) g_plat[s].calls++;
+    int first = (s < 0 || g_plat[s].calls == 1);
+    // Gated on KL_PLAT_INIT (the Unreal plat_init targets), NOT on
+    // g_platform_up alone: a Unity guest also brings the platform up
+    // (ovr_UnityInitWrapper / the async init), and for Unity a type-0 queued
+    // error stalls the SDK's message pump — see "Why this branch does NOT
+    // queue an ERROR message" below. Unity keeps driver's bare 0.
+    if (g_platform_up && klplat_init_target())
+        return klplat_request_error(name, first
+            ? "no Oculus service on this host. Nothing is reported and the "
+              "accessors over it are still unreachable"
+            : NULL);
+    if (first)
+        fprintf(stderr, "  [plat] %s -> 0 (request NOT made, and the platform has "
+                        "not been declared up: no Oculus service on this host. "
+                        "Nothing is reported and no completion is queued, so the "
+                        "accessors over it are unreachable)\n", name);
     return 0;
 }
 
@@ -750,16 +1163,169 @@ static const char *const g_plat_request[] = {
     // service the request cannot be made, which is what 0 says. Beat Saber
     // 1.28 takes its offline path from there (~swap 34k of the boot).
     "ovr_User_GetLoggedInUser",
+
+    // ---- the rest of the ovr_User_* REQUEST half (batman, boot #3) ----
+    //
+    // Arkham Shadow's OculusCorePlatformProvider.InitPlatform() walks this
+    // family during startup and boot #3 died on the first member of it:
+    //
+    //   [plat] ovr_Achievements_GetAllDefinitions -> 0 (...)
+    //   E/Unity: An unknown error occurred. Request failed.       <- handled
+    //   ...
+    //   [klepton] fatal: ... unimplemented ... 'ovr_User_GetAccessToken'
+    //
+    // Those two lines are the whole argument. `ovr_Achievements_*` already
+    // answers 0 here, and the guest's own SDK turned that into a completed,
+    // FAILED request client-side and carried on for another dozen log lines —
+    // which is exactly the outcome an "error completion" is supposed to buy.
+    // The Unity SDK special-cases an ovrRequest of 0 in Callback.OnComplete and
+    // fires the callback immediately with a synthesized error ("An unknown
+    // error occurred. Request failed." is its own string, and it is in this
+    // guest's global-metadata.dat); nothing is left outstanding and nothing
+    // waits on the pump. See the note below g_plat_request_prefix for why the
+    // Unreal branches (pinballfx, deadpool) need a QUEUED error message instead
+    // and why queueing one here would be a regression.
+    //
+    // NOT a blanket ovr_User_ prefix: this family is the mixed one the comment
+    // below calls out — ovr_User_GetID / _GetOculusID / _GetDisplayName and the
+    // rest of the accessors read fields off a User handle and a blanket 0 would
+    // be a wrong ANSWER rather than a refused request. Every name here was
+    // cross-checked against the guest's OWN Message.MessageType enum in
+    // global-metadata.dat (the same table that yielded the type constants
+    // above): a name is a request exactly when the enum has a member for it,
+    // and all ten below do. Refusing them reports what a headset with no
+    // network and no signed-in session reports; none of them is an ownership
+    // question (IAP / Purchase / Entitlement / AssetFile still refuse through
+    // plat_is_drm, which runs first), and an access token we do not have is
+    // reported as absent rather than invented.
+    "ovr_User_Get",
+    "ovr_User_GetAccessToken",
+    "ovr_User_GetBlockedUsers",
+    "ovr_User_GetLinkedAccounts",
+    "ovr_User_GetLoggedInUserFriends",
+    "ovr_User_GetOrgScopedID",
+    "ovr_User_GetSdkAccounts",
+    "ovr_User_GetUserCapabilities",
+    "ovr_User_GetUserProof",
+
+    // ---- the HTTP fetch half ----
+    //
+    // The SDK's own transport, not a game feature: `ovr_HTTP_GetWithMessageType`
+    // is how every DeserializableList<T> fetches its next page, and HTTP_Get /
+    // GetToFile / Post / MultiPartPost are the plain fetches behind avatar
+    // images and the like. All five have a MessageType member in this guest's
+    // enum, so all five are requests. There is no service and no session to
+    // fetch against, so 0 — "the request could not be made" — is the literal
+    // truth, and it lands on the same handled-failure path as the achievements
+    // line above.
+    //
+    // The STREAMING trio (ovr_HTTP_StartTransfer / _Write / _WriteEOM) is
+    // deliberately absent: it is a different shape (a transfer id plus chunked
+    // writes, delivered through ovr_HttpTransferUpdate_*), it has no MessageType
+    // member, and nothing has asked for it. It keeps the fail-closed default.
+    "ovr_HTTP_Get",
+    "ovr_HTTP_GetToFile",
+    "ovr_HTTP_GetWithMessageType",
+    "ovr_HTTP_MultiPartPost",
+    "ovr_HTTP_Post",
+
+    // ---- the rest of the surface, derived rather than discovered (pttr) ----
+    //
+    // Paint the Town Red VR died on ovr_Leaderboard_GetEntries after a boot that
+    // had already composited a frame, and it was the fourth launch in a row lost
+    // to "the next name nobody implemented". The surface does not run dry that
+    // way: this guest's libil2cpp.so carries the SDK's ENTIRE C binding — 700
+    // distinct ovr_* entry points in its rodata — because Unity compiles CApi.cs
+    // whether the title calls it or not.
+    //
+    // So the split was derived in one pass instead of one launch at a time, by
+    // the test this file already established and trusts: **a name is a request
+    // exactly when the guest's own ovrMessageType enum has a member for it.**
+    // The enum members live in global-metadata.dat's identifier heap, which
+    // work/pttr-jni-census.md already parses; intersecting the 700 rodata names
+    // with the 153,246 identifiers yields 167 requests, and the residue is
+    // accessors, options builders and commands. It reproduces the nine
+    // ovr_Leaderboard_* the pinballfx branch worked out by hand from the
+    // loader's thunks (d5d0172) name for name, which is the check that the test
+    // is measuring the right thing.
+    //
+    // Listed BY NAME, never by prefix, for every family below — the mixed ones
+    // are exactly the families the prefix table's comment warned about, and
+    // ovr_Challenge_GetID or ovr_Party_GetID answering "0" would be a wrong
+    // ANSWER rather than a refused request. Names already covered elsewhere are
+    // absent by construction: the DRM families (plat_is_drm runs first), the six
+    // request PREFIXES below, the ten ovr_User_* above, the five ovr_HTTP_*, and
+    // everything in g_plat_impl / g_plat_init.
+    //
+    // None of these is an ownership question. Leaderboards and challenges record
+    // what a player SCORED, parties and NetSync are who they are playing with,
+    // Livestreaming and Media are what they broadcast, and the report/block
+    // flows are moderation. The entitlement line does not move with any of it.
+    "ovr_Leaderboard_Get", "ovr_Leaderboard_GetEntries",
+    "ovr_Leaderboard_GetEntriesAfterRank", "ovr_Leaderboard_GetEntriesByIds",
+    "ovr_Leaderboard_GetNextEntries", "ovr_Leaderboard_GetPreviousEntries",
+    "ovr_Leaderboard_WriteEntry",
+    "ovr_Leaderboard_WriteEntryWithSupplementaryMetric",
+    "ovr_Challenges_Create", "ovr_Challenges_DeclineInvite",
+    "ovr_Challenges_Delete", "ovr_Challenges_Get", "ovr_Challenges_GetEntries",
+    "ovr_Challenges_GetEntriesAfterRank", "ovr_Challenges_GetEntriesByIds",
+    "ovr_Challenges_GetList", "ovr_Challenges_GetNextChallenges",
+    "ovr_Challenges_GetNextEntries", "ovr_Challenges_GetPreviousChallenges",
+    "ovr_Challenges_GetPreviousEntries", "ovr_Challenges_Join",
+    "ovr_Challenges_Leave", "ovr_Challenges_UpdateInfo",
+    "ovr_Party_Create", "ovr_Party_GatherInApplication", "ovr_Party_Get",
+    "ovr_Party_GetCurrent", "ovr_Party_GetCurrentForUser", "ovr_Party_Invite",
+    "ovr_Party_Join", "ovr_Party_Leave",
+    "ovr_NetSync_Connect", "ovr_NetSync_Disconnect", "ovr_NetSync_GetSessions",
+    "ovr_NetSync_GetVoipAttenuation", "ovr_NetSync_GetVoipAttenuationDefault",
+    "ovr_NetSync_SetVoipAttenuation", "ovr_NetSync_SetVoipAttenuationModel",
+    "ovr_NetSync_SetVoipChannelCfg", "ovr_NetSync_SetVoipGroup",
+    "ovr_NetSync_SetVoipListentoChannels", "ovr_NetSync_SetVoipMicSource",
+    "ovr_NetSync_SetVoipSessionMuted", "ovr_NetSync_SetVoipSpeaktoChannels",
+    "ovr_NetSync_SetVoipStreamMode",
+    "ovr_Voip_GetMicrophoneAvailability", "ovr_Voip_ReportAppVoipSessions",
+    "ovr_Voip_SetSystemVoipSuppressed",
+    "ovr_RichPresence_GetDestinations", "ovr_RichPresence_SetLobbySession",
+    "ovr_RichPresence_SetMatchSession",
+    "ovr_Livestreaming_IsAllowedForApplication",
+    "ovr_Livestreaming_StartPartyStream", "ovr_Livestreaming_StartStream",
+    "ovr_Livestreaming_StopPartyStream", "ovr_Livestreaming_StopStream",
+    "ovr_Livestreaming_UpdateMicStatus",
+    "ovr_Application_CancelAppDownload",
+    "ovr_Application_CheckAppDownloadProgress",
+    "ovr_Application_GetInstalledApplications",
+    "ovr_Application_InstallAppUpdateAndRelaunch",
+    "ovr_Application_LaunchOtherApp", "ovr_Application_StartAppDownload",
+    "ovr_ApplicationLifecycle_GetRegisteredPIDs",
+    "ovr_ApplicationLifecycle_GetSessionKey",
+    "ovr_ApplicationLifecycle_RegisterSessionKey",
+    "ovr_User_CancelRecordingForReportFlow", "ovr_User_LaunchBlockFlow",
+    "ovr_User_LaunchFriendRequestFlow", "ovr_User_LaunchReportFlow",
+    "ovr_User_LaunchReportFlow2", "ovr_User_LaunchUnblockFlow",
+    "ovr_User_NewEntitledTestUser", "ovr_User_NewTestUser",
+    "ovr_User_NewTestUserFriends", "ovr_User_StartRecordingForReportFlow",
+    "ovr_User_StopRecordingAndLaunchReportFlow",
+    "ovr_User_StopRecordingAndLaunchReportFlow2",
+    "ovr_User_TestUserCreateDeviceManifest",
+    "ovr_UserAgeCategory_Report",
+    "ovr_Colocation_GetCurrentMapUuid", "ovr_Colocation_RequestMap",
+    "ovr_Colocation_ShareMap",
+    "ovr_Avatar_LaunchAvatarEditor", "ovr_Avatar_UpdateMetaData",
+    "ovr_AbuseReport_LaunchAdvancedReportFlow",
+    "ovr_AbuseReport_ReportRequestHandled",
+    "ovr_Notification_MarkAsRead",
+    "ovr_Media_ShareToFacebook",
+    "ovr_GraphAPI_Get", "ovr_GraphAPI_Post",
+    "ovr_DeviceApplicationIntegrity_GetAttestationToken",
+    "ovr_DeviceApplicationIntegrity_GetIntegrityToken",
+
     // The signed-in user's SOCIAL graph — friends, and the room/party a friend
     // is in. Pure social decoration, no ownership: with no platform service the
     // request cannot be made (0). Asgard's Wrath 2 walks this whole family right
     // after KL_PLAT_USER hands it a user; each is honestly "could not be made".
-    "ovr_User_GetLoggedInUserFriends",
     "ovr_User_GetLoggedInUserFriendsAndRooms",
     "ovr_User_GetLoggedInUserFriendsV2",
     "ovr_User_GetNextUserArrayPage",
-    "ovr_User_GetOrgScopedID",
-    "ovr_User_LaunchFriendRequestFlow",
     "ovr_User_GetLoggedInUserManagedInfo",
 };
 
@@ -778,9 +1344,79 @@ static const char *const g_plat_request[] = {
 //     the invite/roster panels read. Ownership does not enter into it, and the
 //     trailing underscore keeps this clear of ovr_GroupPresenceOptions_* below,
 //     which is a different shape entirely.
+//   ovr_CloudStorage_* / ovr_CloudStorage2_* — cloud saves. The user's own save
+//     data, not a thing they bought. 0 is right for the transfer calls: with no
+//     cloud there is nothing to load from or save to. It was NOT right for
+//     ovr_CloudStorage2_GetUserDirectoryPath, which is carved out above and
+//     answered — see the comment there for the launch it deadlocked. "A game
+//     that cannot reach the cloud writes locally" is only true if something
+//     tells it where local IS.
+//   ovr_LanguagePack_* — which language pack is current. (The _GetCurrent /
+//     _SetCurrent pair only; ovr_LanguagePackInfo_* is an accessor family and is
+//     answered separately below.)
+//   ovr_UserDataStore_* — the per-user key/value store a title keeps progress
+//     in. Again the user's own data. Note the trailing underscore keeps this
+//     clear of ovr_UserDataStoreUpdateResponse_*, which is an accessor.
+//
+// Membership here is not a judgement call: for every name under these prefixes
+// the game's own metadata carries a matching ovrMessageType, which is what
+// "returns an ovrRequest and completes through a message" means. Cross-checked
+// name by name against the MessageType enum in global-metadata.dat (the same
+// table that yielded ovrMessageType_Entitlement_GetIsViewerEntitled) —
+// Achievements 7/7, CloudStorage 9/9, CloudStorage2 1/1, LanguagePack 2/2,
+// UserDataStore 8/8. The mixed families (User_, Room_, Leaderboard_, Voip_,
+// Party_, Livestreaming_, Application_) are deliberately absent: they mix
+// requests with plain accessors, and a blanket 0 would be a wrong ANSWER rather
+// than a refused request.
+//
+// Leaderboard_ was the first of those to be asked for on device (round 6), and
+// the prediction held: nine of its twelve exports are requests and three are
+// handle accessors. Its request half is now listed BY NAME in g_plat_request
+// above — which is what "mixed" was always going to mean in practice, and why
+// the family is still not a prefix here.
 static const char *const g_plat_request_prefix[] = {
     "ovr_Achievements_", "ovr_GroupPresence_",
+    "ovr_CloudStorage_", "ovr_CloudStorage2_",
+    "ovr_LanguagePack_", "ovr_UserDataStore_",
 };
+
+// ---------------------------------------------------------------------------
+// Why this branch does NOT queue an ERROR message for a refused request
+//
+// The pinballfx branch answers a refused request with a real ovrRequest id and
+// a QUEUED error completion (klplat_request_error, c38bfe8/e2351d0), because
+// Unreal's FOnlineSubsystemOculus registers a completion delegate under the id
+// without checking it against 0 and retires it only when a message carrying
+// that id is popped — so a 0 there is a permanent leak, and Zen Studios' Exit
+// Table teardown spins forever on the outstanding count. That is a real bug and
+// that is a real fix, for a GUEST THAT BEHAVES THAT WAY.
+//
+// This guest does not. Unity's Oculus SDK special-cases request id 0 in
+// Callback.OnComplete and completes the request immediately, client-side, with
+// a synthesized error — measured in boot #3 above, where the achievements
+// request answered 0 and the very next line was the SDK's own "An unknown error
+// occurred. Request failed." with the game carrying on. Nothing is left
+// outstanding, so there is nothing for a queued message to retire.
+//
+// And queueing one would be actively worse here, which is the half worth
+// writing down. pinballfx's error message carries type 0 (ovrMessage_Unknown),
+// deliberately, because UE dispatches on the request id and never looks at the
+// type — and that file's own comment flags the Unity case as needing a revisit
+// before it ships. This is that revisit. Unity's Messages.ParseMessageHandle
+// switches on ovr_Message_GetType FIRST and builds a typed Message<T> from it;
+// its default arm logs "Unrecognized message type" (that string is in this
+// guest's global-metadata.dat) and returns null, and Request.RunCallbacks stops
+// pumping the moment PopMessage hands it a null. So a type-0 error message
+// would not complete the request — it would stall the whole message pump for
+// that frame and strand every LATER completion behind it, including the init
+// and entitlement ones this file works hard to deliver.
+//
+// Queueing a CORRECTLY TYPED error would work, but it needs the guest's own
+// ovrMessageType constant for each refused call, read out with KL_PROBE_ENUM
+// like the five above — a per-name cost with no observed symptom to pay it
+// for. If a Unity guest is ever seen waiting on a request that answered 0, that
+// is the moment to add klplat_request_error here with a real type, and not
+// before.
 
 // ---------------------------------------------------------------------------
 // Options objects: ovr_<Thing>Options_Create / _Set<Field> / _Destroy.
@@ -813,9 +1449,31 @@ static const char *const g_plat_request_prefix[] = {
 //     nothing the guest can learn from the call. It is deliberately NOT filed
 //     with the enumeration-answers-none group: those state an absence, and this
 //     one is a command with no reply.
+//   The rest of the outbound-only surface, added whole for pttr rather than one
+//   launch at a time (see the derived-request note above for the method). Every
+//   name here is a COMMAND with no reply: the guest hands us a setting, a
+//   position, a callback or a buffer to free, and asks nothing back. There is no
+//   voice chat here to configure, no NetSync session to place a listener in, no
+//   packet we allocated to free, and no test platform to reset.
+//
+//   ovr_CrashApplication is in this group deliberately even though the enum has
+//   a member for it: it is the SDK's deliberate-crash debug hook, and the one
+//   thing it must NOT do here is what its name says.
 static const char *const g_plat_drop[] = {
     "ovr_Log_NewEvent",
     "ovr_Voip_SetMicrophoneMuted",
+    "ovr_Voip_Start", "ovr_Voip_Stop", "ovr_Voip_Accept",
+    "ovr_Voip_SetOutputSampleRate", "ovr_Voip_SetNewConnectionOptions",
+    "ovr_Voip_SetSystemVoipMicrophoneMuted", "ovr_Voip_SetSystemVoipPassthrough",
+    "ovr_Voip_SetMicrophoneFilterCallback",
+    "ovr_Voip_SetMicrophoneFilterCallbackWithFixedSizeBuffer",
+    "ovr_Voip_DestroyEncoder", "ovr_Voip_DestroyDecoder",
+    "ovr_Microphone_Destroy", "ovr_Microphone_Start", "ovr_Microphone_Stop",
+    "ovr_Microphone_SetAcceptableRecordingDelayHint",
+    "ovr_NetSync_SetListenerPosition", "ovr_Packet_Free",
+    "ovr_ApplicationLifecycle_LogDeeplinkResult",
+    "ovr_SetDeveloperAccessToken", "ovr_UnityResetTestPlatform",
+    "ovr_CrashApplication",
 };
 
 static int plat_is_drop(const char *name) {
@@ -916,6 +1574,149 @@ static int plat_is_options_sink(const char *name) {
            strstr(name, "Options_Set") != NULL;
 }
 
+// ---------------------------------------------------------------------------
+// Launch details: how the app was started. Not a request — a plain accessor
+// returning an opaque handle the managed SDK immediately picks apart
+// (Models.LaunchDetails reads a dozen ovr_LaunchDetails_* fields off it in its
+// constructor). SUPERHOT asks while building its main scene.
+//
+// The truthful answer is "normally, by the user, with nothing attached": no
+// deeplink message, no destination, no room, no invited users, LaunchType 0
+// (Unknown). That is what every ovr_LaunchDetails_* accessor reports below —
+// 0 for the integers and enums, NULL for the strings — and it is the same
+// answer the real platform gives an app nobody deeplinked into.
+//
+// The handle itself must be non-NULL for the same reason the options cookie
+// is: a NULL would be carried into those accessors, and on a real platform
+// that is a null deref inside the library rather than an empty answer.
+static uint64_t klplat_GetLaunchDetails(void) {
+    plat_hit("ovr_ApplicationLifecycle_GetLaunchDetails");
+    static int said;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "  [plat] ovr_ApplicationLifecycle_GetLaunchDetails -> empty "
+                        "(launched normally: no deeplink, no destination, no party)\n");
+    }
+    return (uint64_t)(uintptr_t)g_launch_cookie;
+}
+
+// The accessors over it, plus the user array one of them hands back. Reporting
+// "nothing" is the answer, not a stand-in for one: 0 is an empty string / a
+// zero id / LaunchType_Unknown / an array of length 0, and the managed models
+// are built to be told exactly that.
+static uint64_t klplat_nothing(const char *name) {
+    plat_hit(name);
+    return 0;
+}
+
+// ovrLaunchType_ToString — the enum-to-string helper beside those accessors, and
+// UE4's OculusPlatform module calls it on whatever GetLaunchType answered so it
+// can log the launch. In this title's own libovrplatformloader.so (+0x86898) it
+// is a loader THUNK — `str w0,[sp,#0xc]; ldr x8,[got+0x120]; ldr w0,[sp,#0xc];
+// blr x8` — so the binary states the ABI (one 32-bit enum in w0, a pointer out)
+// and nothing else; the table it forwards to lives in com.oculus.horizon, which
+// is not here. The strings are the platform SDK's own OVR_LaunchType.h spelling.
+//
+// We answer 0 / ovrLaunchType_Unknown from every launch accessor (see above), so
+// "Unknown" is the string this actually produces on this host. The rest of the
+// table is there so the answer stays right if that ever changes, and the default
+// is the SDK's own "UNKNOWN_ERROR" rather than NULL — a caller that logs the
+// result with %s must not be handed one.
+static const char *klplat_LaunchType_ToString(int v) {
+    plat_hit("ovrLaunchType_ToString");
+    switch (v) {
+    case 0: return "Unknown";
+    case 1: return "Normal";
+    case 2: return "Invite";
+    case 3: return "Coordinated";
+    case 4: return "Deeplink";
+    }
+    return "UNKNOWN_ERROR";
+}
+
+static int plat_is_launch_accessor(const char *name) {
+    return strncmp(name, "ovr_LaunchDetails_", 18) == 0 ||
+           strncmp(name, "ovr_UserArray_", 14) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Accessors over a message we did not produce, and the arrays hanging off one.
+//
+// Every request above answers 0, and a request that answered 0 queues no
+// message — so on a Unity guest the SDK synthesizes the failure client-side and
+// none of these is reachable. They are answered anyway, because "not reachable"
+// is a property of the guest's SDK version rather than of this file, and the
+// price of being wrong about it has been one launch per name.
+//
+// Zero is the right answer for all of them at once, and it is the answer the
+// real SDK gives for a field that is not on an error message: an empty array, a
+// zero id, a zero rank or score, and NULL for every string and sub-handle. The
+// managed models are built to be told exactly that — DeserializableList<T>
+// reads GetSize and stops, and every optional sub-object is null-checked.
+//
+// Narrow on purpose: the message / array / error / leaderboard-entry /
+// challenge-entry families only. Everything else still falls through to the
+// terminal tier, which now NAMES what it answered instead of stopping the run,
+// so the next log is still a work list.
+//
+// It runs AFTER plat_is_request in kl_ovrplat_sym, so a request whose name
+// happens to contain one of these fragments is still classified as a request.
+static int plat_is_model_accessor(const char *name) {
+    return strstr(name, "Array_Get") != NULL              ||
+           strncmp(name, "ovr_Error_", 10)            == 0 ||
+           strncmp(name, "ovr_Message_Get", 15)       == 0 ||
+           strncmp(name, "ovr_LeaderboardEntry_", 21) == 0 ||
+           strncmp(name, "ovr_LeaderboardUpdateStatus_", 28) == 0 ||
+           strncmp(name, "ovr_ChallengeEntry_", 19)    == 0 ||
+           strncmp(name, "ovr_Challenge_", 14)         == 0;
+}
+
+static uint64_t klplat_model_accessor(const char *name) {
+    plat_hit(name);
+    int s = plat_slot(name);
+    if (s < 0 || g_plat[s].calls == 1)
+        fprintf(stderr, "  [plat] %s -> 0 (accessor over a message this host never "
+                        "produced: an empty array, a zero id and a NULL string, "
+                        "which is what the SDK reads off an error message)\n", name);
+    return 0;
+}
+
+// The three handle-returning CREATORS outside the options family, which are the
+// only names in this guest's 700 where a NULL is a contract violation rather
+// than an empty answer — and the only ones where NULL is nonetheless the honest
+// report, because the device really is absent.
+//
+// kl_aaudio refuses capture streams by design and no microphone is presented on
+// this host, so ovr_Microphone_Create has nothing to open; the two Voip codec
+// creators belong to a voice session that cannot exist without it. A real
+// headset with no microphone permission answers exactly this way, and the Unity
+// SDK's Voip.CreateEncoder / Microphone wrappers null-check what they get back.
+//
+// ovr_GetLoggedInUserLocale rides along because it is the same shape — a
+// synchronous accessor returning a const char * we do not have. NULL is the
+// SDK's "unknown", and Marshal.PtrToStringAnsi(NULL) is null on the managed
+// side rather than a fault.
+static const char *const g_plat_absent[] = {
+    "ovr_Microphone_Create", "ovr_Voip_CreateEncoder", "ovr_Voip_CreateDecoder",
+    "ovr_GetLoggedInUserLocale",
+};
+
+static int plat_is_absent(const char *name) {
+    for (size_t i = 0; i < sizeof g_plat_absent / sizeof g_plat_absent[0]; i++)
+        if (strcmp(g_plat_absent[i], name) == 0) return 1;
+    return 0;
+}
+
+static uint64_t klplat_absent(const char *name) {
+    plat_hit(name);
+    int s = plat_slot(name);
+    if (s < 0 || g_plat[s].calls == 1)
+        fprintf(stderr, "  [plat] %s -> NULL (the device or datum it would hand "
+                        "back is genuinely absent on this host, which is what a "
+                        "headset with no microphone and no session reports)\n", name);
+    return 0;
+}
+
 static int plat_is_request(const char *name) {
     for (size_t i = 0; i < sizeof g_plat_request / sizeof g_plat_request[0]; i++)
         if (strcmp(g_plat_request[i], name) == 0) return 1;
@@ -935,38 +1736,67 @@ static int plat_is_request(const char *name) {
 // for it: `ovr_User_GetLoggedInUser` beside them is the ASYNC form and correctly
 // answers "the request could not be made", while this one is asked and answered
 // on the spot. RE4 asks during engine init.
+//
+// `KL_PLAT_USER=<ovrID>` answers an id instead, and it exists because 0 is not
+// free for every guest: UE4's OnlineSubsystemOculus REFUSES to Init without a
+// logged-in user, and a subsystem that did not Init never Ticks — so it never
+// calls ovr_PopMessage, and every completion this file queues (the entitlement
+// answer included) sits in the queue forever. Measured on Tetris Effect r2:
+// 0 gives a platform surface of 9 calls and no pump at all; a non-zero id gives
+// 15, `ovr_PopMessage` x8697, and the entitlement completion actually popped,
+// checked with ovr_Message_IsError and freed.
+//
+// It is OFF by default and stays off. Answering an id is a claim about a person
+// where the truthful answer is "nobody", so it has to be asked for out loud —
+// a target that needs one bakes it, the same shape as PORTING.md's KL_PLAT_INIT
+// bake, and the log says so on every run that uses it.
+//
+// ...and on a KL_PLAT_INIT target, where the platform reported itself up, a
+// user has to exist behind that report: "initialized but nobody home" is
+// exactly what deadpool's boot refuses to run — the ForceQuit lands right
+// after this answer. The id served is the declared local user's (see the
+// constants above): not discovered, issued.
 static uint64_t klplat_GetLoggedInUserID(void) {
     plat_hit("ovr_GetLoggedInUserID");
-    // KL_PLAT_USER opts a title into a synthetic OFFLINE user, the same switch
-    // klplat_User_GetLoggedInUser reads for the async form. Some titles gate boot
-    // on "is anyone signed in?" and ForceQuit when this returns 0 — Asgard's
-    // Wrath 2 does exactly that (ovr_PlatformInitializeAndroid succeeds,
-    // ovr_GetLoggedInUserID == 0, then AndroidThunkJava_ForceQuit). The ID is
-    // the SAME synthetic ovrID ovr_User_GetID hands back, so the sync and async
-    // views of "who is playing" agree. This is a session identity, NOT an
-    // ownership answer: entitlement stays a separate request
-    // (ovr_Entitlement_GetIsViewerEntitled) that still returns "could not be
-    // made" and grants nothing. The default is the per-target one — the SAME
-    // klplat_user_default() the async form reads — so a title that fatals on a
-    // 0 here (Into the Radius, Red Matter 2: "Unable to get a valid UserID")
-    // gets the synthetic id without a flag, while titles fine with 0 (RE4) keep
-    // it. Previously this hardcoded 0 and only the async form honoured the
-    // per-target default, so the sync callers still fatalled.
-    if (kl_env_on("KL_PLAT_USER", klplat_user_default())) {
-        static int saidu;
-        if (!saidu) { saidu = 1;
-            fprintf(stderr, "  [plat] ovr_GetLoggedInUserID -> synthetic offline "
-                    "user (KL_PLAT_USER=1); NOT an entitlement grant\n"); }
-        return 1000000000000042ull;   // == klplat_User_GetID's synthetic ovrID
+    if (klplat_init_target()) {
+        static int said_id;
+        if (!said_id) {
+            said_id = 1;
+            fprintf(stderr, "  [plat] ovr_GetLoggedInUserID -> 0x%llx (the "
+                            "declared local user — KL_PLAT_INIT reported the "
+                            "platform up, so somebody is home)\n",
+                    (unsigned long long)KLPLAT_USER_ID);
+        }
+        return KLPLAT_USER_ID;
     }
+    // KL_PLAT_USER has two spellings. `=<ovrID>` (anything above 1) answers that
+    // id; `=1` (or on/yes, or the per-target default from klplat_user_default(),
+    // the SAME switch klplat_User_GetLoggedInUser reads for the async form) is
+    // the synthetic OFFLINE user, and answers the same ovrID ovr_User_GetID hands
+    // back, so the sync and async views of "who is playing" agree. Some titles
+    // gate boot on "is anyone signed in?" and ForceQuit or fatal when this
+    // returns 0 (Asgard's Wrath 2, Into the Radius, Red Matter 2: "Unable to get
+    // a valid UserID"). This is a session identity, NOT an ownership answer:
+    // entitlement stays a separate request and grants nothing here.
+    const char *forced = kl_env_str("KL_PLAT_USER", NULL);
+    unsigned long long id = forced && *forced ? strtoull(forced, NULL, 0) : 0;
+    if (id == 1 || (!id && kl_env_on("KL_PLAT_USER", klplat_user_default())))
+        id = 1000000000000042ull;   // == klplat_User_GetID's synthetic ovrID
     static int said;
     if (!said) {
         said = 1;
-        fprintf(stderr, "  [plat] ovr_GetLoggedInUserID -> 0 (no platform user; "
-                        "there is no service here to be signed in to; set "
-                        "KL_PLAT_USER=1 for a synthetic offline user)\n");
+        if (id)
+            fprintf(stderr, "  [plat] ovr_GetLoggedInUserID -> %llu (KL_PLAT_USER: "
+                            "there is no Oculus account here, this id is INVENTED "
+                            "— set so the guest's platform subsystem will "
+                            "initialize and pump its messages; NOT an entitlement "
+                            "grant)\n", id);
+        else
+            fprintf(stderr, "  [plat] ovr_GetLoggedInUserID -> 0 (no platform user; "
+                            "there is no service here to be signed in to; set "
+                            "KL_PLAT_USER=1 for a synthetic offline user)\n");
     }
-    return 0;
+    return id;
 }
 
 // ovr_GetLoggedInUserLocale — a SYNCHRONOUS getter (returns const char*, not an
@@ -986,6 +1816,47 @@ static uint64_t klplat_GetLoggedInUserLocale(void) {
     return (uint64_t)(uintptr_t)loc;
 }
 
+// The KL_PLAT_INIT declared-user surface (consulted ahead of the KL_PLAT_USER
+// one above, and only on KL_PLAT_INIT targets — see g_plat_user_impl).
+// The ASYNC form of the same question, a REQUEST returning `Request<User>`.
+// On a KL_PLAT_INIT target it gets the real treatment — a typed
+// User_GetLoggedInUser completion through the pump, whose payload the three
+// accessors below read — because UE4's identity login awaits exactly that
+// message and 0 would park it on a completion that cannot come. Everywhere
+// else the truthful answer stands: 0, "the request could not be made" (Beat
+// Saber 1.28 takes its offline path from there, ~swap 34k of the boot).
+static uint64_t klplat_init_User_GetLoggedInUser(void) {
+    plat_hit("ovr_User_GetLoggedInUser");
+    return klplat_request("ovr_User_GetLoggedInUser",
+                          KLPLAT_MSG_INIT_LOGGED_IN_USER, 0);
+}
+
+// The User payload accessors. The payload handle IS the message (same move as
+// klplat_Message_GetPayload), and the two fields are the declared constants:
+// there is exactly one user on this host, so no message carries a different
+// answer. ovr_User_GetID's return is an ovrID, ovr_User_GetOculusID's a
+// string the SDK copies.
+static uint64_t klplat_init_User_GetID(const void *h) {
+    plat_hit("ovr_User_GetID");
+    (void)h;
+    return KLPLAT_USER_ID;
+}
+static const char *klplat_init_User_GetOculusID(const void *h) {
+    plat_hit("ovr_User_GetOculusID");
+    (void)h;
+    return KLPLAT_USER_NAME;
+}
+
+// The third leg of UE4's identity login (FOculusIdentityInterface asks for
+// the token, the user, and then combines them). A `Request<string>`, so the
+// answer rides the string-payload channel the cloud directory already uses;
+// the value is the declared placeholder above, on KL_PLAT_INIT targets only.
+static uint64_t klplat_init_User_GetAccessToken(void) {
+    plat_hit("ovr_User_GetAccessToken");
+    return klplat_request_str("ovr_User_GetAccessToken",
+                              KLPLAT_MSG_INIT_ACCESS_TOKEN, 0, KLPLAT_USER_TOKEN);
+}
+
 // The real libovrplatformloader exports JNI_OnLoad and caches the JavaVM out of
 // it. Ours has no JNI surface to set up, so the whole body is the version
 // number Android checks for.
@@ -1003,6 +1874,353 @@ static uint64_t klplat_JNI_OnLoad(void *vm, void *reserved) {
     (void)vm; (void)reserved;
     plat_hit("JNI_OnLoad");
     return 0x00010006;                 // JNI_VERSION_1_6
+}
+
+// ---------------------------------------------------------------------------
+// The completion queue: a request builds a real message, queues it and returns
+// a request id; the SDK's own pump (ovr_PopMessage, already called every frame)
+// delivers it on a later call. Every string points into the message and is
+// freed by ovr_FreeMessage, after the SDK has copied what it needs — that is
+// the real platform's lifetime contract.
+
+// One queue, two message shapes. Publishing is its own function because the
+// moment a message is on the queue it belongs to whoever pops it next — reading
+// anything back out of `m` after this returns is a use-after-free waiting for a
+// second thread — so the request id comes back by value and the caller keeps
+// nothing.
+static uint64_t klplat_enqueue(klplat_msg *m) {
+    pthread_mutex_lock(&g_msg_mu);
+    uint64_t id = m->request_id = g_next_request++;
+    if (g_msg_tail) g_msg_tail->next = m;
+    else            g_msg_head = m;
+    g_msg_tail = m;
+    pthread_mutex_unlock(&g_msg_mu);
+    return id;
+}
+
+// A completion with no payload: type, request id, and "not an error", which is
+// every field the SDK reads off a message it has no accessor for. The
+// entitlement answer is exactly this shape.
+static uint64_t klplat_queue_bare(uint32_t type) {
+    klplat_msg *m = calloc(1, sizeof *m);
+    if (!m) return 0;
+    m->type = type;
+    return klplat_enqueue(m);
+}
+
+// ---------------------------------------------------------------------------
+// ovr_CloudStorage2_GetUserDirectoryPath — the one cloud-save call that has to
+// be ANSWERED rather than refused.
+//
+// It was in the request-returning families below, answering 0 ("the request
+// could not be made"), on the reasoning that a game which cannot reach the
+// cloud writes locally. For SUPERHOT that reasoning is wrong in a way that
+// cost this port a week: 0 does not put the game on a local path, it puts it
+// on NO path. `VRSaveManager::LoadAsync` (libil2cpp+0xd2174c) asks for the
+// directory and hangs its whole continuation off the answer —
+//
+//     req = CloudStorage2.GetUserDirectoryPath();
+//     if (req == null) FailedToLoad(...);            // quits
+//     req.OnComplete(LoadAsyncContinued);            // the ONLY way forward
+//
+// — and the SDK's OnComplete drops a request whose id is 0 on the floor with
+// "An unknown error occurred. Request failed.", so `LoadAsyncContinued` never
+// runs, `VRLaunch::OnLoadCompleted` never runs, and the `LoadSceneAsync` at
+// the end of it never happens. The launch scene stays on screen forever. That
+// is the same shape as the entitlement bug above: a request id nothing would
+// ever complete.
+//
+// So: queue a real completion carrying a real directory. This asserts nothing
+// about ownership — a per-user save directory is the user's own data, not a
+// purchase — and the honest answer on a machine with no Oculus cloud is a
+// local directory that is really there. `LoadAsyncContinued` stores it as the
+// save folder and `PerformOneTimeSaveMerging` calls IsDirectoryWritable on it
+// before anything else (and quits if it is not), so it is created here.
+//
+// 0x76a42eee is ovrMessageType_CloudStorage2_GetUserDirectoryPath, read out of
+// the guest's own metadata with KL_PROBE_ENUM=Oculus.Platform.Message/
+// MessageType (kl_mprobe.c) — the same table, cross-checked in the same run
+// against the two constants already baked here: Entitlement_GetIsViewerEntitled
+// 0x186b58b1 and AssetFile_GetList 0x4afc6f74, both exact.
+#define KL_MSG_CLOUDSTORAGE2_GETUSERDIRECTORYPATH 0x76a42eeeu
+
+static uint64_t klplat_CloudStorage2_GetUserDirectoryPath(void) {
+    plat_hit("ovr_CloudStorage2_GetUserDirectoryPath");
+
+    // KL_PLAT_CLOUD_DIR overrides the directory; setting it EMPTY restores the
+    // old request-id-0 refusal, which is the A/B for "is this what unblocked
+    // the launch".
+    const char *over = kl_env_str("KL_PLAT_CLOUD_DIR", NULL);
+    if (over && !*over) return 0;
+
+    static char dir[1100];
+    if (!dir[0]) {
+        if (over) snprintf(dir, sizeof dir, "%s", over);
+        // A sibling of getFilesDir()'s `files`, not a child: the game merges
+        // this directory against Application.persistentDataPath (which IS
+        // `files`), and a save folder nested inside the folder it is being
+        // merged with invites the game to find its own copies.
+        else snprintf(dir, sizeof dir, "%s/cloudstorage", kl_jni_files_dir());
+    }
+    struct stat st;
+    if (stat(dir, &st) != 0 && mkdir(dir, 0755) != 0) {
+        fprintf(stderr, "  [plat] ovr_CloudStorage2_GetUserDirectoryPath: cannot "
+                        "create %s — answering 0 (the request could not be made)\n", dir);
+        return 0;
+    }
+
+    klplat_msg *m = calloc(1, sizeof *m);
+    if (!m) return 0;
+    m->type = KL_MSG_CLOUDSTORAGE2_GETUSERDIRECTORYPATH;
+    m->str  = strdup(dir);
+    if (!m->str) { free(m); return 0; }
+    uint64_t req = klplat_enqueue(m);
+    static int said;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "  [plat] ovr_CloudStorage2_GetUserDirectoryPath -> \"%s\" "
+                        "(no Oculus cloud here; the user's save directory is local)\n", dir);
+    }
+    return req;
+}
+
+// The message pump. NULL still means "no messages queued" — the documented
+// steady state; it can also hand out a queued completion.
+static void *klplat_PopMessage(void) {
+    plat_hit("ovr_PopMessage");
+    pthread_mutex_lock(&g_msg_mu);
+    klplat_msg *m = g_msg_head;
+    if (m) {
+        g_msg_head = m->next;
+        if (!g_msg_head) g_msg_tail = NULL;
+        m->next = NULL;
+    }
+    pthread_mutex_unlock(&g_msg_mu);
+    return m;
+}
+
+static uint64_t klplat_FreeMessage(klplat_msg *m) {
+    plat_hit("ovr_FreeMessage");
+    if (!m) return 0;
+    for (size_t i = 0; i < m->count; i++) free(m->items[i].filepath);
+    free(m->items);
+    free(m->str);
+    free(m);
+    return 0;
+}
+
+// Accessors over the message and its contents. The handles are our own
+// structs; every read goes through one of these, so the layout is ours.
+static uint64_t    klplat_msg_type(klplat_msg *m)        { return m ? m->type : 0; }
+static uint64_t    klplat_msg_is_error(klplat_msg *m)    { return m && m->is_error; }
+static uint64_t    klplat_msg_request_id(klplat_msg *m)  { return m ? m->request_id : 0; }
+static void       *klplat_msg_error(klplat_msg *m)       { return (m && m->is_error) ? m : NULL; }
+static const char *klplat_err_message(klplat_msg *m)     { return m ? m->err : NULL; }
+static uint64_t    klplat_err_code(klplat_msg *m)        { (void)m; return 1; }
+static uint64_t    klplat_err_http(klplat_msg *m)        { (void)m; return 0; }
+static void       *klplat_msg_string(klplat_msg *m)      { return m ? m->str : NULL; }
+static void       *klplat_msg_native(klplat_msg *m)      { return m; }
+static void       *klplat_msg_asset_array(klplat_msg *m) { return m; }
+static uint64_t    klplat_arr_size(klplat_msg *m)        { return m ? m->count : 0; }
+static void       *klplat_arr_element(klplat_msg *m, uint64_t i) {
+    return (m && i < m->count) ? &m->items[i] : NULL;
+}
+// ---------------------------------------------------------------------------
+// ovr_AssetFile_Status / _StatusById / _StatusByName — answered "available /
+// not-entitled", for every name, on every target (see the carve-out comment at
+// the top). The SDK's Message<AssetDetails>: one AssetDetails read through
+// ovr_Message_GetAssetDetails. The three message types are the SDK's own
+// ovrMessageType members (read out of a guest's metadata with KL_PROBE_ENUM,
+// with AssetFile_GetList 0x4afc6f74 reproduced as the calibration): the
+// managed side switches on the type before it reads anything, so a guessed
+// number would be a completion that never arrives.
+//
+// What a caller sees is "this asset exists in the store and is not here and
+// not yours": DownloadStatus "available", IapStatus "not-entitled", no file
+// path. A game that would go on to download it hits ovr_AssetFile_Download*,
+// which still aborts. Nothing here looks at the filesystem.
+#define KL_MSG_ASSETFILE_STATUS       0x02d32f60u
+#define KL_MSG_ASSETFILE_STATUSBYID   0x5d955d38u
+#define KL_MSG_ASSETFILE_STATUSBYNAME 0x41cfda50u
+
+// A stable nonzero id per name (FNV-1a over the basename), so a later *ById
+// call about the same asset is answered about the same asset.
+static uint64_t klplat_asset_id(const char *name) {
+    uint64_t h = 1469598103934665603ull;
+    for (const unsigned char *p = (const unsigned char *)name; p && *p; p++)
+        h = (h ^ *p) * 1099511628211ull;
+    return h ? h : 1;
+}
+
+static uint64_t klplat_status_msg(const char *what, uint32_t type,
+                                  const char *name, uint64_t id) {
+    plat_hit(what);
+    const char *base = name;
+    if (base) { const char *sl = strrchr(base, '/'); if (sl) base = sl + 1; }
+    klplat_msg *m = calloc(1, sizeof *m);
+    if (!m) return 0;
+    m->type  = type;
+    m->items = calloc(1, sizeof *m->items);
+    if (!m->items) { free(m); return 0; }
+    m->count = 1;
+    m->items[0].asset_id = id ? id : klplat_asset_id(base && *base ? base : "?");
+    m->items[0].filepath = NULL;              // not here: no path to report
+    uint64_t req = klplat_enqueue(m);         // `m` is the queue's from here on
+    static int said;
+    if (said++ < 8)
+        fprintf(stderr, "  [plat] %s(\"%s\") -> available / not-entitled (no "
+                        "platform here; nothing is owned, nothing is installed)\n",
+                what, base && *base ? base : "<by id>");
+    return req;
+}
+static uint64_t klplat_StatusByName(const char *name) {
+    return klplat_status_msg("ovr_AssetFile_StatusByName",
+                             KL_MSG_ASSETFILE_STATUSBYNAME, name, 0);
+}
+static uint64_t klplat_StatusById(uint64_t id) {
+    return klplat_status_msg("ovr_AssetFile_StatusById",
+                             KL_MSG_ASSETFILE_STATUSBYID, NULL, id);
+}
+static uint64_t klplat_Status(uint64_t id) {          // the deprecated spelling
+    return klplat_status_msg("ovr_AssetFile_Status",
+                             KL_MSG_ASSETFILE_STATUS, NULL, id);
+}
+
+// The single-AssetDetails payload, and the accessors over it.
+static void       *klplat_msg_asset_details(klplat_msg *m) {
+    return (m && m->count) ? &m->items[0] : NULL;
+}
+static uint64_t    klplat_ad_id(klplat_asset *a)       { return a ? a->asset_id : 0; }
+static const char *klplat_ad_type(klplat_asset *a)     { (void)a; return "default"; }
+static const char *klplat_ad_status(klplat_asset *a)   { (void)a; return "available"; }
+static const char *klplat_ad_path(klplat_asset *a)     { (void)a; return NULL; }
+static const char *klplat_ad_iap(klplat_asset *a)      { (void)a; return "not-entitled"; }
+static void       *klplat_ad_language(klplat_asset *a) { (void)a; return NULL; }
+static const char *klplat_ad_meta(klplat_asset *a)     { (void)a; return ""; }
+// The language-pack sub-object: none, so its accessors answer NULL (the
+// managed model reads them unconditionally when it parses an AssetDetails).
+static const char *klplat_lang_string(void *h)         { (void)h; return NULL; }
+
+// ---------------------------------------------------------------------------
+// ovr_IAP_GetViewerPurchases — answered EMPTY.
+//
+// The one ownership question in this file that is answered with a NEGATIVE
+// rather than refused. See the carve-out comment at the top for the policy; the
+// mechanics are: queue a completion carrying a purchase array of length 0, hand
+// the guest a real request id, and let its own pump deliver it. count is 0 and
+// items is NULL, so every accessor over it already says "nothing".
+//
+// THE MESSAGE TYPE IS 0 (ovrMessage_Unknown), on purpose, and it is safe here
+// for the same reason it is on the pinballfx branch (see the note under
+// g_plat_request_prefix): UNREAL dispatches a completion on the REQUEST ID.
+// FOnlineSubsystemOculus::OnReceiveMessage looks the id up in its
+// RequestDelegates map and only falls back to ovr_Message_GetType for
+// notifications, which have no id. Into the Radius is a UE 4.27 guest and
+// libUE4 imports ovr_Message_GetRequestID / _IsError / _GetPurchaseArray for
+// exactly that path. A UNITY guest would need the real ovrMessageType constant
+// read out of its own metadata with KL_PROBE_ENUM (Messages.ParseMessageHandle
+// switches on the type FIRST), so if this is ever wanted on a Unity title, that
+// is the thing to add before it is used there — not a guessed number.
+static uint64_t klplat_IAP_GetViewerPurchases(void) {
+    plat_hit("ovr_IAP_GetViewerPurchases");
+
+    klplat_msg *m = calloc(1, sizeof *m);
+    if (!m) return 0;
+    m->type  = 0;                 // ovrMessage_Unknown; UE dispatches on the id
+    m->count = 0;                 // ...and the array is EMPTY. That is the answer.
+    m->items = NULL;
+    uint64_t req = klplat_enqueue(m);
+    static int said;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "  [plat] ovr_IAP_GetViewerPurchases -> request %llu, "
+                        "completion queued with an EMPTY purchase array (this "
+                        "viewer owns nothing: there is no Oculus Store account "
+                        "here and no purchase history. Nothing is claimed, no "
+                        "SKU is named, and every purchasing / delivery call "
+                        "still refuses)\n", (unsigned long long)req);
+    }
+    return req;
+}
+
+// The accessors over that empty array. The message IS the array handle, as it
+// is for the asset enumeration; size and element route to the shared array
+// accessors, which answer 0 and NULL for count 0.
+static uint64_t    klplat_purch_has_next(klplat_msg *m) { (void)m; return 0; }
+static const char *klplat_purch_next_url(klplat_msg *m) { (void)m; return NULL; }
+
+static const struct { const char *name; void *fn; } g_plat_enum_impl[] = {
+    {"ovr_AssetFile_Status",                        klplat_Status},
+    {"ovr_AssetFile_StatusById",                    klplat_StatusById},
+    {"ovr_AssetFile_StatusByName",                  klplat_StatusByName},
+    {"ovr_Message_GetAssetDetails",                 klplat_msg_asset_details},
+    {"ovr_AssetDetails_GetAssetId",                 klplat_ad_id},
+    {"ovr_AssetDetails_GetAssetType",               klplat_ad_type},
+    {"ovr_AssetDetails_GetAssetType_Native",        klplat_ad_type},
+    {"ovr_AssetDetails_GetDownloadStatus",          klplat_ad_status},
+    {"ovr_AssetDetails_GetDownloadStatus_Native",   klplat_ad_status},
+    {"ovr_AssetDetails_GetFilepath",                klplat_ad_path},
+    {"ovr_AssetDetails_GetFilepath_Native",         klplat_ad_path},
+    {"ovr_AssetDetails_GetIapStatus",               klplat_ad_iap},
+    {"ovr_AssetDetails_GetIapStatus_Native",        klplat_ad_iap},
+    {"ovr_AssetDetails_GetLanguage",                klplat_ad_language},
+    {"ovr_AssetDetails_GetMetadata",                klplat_ad_meta},
+    {"ovr_AssetDetails_GetMetadata_Native",         klplat_ad_meta},
+    {"ovr_LanguagePackInfo_GetEnglishName",            klplat_lang_string},
+    {"ovr_LanguagePackInfo_GetEnglishName_Native",     klplat_lang_string},
+    {"ovr_LanguagePackInfo_GetNativeName",             klplat_lang_string},
+    {"ovr_LanguagePackInfo_GetNativeName_Native",      klplat_lang_string},
+    {"ovr_LanguagePackInfo_GetTag",                    klplat_lang_string},
+    {"ovr_LanguagePackInfo_GetTag_Native",             klplat_lang_string},
+    {"ovr_FreeMessage",                             klplat_FreeMessage},
+    {"ovr_Message_GetType",                         klplat_msg_type},
+    {"ovr_Message_IsError",                         klplat_msg_is_error},
+    {"ovr_Message_GetRequestID",                    klplat_msg_request_id},
+    {"ovr_Message_GetError",                        klplat_msg_error},
+    {"ovr_Error_GetMessage",                        klplat_err_message},
+    {"ovr_Error_GetMessage_Native",                 klplat_err_message},
+    {"ovr_Error_GetDisplayableMessage",             klplat_err_message},
+    {"ovr_Error_GetDisplayableMessage_Native",      klplat_err_message},
+    {"ovr_Error_GetCode",                           klplat_err_code},
+    {"ovr_Error_GetHttpCode",                       klplat_err_http},
+    {"ovr_Message_GetString",                       klplat_msg_string},
+    {"ovr_Message_GetString_Native",                klplat_msg_string},
+    {"ovr_Message_GetNativeMessage",                klplat_msg_native},
+    // The empty purchase answer. ovr_Purchase_* is NOT here on purpose:
+    // an empty array has no element to read a SKU off, so those names keep the
+    // refusal.
+    {"ovr_IAP_GetViewerPurchases",                  klplat_IAP_GetViewerPurchases},
+    {"ovr_Message_GetPurchaseArray",                klplat_msg_asset_array},
+    {"ovr_PurchaseArray_GetSize",                   klplat_arr_size},
+    {"ovr_PurchaseArray_GetElement",                klplat_arr_element},
+    {"ovr_PurchaseArray_HasNextPage",               klplat_purch_has_next},
+    {"ovr_PurchaseArray_GetNextUrl",                klplat_purch_next_url},
+};
+
+// ---------------------------------------------------------------------------
+// ovrKeyValuePair_makeString — the platform SDK's own struct constructor,
+// which libUE4 (Deadpool) LINKS rather than reaching through dlsym.
+//
+// The ABI is the header's (OVR_Platform_Defs.h, the 1.x-era SDK this loader
+// speaks): a 32-byte struct, returned BY VALUE — which is an sret through x8
+// at this size, so this stays a plain C struct return and lets the compiler
+// do the ABI. The real loader's copy is a gate, not an implementation: it
+// aborts unless ovr_PlatformInitializeAndroid ran (verified in the shipped
+// binary — "...makeString was called before ovr_PlatformInitializeAndroid!"),
+// because the pair only matters to calls the service answers. Here it is pure
+// local state, so the constructor just constructs.
+typedef struct {
+    const char *key;
+    int type;                        // 0 string, 1 int, 2 double (the header's enum)
+    int int_value;
+    double double_value;
+    const char *string_value;
+} klplat_kvpair;
+
+static klplat_kvpair klplat_KeyValuePair_makeString(const char *key, const char *value) {
+    plat_hit("ovrKeyValuePair_makeString");
+    klplat_kvpair p = { key, 0, 0, 0.0, value };
+    return p;
 }
 
 static const struct { const char *name; void *fn; } g_plat_impl[] = {
@@ -1058,6 +2276,18 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"ovr_Message_GetNativeMessage", (void *)klplat_Message_GetPayload},
     {"ovr_Message_IsError",       (void *)klplat_Message_IsError},
     {"ovr_Message_GetRequestID",  (void *)klplat_Message_GetRequestID},
+    // A failed request's completion, and the accessors a guest reads off it.
+    // libUnreal imports ovr_Message_GetError and ovr_Error_GetMessage by name
+    // (FOnlineSubsystemOculus::OnReceiveMessage logs the error and then retires
+    // the delegate); the rest are here so that a guest which logs more of the
+    // error does not trade round 16's hang for an unimplemented-name abort.
+    {"ovr_Message_GetError",      (void *)klplat_Message_GetError},
+    {"ovr_Error_GetMessage",      (void *)klplat_Error_GetMessage},
+    {"ovr_Error_GetMessage_Native", (void *)klplat_Error_GetMessage},
+    {"ovr_Error_GetDisplayableMessage", (void *)klplat_Error_GetDisplayableMessage},
+    {"ovr_Error_GetDisplayableMessage_Native", (void *)klplat_Error_GetDisplayableMessage},
+    {"ovr_Error_GetCode",         (void *)klplat_Error_GetCode},
+    {"ovr_Error_GetHttpCode",     (void *)klplat_Error_GetHttpCode},
     {"ovr_Message_GetPlatformInitialize",      (void *)klplat_Message_GetPayload},
     {"ovr_PlatformInitialize_GetResult",       (void *)klplat_payload_int},
     {"ovr_Message_GetUserAccountAgeCategory",  (void *)klplat_Message_GetPayload},
@@ -1066,8 +2296,13 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"ovr_Message_GetString",     (void *)klplat_Message_GetString},
     {"ovr_CloudStorage2_GetUserDirectoryPath",
                                   (void *)klplat_CloudStorage2_GetUserDirectoryPath},
+    {"ovr_ApplicationLifecycle_GetLaunchDetails", (void *)klplat_GetLaunchDetails},
+    // Takes the enum value in w0, so it cannot go through a named trampoline
+    // either — see klplat_LaunchType_ToString.
+    {"ovrLaunchType_ToString",    (void *)klplat_LaunchType_ToString},
+    // The SDK's own struct constructor, which libUE4 (deadpool) links.
+    {"ovrKeyValuePair_makeString",  (void *)klplat_KeyValuePair_makeString},
 };
-
 static const char g_plat_handle[] = "klepton-ovrplatformloader";
 
 int kl_ovrplat_claims(const char *soname) {
@@ -1088,6 +2323,18 @@ void *kl_ovrplat_dlopen(const char *soname) {
     return (void *)g_plat_handle;
 }
 
+// The declared local user's surface (KL_PLAT_INIT targets ONLY): the request,
+// the payload accessor and the User field accessors it lands on. A table of its
+// own, consulted only when the knob is on, so every other target keeps driver's
+// classification of these names (request-fails / model accessor) unchanged.
+static const struct { const char *name; void *fn; } g_plat_user_impl[] = {
+    {"ovr_User_GetLoggedInUser",    (void *)klplat_init_User_GetLoggedInUser},
+    {"ovr_Message_GetUser",         (void *)klplat_Message_GetPayload},
+    {"ovr_User_GetID",              (void *)klplat_init_User_GetID},
+    {"ovr_User_GetOculusID",        (void *)klplat_init_User_GetOculusID},
+    {"ovr_User_GetAccessToken",     (void *)klplat_init_User_GetAccessToken},
+};
+
 int kl_ovrplat_is_handle(const void *h) { return h == (const void *)g_plat_handle; }
 
 void *kl_ovrplat_sym(const char *name) {
@@ -1101,8 +2348,18 @@ void *kl_ovrplat_sym(const char *name) {
         if (s >= 0) g_plat[s].drm = 1;
         return kl_named_stub(name, (void *)klplat_drm);
     }
+    // The ownership families' request half: answered 0 rather than refused.
+    // Checked here, immediately after the refusal, so the two halves of the
+    // policy read together — requests fail honestly, accessors still refuse.
+    if (plat_is_drm_request(name))
+        return kl_named_stub(name, (void *)klplat_drm_request);
+    if (klplat_init_target())
+        for (size_t i = 0; i < sizeof g_plat_user_impl / sizeof g_plat_user_impl[0]; i++)
+            if (strcmp(g_plat_user_impl[i].name, name) == 0) return g_plat_user_impl[i].fn;
     for (size_t i = 0; i < sizeof g_plat_impl / sizeof g_plat_impl[0]; i++)
         if (strcmp(g_plat_impl[i].name, name) == 0) return g_plat_impl[i].fn;
+    for (size_t i = 0; i < sizeof g_plat_enum_impl / sizeof g_plat_enum_impl[0]; i++)
+        if (strcmp(g_plat_enum_impl[i].name, name) == 0) return g_plat_enum_impl[i].fn;
     if (plat_is_unity_hook(name))
         return kl_named_stub(name, (void *)klplat_void);
     if (plat_is_drop(name))
@@ -1117,10 +2374,20 @@ void *kl_ovrplat_sym(const char *name) {
         return kl_named_stub(name, (void *)klplat_empty_array);
     if (plat_is_options_sink(name))
         return kl_named_stub(name, (void *)klplat_void);
+    if (plat_is_launch_accessor(name))
+        return kl_named_stub(name, (void *)klplat_nothing);
     if (plat_is_init_async(name))
         return kl_named_stub(name, (void *)klplat_init_async);
-    if (plat_is_absent_ok(name) || plat_is_init(name) || plat_is_request(name))
+    if (plat_is_init(name))
         return kl_named_stub(name, (void *)klplat_init_fails);
+    if (plat_is_absent(name))
+        return kl_named_stub(name, (void *)klplat_absent);
+    // Requests before accessors: a request name that happens to contain one of
+    // the accessor fragments is still a request.
+    if (plat_is_request(name))
+        return kl_named_stub(name, (void *)klplat_request_fails);
+    if (plat_is_model_accessor(name))
+        return kl_named_stub(name, (void *)klplat_model_accessor);
     return kl_named_stub(name, (void *)klplat_called);
 }
 
@@ -1135,6 +2402,10 @@ void kl_ovrplat_report(FILE *f) {
     }
     fprintf(f, "\n=== Oculus Platform surface ===\n");
     fprintf(f, "  resolved: %u, of which called: %u\n", g_nplat, called);
+    if (g_plat_unclassified)
+        fprintf(f, "  %u name%s answered 0 from the UNCLASSIFIED tier — each one is "
+                   "a line above saying so, and the next round's work list\n",
+                g_plat_unclassified, g_plat_unclassified == 1 ? "" : "s");
     if (drm) {
         fprintf(f, "  --- entitlement / ownership (REFUSED by policy) ---\n");
         for (unsigned i = 0; i < g_nplat; i++)

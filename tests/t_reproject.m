@@ -1366,16 +1366,402 @@ static void check_overlay_pixels(void) {
     }
 }
 
+// THE GUARD BAND — the black wedges a rotated quad leaves behind.
+//
+// The quad is sized by the tangents the guest rendered with, which are the
+// display's own, so it fills the eye EXACTLY at zero correction and stops
+// covering it the instant the model-view rotates. Under head ROLL that leaves
+// four black wedges at the corners, moving with the head — what was reported
+// from the headset on 2026-08-23, and what `guard` fills.
+//
+// Measured the way the report describes it: roll the quad and read the CORNER
+// of the render target. With no guard the corner is the clear colour; with one
+// it is the picture. Both arms are here so a pass cannot be the corner simply
+// never being reached.
+static void check_guard_band(void) {
+    printf("=== the guard band, under roll ===\n");
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    if (!dev || !q) { printf("  no Metal device — skipped\n"); return; }
+
+    NSError *err = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:
+                              [NSString stringWithUTF8String:kl_reproject_msl()]
+                                           options:nil error:&err];
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"kl_reproject_v"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"kl_reproject_f"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd
+                                                                       error:&err];
+    if (!ps) { ok(0, "pipeline for the guard-band check"); return; }
+
+    // A source that is one flat colour, so "did the corner get the picture" is
+    // a single comparison and cannot be confused with which texel was sampled.
+    const uint8_t C[4] = { 0, 0, 255, 255 };
+    MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+    td.textureType = MTLTextureType2DArray;
+    td.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    td.width = 8; td.height = 8; td.arrayLength = 2;
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> src = [dev newTextureWithDescriptor:td];
+    uint8_t s[8 * 8 * 4];
+    for (int i = 0; i < 8 * 8; i++) memcpy(s + i * 4, C, 4);
+    for (int sl = 0; sl < 2; sl++)
+        [src replaceRegion:MTLRegionMake2D(0,0,8,8) mipmapLevel:0 slice:sl
+                 withBytes:s bytesPerRow:32 bytesPerImage:256];
+
+    MTLTextureDescriptor *rd = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                     width:32 height:32 mipmapped:NO];
+    rd.usage = MTLTextureUsageRenderTarget;
+    rd.storageMode = MTLStorageModeShared;
+    id<MTLTexture> dst = [dev newTextureWithDescriptor:rd];
+
+    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+    sd.minFilter = MTLSamplerMinMagFilterNearest;
+    sd.magFilter = MTLSamplerMinMagFilterNearest;
+    sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    id<MTLSamplerState> samp = [dev newSamplerStateWithDescriptor:sd];
+
+    // A pure ROLL of 3 degrees: a rotation about the view's own Z, which is the
+    // axis that leaves the quad's centre alone and its corners uncovered.
+    const float roll = 3.0f * (float)M_PI / 180.0f;
+    float cs = cosf(roll), sn = sinf(roll);
+    simd_float4x4 R = matrix_identity_float4x4;
+    R.columns[0] = simd_make_float4( cs, sn, 0, 0);
+    R.columns[1] = simd_make_float4(-sn, cs, 0, 0);
+
+    simd_float4x4 P = kl_reproject_projection(1, 1, 1, 1, 0.03f);
+    kl_ovrp_render_pose r = {0};
+    r.serial = 1; r.qw = 1;
+    for (int e = 0; e < 2; e++)
+        for (int i = 0; i < 4; i++) r.tangents[e][i] = 1.0f;
+
+    // Heap-allocated, not a VLA: a block cannot capture a variably-modified
+    // type, and the corner probe below is a block so both arms run identically.
+    const size_t grid_n = kl_reproject_grid_entries(8, 8);
+    const size_t grid_bytes = grid_n * sizeof(simd_float2);
+    simd_float2 *grid = malloc(grid_bytes);
+    const float vp[4] = { 0, 0, 8, 8 };
+    kl_reproject_grid_build(grid, 8, 8, vp, 8, 8, 8, 8, NULL, NULL);
+
+    // The corner texel of the render target, for a given guard.
+    uint8_t (^corner)(float) = ^uint8_t(float g) {
+        kl_reproject_uniforms u = kl_reproject_build(&r, 0, matrix_identity_float4x4,
+                                                     matrix_identity_float4x4, P, 0, 0, 0);
+        u.model_view = R;
+        u.guard = g;
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = dst;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+        id<MTLCommandBuffer> cmd = [q commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:ps];
+        [enc setFragmentTexture:src atIndex:0];
+        [enc setFragmentTexture:src atIndex:1];
+        [enc setFragmentSamplerState:samp atIndex:0];
+        [enc setVertexBytes:&u length:sizeof u atIndex:0];
+        [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+        [enc setVertexBytes:grid length:grid_bytes atIndex:1];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0
+                vertexCount:kl_reproject_grid_vertices(8, 8)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        uint8_t px[4] = {0};
+        [dst getBytes:px bytesPerRow:4 fromRegion:MTLRegionMake2D(0,0,1,1) mipmapLevel:0];
+        return px[2];                      // blue: 255 = picture, 0 = the clear
+    };
+
+    // The failing direction FIRST, so the assertion below is known to be
+    // measuring something: with no guard the roll must leave the corner black.
+    ok(corner(0.0f) == 0, "with no guard a rolled quad leaves the corner BLACK "
+                          "— the head-roll wedges, reproduced");
+    ok(corner(0.10f) == 255, "...and a guard band fills that corner with the "
+                             "picture's edge instead");
+    // The default is BAKED, so it is checked rather than assumed: a build whose
+    // default silently became 0 would pass both arms above and ship the bug.
+    kl_reproject_uniforms u = kl_reproject_build(&r, 0, matrix_identity_float4x4,
+                                                 matrix_identity_float4x4, P, 0, 0, 0);
+    ok(u.guard > 0.0f, "kl_reproject_build BAKES a guard band by default "
+                       "(the Home View carries no environment)");
+    free(grid);
+}
+
+// ===========================================================================
+// A FOVEATED DoubleWide — the one configuration that had never been exercised
+//
+// Every foveation test above uses `half_s2p`, a LINEAR stand-in, and every
+// DoubleWide test (check_split_crop_pixels) passes no map at all. So the
+// combination Tetris Effect actually runs in — two eyes side by side in one
+// canvas, under a real non-linear rate map — was covered by nothing, and a
+// defect lived there for four rounds.
+//
+// The defect: the display's rate curve describes ONE EYE, and a DoubleWide
+// guest's canvas is two. Stretching the one-eye curve across both puts each
+// eye's dense region against the SEAM instead of at its own centre, and runs
+// each eye's outboard edge at the rate meant for the canvas's edge. The fix is
+// the curve TILED per eye. Both arms are asserted here, so the test says what
+// the bug was as well as what the fix is.
+
+// Screen -> physical through a zone curve, which is what an
+// MTLRasterizationRateMap does: the screen splits into `n` equal zones and each
+// one gets a share of the physical extent proportional to its rate.
+typedef struct {
+    const float *qx; int nx; float screen_w, phys_w;
+    const float *qy; int ny; float screen_h, phys_h;
+} curve_ctx;
+
+static float curve_map(float s, const float *q, int n, float screen, float phys) {
+    if (s <= 0) return 0;
+    if (s >= screen) return phys;
+    float total = 0;
+    for (int i = 0; i < n; i++) total += q[i];
+    float zone = screen / (float)n;
+    int   i    = (int)(s / zone);
+    if (i >= n) i = n - 1;
+    float acc = 0;
+    for (int k = 0; k < i; k++) acc += q[k];
+    acc += q[i] * ((s - (float)i * zone) / zone);
+    return phys * acc / total;
+}
+
+static void curve_s2p(void *ctx, float sx, float sy, float *px, float *py) {
+    const curve_ctx *c = ctx;
+    *px = curve_map(sx, c->qx, c->nx, c->screen_w, c->phys_w);
+    *py = curve_map(sy, c->qy, c->ny, c->screen_h, c->phys_h);
+}
+
+// Where the picture is DENSEST inside one eye's block, as a fraction of that
+// eye's width. Physical extent is the INTEGRAL of the rate, so a high-rate zone
+// consumes MORE texture per unit of screen: the fovea is the grid column with
+// the LARGEST uv span, not the smallest. (Getting that backwards is the first
+// thing this test did, and it reported the fovea at the periphery in both
+// arms — which is worth the sentence, because the same inversion in the
+// compositor would be invisible.)
+static float densest_column(const simd_float2 *g, uint32_t eye,
+                            uint32_t nx, uint32_t ny) {
+    uint32_t base = 1u + eye * kl_reproject_grid_stride(nx, ny);
+    uint32_t row  = ny / 2;                 // the middle row, away from the edges
+    float best = -1.0f; uint32_t at = 0;
+    for (uint32_t x = 0; x < nx; x++) {
+        float span = g[base + row * (nx + 1) + x + 1].x -
+                     g[base + row * (nx + 1) + x].x;
+        if (span > best) { best = span; at = x; }
+    }
+    return ((float)at + 0.5f) / (float)nx;
+}
+
+static void check_foveated_doublewide(void) {
+    printf("=== a foveated DoubleWide: whose eye is the rate curve for? ===\n");
+    // One eye's curve: single-peaked at its own centre, periphery at a fifth.
+    // (The device's is the per-zone MAX of the two views' layers and so is
+    // twin-peaked, but the question here is where the peak LANDS, and one peak
+    // makes that unambiguous.)
+    static const float one_eye[8] = {0.2f, 0.3f, 0.5f, 1.0f, 1.0f, 0.5f, 0.3f, 0.2f};
+    static float tiled[16];
+    for (int i = 0; i < 16; i++) tiled[i] = one_eye[i % 8];
+
+    const float SW = 12288, SH = 4928;          // the DoubleWide canvas
+    const float vp0[4] = {0, 0, SW / 2, SH};
+    const float vp1[4] = {SW / 2, 0, SW / 2, SH};
+    const uint32_t nx = 8, ny = 4;
+
+    simd_float2 *g = malloc(kl_reproject_grid_entries_n(nx, ny, 2) * sizeof *g);
+
+    // --- the bug: one eye's curve stretched across both eyes ---
+    curve_ctx stretched = { one_eye, 8, SW, SW, one_eye, 8, SH, SH };
+    kl_reproject_grid_build_eye(g, 0, nx, ny, vp0, SW, SH, SW, SH, curve_s2p, &stretched);
+    kl_reproject_grid_build_eye(g, 1, nx, ny, vp1, SW, SH, SW, SH, curve_s2p, &stretched);
+    float bad0 = densest_column(g, 0, nx, ny);
+    float bad1 = densest_column(g, 1, nx, ny);
+    printf("     stretched: densest column at %.2f / %.2f of each eye\n", bad0, bad1);
+    ok(bad0 > 0.7f && bad1 < 0.3f,
+       "stretching one eye's curve across two drives each fovea to the SEAM");
+
+    // --- the fix: the same curve, tiled once per eye ---
+    curve_ctx per_eye = { tiled, 16, SW, SW, one_eye, 8, SH, SH };
+    kl_reproject_grid_build_eye(g, 0, nx, ny, vp0, SW, SH, SW, SH, curve_s2p, &per_eye);
+    kl_reproject_grid_build_eye(g, 1, nx, ny, vp1, SW, SH, SW, SH, curve_s2p, &per_eye);
+    float good0 = densest_column(g, 0, nx, ny);
+    float good1 = densest_column(g, 1, nx, ny);
+    printf("     tiled:     densest column at %.2f / %.2f of each eye\n", good0, good1);
+    ok(fabsf(good0 - 0.5f) < 0.15f,
+       "tiled per eye, eye 0's fovea is at the centre of eye 0");
+    ok(fabsf(good1 - 0.5f) < 0.15f,
+       "...and eye 1's at the centre of eye 1");
+
+    // CONTAINMENT, under both curves. This is the claim that says a rate-map
+    // SHAPE error cannot make one eye read the other's half — the grid inverts
+    // the SAME map the guest rasterized through, so a wrong curve moves where
+    // the samples are and never where they are read from. If this ever fails,
+    // a mis-shaped map really can put the interior of the canvas at an eye's
+    // edge, and the blue-fill hunt has its answer.
+    uint32_t s = kl_reproject_grid_stride(nx, ny);
+    float e0max = 0, e1min = 1;
+    for (uint32_t i = 0; i < s; i++) {
+        if (g[1 + i].x > e0max) e0max = g[1 + i].x;
+        if (g[1 + s + i].x < e1min) e1min = g[1 + s + i].x;
+    }
+    printf("     containment: eye 0 reaches %.4f, eye 1 starts at %.4f\n", e0max, e1min);
+    ok(e0max <= 0.5f + 1e-4f, "eye 0's grid never samples past the canvas seam");
+    ok(e1min >= 0.5f - 1e-4f, "...and eye 1's never samples before it");
+
+    free(g);
+}
+
+// N12-D: the per-layer composite must not ZOOM with head speed.
+//
+// Half-Life: Alyx on the Vision Pro: "the world zooms in and out as I move my
+// head, in proportion to how fast". The shader's guard band pushes the OUTER
+// RING of grid vertices outward by `guard` with their uv unchanged, and
+// kl_reproject_build sizes guard per frame from the correction angle
+// (2*theta + 0.005). The per-layer pass drew a 1x1 grid, where EVERY vertex is
+// on the outer ring — so the whole picture was magnified by 1 + 2*guard, and
+// guard follows head speed. This models the shader's placement of a texel (the
+// cell rule below is the MSL's `cq`, and within a planar cell the uv is affine
+// in the position, which is what perspective-correct interpolation means) for a
+// device-shaped eye: the Vision Pro's asymmetric canted left eye, the guest told
+// the display's tangents and NOT the cant, the head turned 2 degrees between
+// render and display (2 deg: launch 4's worst correction was 2.6).
+static float zl_param(float uv, uint32_t dim, float guard) {
+    float f = uv * (float)dim;
+    uint32_t g0 = (uint32_t)floorf(f);
+    if (g0 >= dim) g0 = dim - 1;
+    float c0 = (float)g0 / (float)dim, c1 = (float)(g0 + 1) / (float)dim;
+    if (guard > 0) {
+        if (g0 == 0) c0 = -guard;
+        if (g0 + 1 == dim) c1 = 1.0f + guard;
+    }
+    return c0 + (c1 - c0) * (f - (float)g0);
+}
+
+static simd_float2 zl_land(kl_reproject_uniforms u, uint32_t dim, float ux, float uy) {
+    simd_float4 n = corner_ndc(u, zl_param(ux, dim, u.guard), zl_param(uy, dim, u.guard));
+    return simd_make_float2(n.x, n.y);
+}
+
+// Horizontal scale of the picture's middle: the NDC span of uv 0.3 .. 0.7 on
+// the centre row, against the same span placed with no guard band at all.
+static float zl_scale(kl_reproject_uniforms u, uint32_t dim) {
+    kl_reproject_uniforms z = u;
+    z.guard = 0;
+    float a = zl_land(u, dim, 0.7f, 0.5f).x - zl_land(u, dim, 0.3f, 0.5f).x;
+    float b = zl_land(z, dim, 0.7f, 0.5f).x - zl_land(z, dim, 0.3f, 0.5f).x;
+    return a / b;
+}
+
+static simd_float4x4 zl_rot(float deg, float ax, float ay, float az) {
+    simd_float3 a = simd_normalize(simd_make_float3(ax, ay, az));
+    return simd_matrix4x4(simd_quaternion(deg * (float)M_PI / 180.0f, a));
+}
+
+static void check_proj_layer_zoom(void) {
+    printf("=== per-layer composite: no zoom with head speed (N12-D) ===\n");
+    // Launch 4's left eye: display tangents and view rotation, as logged.
+    const float L = 1.7361f, R = 1.0030f, T = 1.0027f, B = 1.1948f;
+    simd_float4x4 P = kl_reproject_projection(L, R, T, B, 0.03f);
+    simd_float4x4 C = zl_rot(1.061f, 0.962f, -0.270f, -0.030f);
+    C.columns[3] = simd_make_float4(-0.0307f, 0.0005f, -0.0008f, 1);
+    // The head the picture was rendered at (pitched down a little, as in the
+    // log), and the head at display: 2 degrees of yaw later.
+    simd_float4x4 Hr = zl_rot(-6.7f, 1, 0, 0);
+    simd_quatf qr = simd_quaternion(Hr);
+    kl_ovrp_proj_layer pl = {0};
+    pl.slot[0] = 0; pl.slot[1] = 1;
+    pl.pose[0] = -0.016f; pl.pose[1] = 1.669f; pl.pose[2] = -0.052f;
+    pl.pose[3] = qr.vector.x; pl.pose[4] = qr.vector.y;
+    pl.pose[5] = qr.vector.z; pl.pose[6] = qr.vector.w;
+    pl.tangents[0][0] = L; pl.tangents[0][1] = R;
+    pl.tangents[0][2] = T; pl.tangents[0][3] = B;
+    pl.origin_top_left = 1;
+
+    simd_float4x4 still = Hr, turned = simd_mul(zl_rot(2.0f, 0, 1, 0), Hr);
+    still.columns[3] = turned.columns[3] = simd_make_float4(0, 1.669f, -0.052f, 1);
+    kl_reproject_uniforms u0 = kl_proj_layer_build(&pl, 0, still, C, P, 0);
+    kl_reproject_uniforms u1 = kl_proj_layer_build(&pl, 0, turned, C, P, 0);
+    printf("     guard: head still %.4f, head turned 2 deg %.4f\n", u0.guard, u1.guard);
+    ok(u1.guard > u0.guard + 0.02f,
+       "the guard band grows with the correction (the zoom's driver)");
+
+    // The bug, pinned so a regression to it is a named failure: 1x1 magnifies.
+    float s0 = zl_scale(u0, 1), s1 = zl_scale(u1, 1);
+    printf("     1x1 grid: picture scale %.4f still, %.4f turned\n", s0, s1);
+    ok(s0 > 1.05f && s1 > s0 + 0.04f,
+       "1x1 grid: the picture is magnified, MORE when the head moves");
+
+    // The fix: at 64x64 the middle of the picture is placed exactly where the
+    // guard-free placement puts it, whatever the correction.
+    uint32_t dim = KL_REPROJECT_GRID_MAX;
+    float d0 = zl_scale(u0, dim), d1 = zl_scale(u1, dim);
+    printf("     %ux%u grid: picture scale %.6f still, %.6f turned\n", dim, dim, d0, d1);
+    ok(fabsf(d0 - 1) < 1e-4f && fabsf(d1 - 1) < 1e-4f,
+       "64x64 grid: no scale change, still or turned");
+
+    // ...and that guard-free placement IS the pure rotation homography: a texel
+    // the guest drew in direction (x, y, -1) of its (uncanted) render frame
+    // lands where the display's canted eye sees that world direction now.
+    float worst = 0;
+    for (int j = 1; j < 10; j++)
+        for (int i = 1; i < 10; i++) {
+            float ux = (float)i / 10, uy = (float)j / 10;
+            simd_float2 got = zl_land(u1, dim, ux, uy);
+            simd_float3 dr = simd_make_float3(-L + (L + R) * ux, -B + (B + T) * uy, -1);
+            simd_float4x4 Rr = Hr, Rd = turned, Cr = C;
+            Rr.columns[3] = Rd.columns[3] = Cr.columns[3] = simd_make_float4(0, 0, 0, 1);
+            simd_float4 w = simd_mul(Rr, simd_make_float4(dr, 0));
+            simd_float4 v = simd_mul(simd_inverse(simd_mul(Rd, Cr)), w);
+            v.w = 1;
+            simd_float4 c = simd_mul(P, v);
+            float ex = fabsf(got.x - c.x / c.w), ey = fabsf(got.y - c.y / c.w);
+            if (ex > worst) worst = ex;
+            if (ey > worst) worst = ey;
+        }
+    printf("     worst NDC error against the rotation homography (64x64): %.2e\n", worst);
+    ok(worst < 1e-4f, "64x64: every interior texel lands on the pure rotation");
+
+    // And the knob that selects it: default 1 (every other guest unchanged).
+    unsetenv("KL_PROJ_LAYER_GRID");
+    ok(kl_proj_layer_grid_dim() == 64, "KL_PROJ_LAYER_GRID unset -> 64 (the shared default)");
+    setenv("KL_PROJ_LAYER_GRID", "1", 1);
+    ok(kl_proj_layer_grid_dim() == 1, "KL_PROJ_LAYER_GRID=1 -> 1 (the pre-fix A/B)");
+    setenv("KL_PROJ_LAYER_GRID", "64", 1);
+    ok(kl_proj_layer_grid_dim() == 64, "KL_PROJ_LAYER_GRID=64 -> 64");
+    setenv("KL_PROJ_LAYER_GRID", "999", 1);
+    ok(kl_proj_layer_grid_dim() == KL_REPROJECT_GRID_MAX, "...clamped to the grid ceiling");
+    unsetenv("KL_PROJ_LAYER_GRID");
+    simd_float2 *g = calloc(kl_reproject_grid_entries(dim, dim), sizeof *g);
+    kl_proj_layer_grid(g, dim);
+    int exact = g[0].x == (float)dim && g[0].y == (float)dim;
+    for (uint32_t y = 0; y <= dim && exact; y++)
+        for (uint32_t x = 0; x <= dim; x++) {
+            simd_float2 e = g[1 + y * (dim + 1) + x];
+            if (fabsf(e.x - (float)x / dim) > 1e-6f || fabsf(e.y - (float)y / dim) > 1e-6f) {
+                exact = 0;
+                break;
+            }
+        }
+    ok(exact, "kl_proj_layer_grid(64) is the identity at every vertex");
+    free(g);
+}
+
 int main(void) {
     @autoreleasepool {
         check_math();
+        check_guard_band();
         check_viewport();
+        check_foveated_doublewide();
         check_shader();
         check_pixels();
         check_crop_pixels();
         check_split_crop_pixels();
         check_two_textures();
         check_proj_layers();
+        check_proj_layer_zoom();
         check_overlay_math();
         check_overlay_pixels();
     }

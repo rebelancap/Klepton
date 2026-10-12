@@ -661,9 +661,15 @@ static ssize_t klmd_read(int fd, void *buf, size_t n) {
     return r;
 }
 
+// kl_shim_override is a single slot with more than one claimant — kl_dl.c's
+// trace shims install from a constructor, so they are already in it by the time
+// this runs. Chain rather than replace; dropping the previous hook would
+// silently disarm whichever instrument was asked for first.
+static void *(*g_shim_override_next)(const char *name);
+
 static void *klmd_shim_override(const char *name) {
     if (g_watch.armed && strcmp(name, "read") == 0) return (void *)klmd_read;
-    return NULL;
+    return g_shim_override_next ? g_shim_override_next(name) : NULL;
 }
 
 void kl_metadump_watch_install(void) {
@@ -672,6 +678,7 @@ void kl_metadump_watch_install(void) {
     g_watch.rearm_ms = (unsigned)kl_env_int("KL_META_WATCH_MS", 50);
     if (!g_watch.rearm_ms) g_watch.rearm_ms = 1;
     kl_file_watch = klmd_watch_file;
+    g_shim_override_next = kl_shim_override;
     kl_shim_override = klmd_shim_override;
     fprintf(stderr, "  [metawatch] on — the metadata buffer will be taken away and "
                     "every reader named\n");

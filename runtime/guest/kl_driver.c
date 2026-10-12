@@ -23,6 +23,7 @@
 #include "kl_openxr.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
+#include "kl_sdl.h"
 #include "kl_mprobe.h"
 #include "kl_sample.h"
 #include "kl_slink.h"
@@ -140,6 +141,24 @@ kl_guest_kind kl_driver_kind(void) {
 
 const char      *kl_driver_error(void)  { return g_error; }
 const char      *kl_driver_target_name(void) { return g_target ? g_target->name : NULL; }
+// See the header. The rows below were measured with this branch's defaults;
+// a row not named here runs with upstream's.
+int kl_driver_upstream_defaults(void) {
+    static int v = -1;
+    if (v >= 0) return v;
+    const char *t = kl_driver_target_name();
+    static const char *const measured[] = {
+        "batman", "beatsaber", "deadpool", "fnaf", "gorn2", "hl2vr", "itr",
+        "pinballfx", "pttr", "re4", "simpsons", "superhot", "tetris",
+    };
+    int up = 1;
+    for (unsigned i = 0; t && i < sizeof measured / sizeof *measured; i++)
+        if (!strcmp(t, measured[i])) { up = 0; break; }
+    up = kl_env_on("KL_UPSTREAM_DEFAULTS", up);
+    // Only latch once a row is known: something may ask before kl_driver_init.
+    if (t) v = up;
+    return up;
+}
 int              kl_driver_gap_only(void) { return g_gap_only; }
 unsigned         kl_driver_frames(void) { return g_frames; }
 void             kl_driver_note_frame(void) { g_frames++; }
@@ -151,6 +170,10 @@ int kl_driver_owns_frame_loop(void) {
     case KL_GUEST_STEAMLINK:
     case KL_GUEST_UE4:
     case KL_GUEST_JKXR:
+    // The SDL guest owns its loop most completely of all: the engine IS
+    // nativeRunMain, a call that does not return on a healthy run, so there is
+    // no such thing as an inline frame here either.
+    case KL_GUEST_SDL:
     case KL_GUEST_NATIVE:
     case KL_GUEST_SDL2:
     case KL_GUEST_GLES3JNI: return 1;
@@ -244,7 +267,10 @@ static int boot_unity(FILE *out) {
     phase("initJni");
     P(out, "\n=== UnityPlayer.initJni%s -> %s-arg call ===\n",
       ijsig ? ijsig : "<sig unrecorded>", initJni3 ? "3" : initJni2 ? "2" : "1");
-    void *thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
+    // The shared singleton for the same reason the Context is one: this is the
+    // object UnityPlayerActivity keeps in mUnityPlayer, and the guest reads it
+    // back through that field. See kl_jni.h.
+    void *thiz = kl_jni_unity_player();
     kl_jni_local_frame_push();
     if (initJni3)
         ((void (*)(void *, void *, void *, int, void *))initJni)(
@@ -365,6 +391,23 @@ static int boot_jkxr(FILE *out) {
     return 0;
 }
 
+// The SDL2 door — SDLActivity's convention: libc++_shared-first Kahn load off
+// DT_NEEDED, then the initializers. What kl_sdl_gap reports is the work list
+// BEFORE anything is initialised, which is the most valuable thing a run over a
+// new srceng target produces; KL_GAP_ONLY stops there.
+static int boot_sdl(FILE *out) {
+    phase("sdl configure");
+    if (kl_sdl_configure(g_libdir, out) != 0) return fail(kl_sdl_error());
+    phase("sdl chain");
+    if (kl_sdl_load(out) != 0) return fail(kl_sdl_error());
+    P(out, "\n=== the shim gap ===\n");
+    kl_sdl_gap(out);
+    if (g_gap_only) return 0;
+    P(out, "\n=== EXIT CRITERION MET: the srceng chain is bound and "
+           "initialised ===\n");
+    return 0;
+}
+
 static int boot_native(FILE *out) {
     phase("native configure");
     if (kl_native_configure(g_libdir, g_target->entry_lib, out) != 0)
@@ -411,6 +454,7 @@ int kl_driver_boot(FILE *out) {
     case KL_GUEST_STEAMLINK: rc = boot_steamlink(out); break;
     case KL_GUEST_UE4:       rc = boot_ue4(out);       break;
     case KL_GUEST_JKXR:      rc = boot_jkxr(out);      break;
+    case KL_GUEST_SDL:       rc = boot_sdl(out);       break;
     case KL_GUEST_NATIVE:    rc = boot_native(out);    break;
     case KL_GUEST_SDL2:      rc = boot_sdl2(out);      break;
     case KL_GUEST_GLES3JNI:  rc = boot_gles3jni(out);  break;
@@ -466,7 +510,8 @@ static void sample_start_if_asked(void) {
 }
 
 static int begin_unity(FILE *out) {
-    g_thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
+    // The SAME player initJni ran on, not a second instance — see kl_jni.h.
+    g_thiz = kl_jni_unity_player();
     if (!g_thiz) return fail("kl_driver_boot must run first");
 
     // Index the OBB's audio banks by basename (NULL base = no UE4 loose-path
@@ -617,12 +662,33 @@ static int begin_native(FILE *out) {
     return 0;
 }
 
+// SDLActivity.onCreate's half: libSDL2's JNI_OnLoad, the three nativeSetupJNI
+// natives, SDL_SetMainReady and the game's own setArgs. It deliberately stops
+// short of ENTERING the game — nativeRunMain never returns on a healthy run, so
+// that call is the guest thread's whole life rather than a step of a lifecycle
+// that has to come back and arm a pump. SDL's Android half assumes both halves
+// land on one thread, and they do.
+//
+// The alarm is armed across the setup half only, as a watchdog: this part
+// returns on every healthy run, and the part that does not is left unarmed on
+// purpose.
+static int begin_sdl(FILE *out) {
+    phase("SDL onCreate");
+    P(out, "\n=== SDLActivity.onCreate (the SDL door) ===\n");
+    if (g_alarm) alarm(g_alarm);
+    if (kl_sdl_begin(out) != 0) { if (g_alarm) alarm(0); return fail(kl_sdl_error()); }
+    if (g_alarm) alarm(0);
+    phase("SDL nativeRunMain");
+    return 0;
+}
+
 int kl_driver_lifecycle_begin(FILE *out) {
     if (!g_target) return fail("kl_driver_init was not called");
     switch (kl_driver_kind()) {
     case KL_GUEST_STEAMLINK: return begin_steamlink(out);
     case KL_GUEST_UE4:       return begin_ue4(out);
     case KL_GUEST_JKXR:      return begin_jkxr(out);
+    case KL_GUEST_SDL:       return begin_sdl(out);
     case KL_GUEST_NATIVE:    return begin_native(out);
     case KL_GUEST_SDL2:      return begin_sdl2(out);
     case KL_GUEST_GLES3JNI:  return begin_gles3jni(out);
@@ -710,6 +776,11 @@ void kl_driver_report(FILE *out) {
     case KL_GUEST_JKXR:
         fprintf(out, "\n=== the OpenJK run ===\n");
         kl_jkxr_report(out);
+        fflush(out);
+        return;
+    case KL_GUEST_SDL:
+        fprintf(out, "\n=== the srceng run ===\n");
+        kl_sdl_report(out);
         fflush(out);
         return;
     case KL_GUEST_NATIVE:

@@ -374,9 +374,15 @@ void kl_jni_tick_choreographer(void) {
     if (!cb) return;
     g_frame_callback = NULL;               // one-shot; doFrame may re-post
 
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    int64_t nanos = (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
+    // The instant the guest is told this frame happened at. NOT a live clock
+    // read any more: our wake-ups land on the panel's 8.33 ms slots, so a live
+    // read hands a 72 Hz engine dt = 16.67 / 16.67 / 8.33 ms forever, and Unity
+    // bakes that into its view matrices where reprojection cannot reach it. The
+    // seam advances one guest period per tick instead — a metronome, which is
+    // what vsync on a Quest actually is — and the guest's predicted display
+    // time rides the same series. See kl_ovrp.h (KL_JNI_UNIFORM_DT); with the
+    // gate off this is exactly the clock_gettime that used to be here.
+    int64_t nanos = (int64_t)(kl_ovrp_guest_frame_tick() * 1e9 + 0.5);
 
     klj_object *o = klj_as_object(cb);
     if (o && strcmp(o->cls, KLJ_CLASS_PROXY) == 0) {
@@ -456,7 +462,30 @@ static klj_val klj_View_setSysUiListener(void *env, void *self, const klj_val *a
     return (klj_val){.j = 0};
 }
 
+// ReflectionHelper.setNativeExceptionOnProxy(proxy, nativePtr, isNative) —
+// Unity's own bookkeeping on a proxy it just built, called on the Java side when
+// an exception has to be carried across the bridge. Its whole body assigns the
+// two values into the proxy's fields; nothing reads them except Unity's own
+// exception path, which runs on the guest side of the bridge and gets the values
+// from the guest.
+//
+// The id is fetched eagerly at UnityPlayer init in every boot of this title, and
+// never called yet — a latent abort that costs a launch the first time an
+// exception crosses a proxy. Bound to record: there is no Java-side proxy object
+// with fields to write, so recording is the whole of the behaviour.
+static klj_val klj_ReflectionHelper_setNativeExceptionOnProxy(void *env, void *self,
+                                                              const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("ReflectionHelper.setNativeExceptionOnProxy(proxy=%p, native=0x%llx, %s)"
+            " — recorded; the proxy's state lives on the guest side",
+            n > 0 ? a[0].l : NULL,
+            (unsigned long long)(n > 1 ? a[1].j : 0),
+            (n > 2 && a[2].j) ? "native" : "managed");
+    return (klj_val){.j = 0};
+}
+
 const klj_binding klj_bind_bridge[] = {
+    {"com/unity3d/player/ReflectionHelper", "setNativeExceptionOnProxy", "(Ljava/lang/Object;JZ)V", klj_ReflectionHelper_setNativeExceptionOnProxy},
 
     {"com/unity3d/player/ReflectionHelper", "getFieldID", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/reflect/Field;", klj_ReflectionHelper_getFieldID},
     {"com/unity3d/player/ReflectionHelper", "getMethodID", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/reflect/Method;", klj_ReflectionHelper_getMethodID},

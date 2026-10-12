@@ -42,6 +42,28 @@ KLT = targets_mod.resolve(os.environ.get("KLEPTON_TARGET") or targets_mod.DEFAUL
 NAME = KLT["product"]
 BUNDLE_ID = os.environ.get("KLEPTON_BUNDLE_ID", KLT["bundle"])
 
+# What the Home View shows under the icon. Deliberately NOT the same knob as
+# NAME: that one is the Xcode target, and therefore the .app filename, the
+# scheme, the product, the bridging header and the paths run.sh reaches into.
+# Renaming the target to reach the Home View would rewrite all of those to
+# change a string the user reads; CFBundleDisplayName is the string the user
+# reads. Quoted in the pbxproj because it contains a space.
+# The summary line below is the only reader left: the pbxproj itself takes
+# KLT["display"] from targets.py. Defaulting this to a literal game name made
+# every other target's summary claim it was Beat Saber.
+DISPLAY_NAME = os.environ.get("KLEPTON_DISPLAY_NAME", KLT["display"])
+
+# The app icon, by asset-catalog name. KLEPTON_APPICON= (empty) ships no icon
+# and gets the system placeholder back, which is the only way to tell two
+# installs of this project apart on the Home View when they differ by bundle id
+# — the name under the icon is small and the icon is what you actually aim at.
+APPICON = os.environ.get("KLEPTON_APPICON", "AppIcon")
+APPICON_SETTING = ((f"\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = {APPICON};\n"
+                    if APPICON else "")
+                   # Info.plist's CFBundleIconName is $(KL_APPICON_NAME): always
+                   # defined, so expansion never leaves a literal "$(...)" behind.
+                   + f"\t\t\t\tKL_APPICON_NAME = \"{APPICON or 'AppIcon'}\";\n")
+
 # Klepton.entitlements — the two memory capabilities (see that file for what
 # they buy and why this app wants them). **On by default: they fixed the
 # loading-transition kills on device, so a build without them is the unusual
@@ -119,7 +141,49 @@ if ENTITLEMENTS and _dropped:
 
 ENTITLEMENTS_SETTING = (f"\t\t\t\tCODE_SIGN_ENTITLEMENTS = {ENTITLEMENTS_FILE};\n"
                         if ENTITLEMENTS else "")
+
+# --- The scene manifest's initial immersion style, per target ----------------
+#
+# Info.plist declares UISceneInitialImmersionStyle, and its own comment explains
+# why it has to agree with what the app then selects: a scene declaration that
+# disagrees with the app fails SILENTLY here, which is how this file came to
+# exist at all. The style is now per-target (targets.py "immersion"), so the one
+# checked-in plist can no longer be right for everyone.
+#
+# Same trick as the entitlements filter above: rewrite it into build/ and point
+# INFOPLIST_FILE there, but only when the target wants something other than what
+# is checked in. A target on the default keeps using visionos/Info.plist
+# untouched, so nothing about Beat Saber's or Steam Link's build moves.
+INFOPLIST_FILE = "Info.plist"
+if KLT["immersion"] != targets_mod.IMMERSION_DEFAULT:
+    import plistlib
+    _style = {"mixed": "UIImmersionStyleMixed",
+              "full":  "UIImmersionStyleFull",
+              "progressive": "UIImmersionStyleProgressive"}[KLT["immersion"]]
+    _src = pathlib.Path(__file__).with_name("Info.plist")
+    _d = plistlib.loads(_src.read_bytes())
+    _roles = _d["UIApplicationSceneManifest"]["UISceneConfigurations"]
+    for _cfg in _roles["UISceneSessionRoleImmersiveSpaceApplication"]:
+        _cfg["UISceneInitialImmersionStyle"] = _style
+    _out = pathlib.Path(__file__).with_name("build") / f"Info-{KLT['name']}.plist"
+    _out.parent.mkdir(parents=True, exist_ok=True)
+    _out.write_bytes(plistlib.dumps(_d))
+    INFOPLIST_FILE = f"build/Info-{KLT['name']}.plist"
+    print(f"  scene manifest: {_style} -> {INFOPLIST_FILE}")
 GUEST = KLT["libs"].split()
+# A row's `device_libs` narrows the DEVICE bundle (hla: only the libraries its
+# native door keeps). run.sh says which build this project is for (it exports
+# KLEPTON_BUILD_MODE); absent = the simulator/whole set, as every row has had.
+if os.environ.get("KLEPTON_BUILD_MODE") == "device" and KLT.get("device_libs"):
+    _want = KLT["device_libs"].split()
+    _absent = [g for g in _want if g not in GUEST]
+    if _absent:
+        print(f"!! device_libs names {', '.join(_absent)}, not in the srcdir's "
+              f"libs ({KLT['libs']})", file=sys.stderr)
+        sys.exit(1)
+    print(f"  device bundle: {len(_want)} of {len(GUEST)} guest libraries "
+          f"(left out: {', '.join(g for g in GUEST if g not in _want)})")
+    GUEST = _want
 ANGLE = ["ANGLE_libEGL", "ANGLE_libGLESv2"]
 # ...and the OTHER renderer, for a guest whose graphics API is Vulkan (BONELAB).
 # Same treatment as ANGLE for the same reasons: one driver for every guest that
@@ -171,64 +235,31 @@ def oid(tag):
 
 PROJ    = oid("PROJ");  TARGET = oid("TGT");   PRODUCT = oid("PROD")
 G_ROOT  = oid("GROOT"); G_SRC  = oid("GSRC");  G_FW    = oid("GFW");  G_PROD = oid("GPRODS")
-BP_SRC  = oid("BPSRC"); BP_FRM = oid("BPFRM"); BP_EMB  = oid("BPEMB")
+BP_SRC  = oid("BPSRC"); BP_FRM = oid("BPFRM"); BP_EMB  = oid("BPEMB"); BP_RES = oid("BPRES")
+# ...and the phase that runs before all of them, because the app links a runtime
+# it does not build. See the script's own comment: this is the gate that a
+# 2026-08-12 device session needed and did not have.
+BP_CHK  = oid("BPCHK")
+# Assets.xcassets — the layered app icon, built by mkicon.py. It needs a
+# Resources phase of its own: the catalog is COMPILED (actool turns the
+# .solidimagestack into Assets.car plus the icon keys Info.plist advertises),
+# so copying it into the bundle would ship a directory visionOS does not read.
+F_ASSETS = oid("FASST"); B_ASSETS = oid("BASST")
 CL_PROJ = oid("CLPRJ"); CL_TGT = oid("CLTGT")
 C_PRJ_D = oid("CPRJD"); C_PRJ_R = oid("CPRJR")
 C_TGT_D = oid("CTGTD"); C_TGT_R = oid("CTGTR")
 F_C = oid("FC"); F_H = oid("FH"); F_BRIDGE = oid("FBRDG")
 B_C = oid("BC")
-# The app icon: an asset catalog holding one solid-image-stack per target that
-# has one (AppIcon-<name>.solidimagestack). Targets without one build exactly
-# as before - the catalog compiles empty for them and no APPICON setting is
-# emitted, so the icon is strictly additive.
-F_ASSETS = oid("FASSET"); B_ASSETS = oid("BASSET"); BP_RES = oid("BPRES")
 import os as _os
 # Compile-time launcher opt-in (also drives LAUNCHER_COND + the display name below).
 _launcher_on = _os.environ.get("KL_CUSTOM_LAUNCHER", "").strip().lower() in ("1", "true", "yes", "on")
 # NB: the bundle id is deliberately NOT switched by the launcher flag. It is a SIGNING
-# identity, and forcing an unregistered id (e.g. com.noosphere.hl1vr) makes every local
-# device build fail code-signing and silently relaunch the old app. For the neutral
-# store id, register the App ID first, then archive with an explicit
-# KLEPTON_BUNDLE_ID=com.noosphere.hl1vr. Local launcher builds keep the dev id and sign.
-_assets_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "Assets.xcassets")
-def _stack_exists(n): return _os.path.isdir(_os.path.join(_assets_dir, n + ".solidimagestack"))
-# With the launcher on, a trademark-free monogram icon (AppIcon-<t>-launcher) replaces
-# the target's normal icon when one is present; otherwise the normal icon stands. Both
-# are gitignored, so this is strictly local/opt-in.
-_icon_base = f"AppIcon-{KLT['name']}"
-_icon_name = (f"{_icon_base}-launcher"
-              if _launcher_on and _stack_exists(f"{_icon_base}-launcher")
-              else _icon_base)
-HAS_ICON = _stack_exists(_icon_name)
-ASSETCATALOG_SETTING = ((f"\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = \"{_icon_name}\";\n"
-                         if HAS_ICON else "")
-                        # Info.plist's CFBundleIconName is $(KL_APPICON_NAME) —
-                        # always defined so expansion never leaves a literal
-                        # "$(...)" in the bundle; the placeholder names no stack
-                        # and behaves exactly like the old no-icon build.
-                        + f"\t\t\t\tKL_APPICON_NAME = \"{_icon_name if HAS_ICON else 'AppIcon'}\";\n")
-
-# Trim the asset catalog to THIS target. The shared Assets.xcassets holds one icon
-# stack per target (~26), and actool compiles ALL of them into the app's Assets.car
-# (~75 MB of icons the app never uses). So build a per-target catalog under build/
-# (gitignored) carrying only this target's normal + launcher stacks, and reference
-# THAT below instead of the full catalog. Iconless targets get an empty catalog,
-# which builds exactly as the shared one did for them.
-import shutil as _shutil
-_appicon_catalog = f"build/appicon/{KLT['name']}.xcassets"
-_cat_abs = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), _appicon_catalog)
-_shutil.rmtree(_cat_abs, ignore_errors=True)
-_os.makedirs(_cat_abs, exist_ok=True)
-_src_contents = _os.path.join(_assets_dir, "Contents.json")
-if _os.path.exists(_src_contents):
-    _shutil.copy(_src_contents, _os.path.join(_cat_abs, "Contents.json"))
-else:
-    open(_os.path.join(_cat_abs, "Contents.json"), "w").write(
-        '{\n  "info" : { "author" : "xcode", "version" : 1 }\n}\n')
-for _stack in (_icon_base, f"{_icon_base}-launcher"):
-    _s = _os.path.join(_assets_dir, _stack + ".solidimagestack")
-    if _os.path.isdir(_s):
-        _shutil.copytree(_s, _os.path.join(_cat_abs, _stack + ".solidimagestack"))
+# identity, and forcing an unregistered id makes every local device build fail
+# code-signing and silently relaunch the old app. For a store id, register the App ID
+# first, then archive with an explicit KLEPTON_BUNDLE_ID=<id>.
+# (The app icon itself is the single Assets.xcassets/AppIcon stack mkicon.py
+# regenerates per target — APPICON_SETTING above — so there is no per-target
+# catalog to trim here.)
 
 # The Swift half of the language split: the App/UI, and the Compositor Services
 # renderer adds. A list rather than an id pair each, for the same reason
@@ -282,8 +313,8 @@ fwchildren = "\n".join(f'\t\t\t\t{g["ref"]},' for g in guest)
 # With the launcher on, the game builds present a compact trademark-free name; every
 # other build (and every other target) keeps its normal display name from targets.py.
 _launcher_display = {"hl1": "HL1VR", "hl2": "HL2VR", "portal": "P1VR"}
-_display = (_launcher_display.get(KLT['name'], KLT['display']) if _launcher_on
-            else KLT['display'])
+_display = (_launcher_display.get(KLT['name'], DISPLAY_NAME) if _launcher_on
+            else DISPLAY_NAME)
 # Trailing newline, glued at line-start to the next setting — the same shape as
 # ENTITLEMENTS_SETTING / ASSETCATALOG_SETTING above, so it lands on its own line in
 # the output and expands to nothing (no blank line) when the flag is off.
@@ -291,13 +322,13 @@ LAUNCHER_COND = ('\t\t\t\tSWIFT_ACTIVE_COMPILATION_CONDITIONS = "KL_CUSTOM_LAUNC
                  if _launcher_on else "")
 
 COMMON = f"""
-				CLANG_ENABLE_MODULES = YES;
+{APPICON_SETTING}				CLANG_ENABLE_MODULES = YES;
 {ENTITLEMENTS_SETTING}				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = {TEAM};
 				ENABLE_PREVIEWS = NO;
 				GENERATE_INFOPLIST_FILE = YES;
-{ASSETCATALOG_SETTING}				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_FILE = {INFOPLIST_FILE};
 				// One entry per runtime source directory: a runtime header is
 				// included by BARE NAME everywhere, including from
 				// Klepton-Bridging-Header.h, so each directory holding one has
@@ -349,7 +380,7 @@ COMMON = f"""
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = {KLT['version']};
 				// VideoToolbox/CoreMedia/CoreVideo are kl_vtdec's, and
 				// they were missing here for the whole of the Steam Link arc:
 				// kl_vtdec joined RUNTIME_SHIP, `make xros` kept passing because
@@ -357,7 +388,7 @@ COMMON = f"""
 				// second target needed one. The failure is a link error naming
 				// VTDecompressionSession*, which reads as a missing SDK rather
 				// than as a build setting that was never updated.
-				OTHER_LDFLAGS = "-lz -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface";
+				OTHER_LDFLAGS = "-lz -liconv -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface";
 				PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID};
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = xros;
@@ -396,10 +427,27 @@ PBX = f"""// !$*UTF8*$!
 		{F_C} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = kl_app.c; sourceTree = "<group>"; }};
 		{F_H} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = kl_app.h; sourceTree = "<group>"; }};
 		{F_BRIDGE} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Klepton-Bridging-Header.h"; sourceTree = "<group>"; }};
-		{F_ASSETS} = {{isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = {_appicon_catalog}; sourceTree = "<group>"; }};
+		{F_ASSETS} = {{isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; }};
 		{F_RT} = {{isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = Klepton.xcframework; path = ../build/Klepton.xcframework; sourceTree = "<group>"; }};
 {filerefs}
 /* End PBXFileReference section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		{BP_CHK} /* Check runtime freshness */ = {{
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = ();
+			inputFileListPaths = ();
+			inputPaths = ();
+			name = "Check runtime freshness";
+			outputFileListPaths = ();
+			outputPaths = ();
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\\"$PROJECT_DIR/check_runtime_fresh.sh\\"\\n";
+		}};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		{BP_FRM} = {{
@@ -426,14 +474,25 @@ PBX = f"""// !$*UTF8*$!
 		}};
 /* End PBXCopyFilesBuildPhase section */
 
+/* Begin PBXResourcesBuildPhase section */
+		{BP_RES} /* Resources */ = {{
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				{B_ASSETS},
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		}};
+/* End PBXResourcesBuildPhase section */
+
 /* Begin PBXGroup section */
 		{G_ROOT} = {{
 			isa = PBXGroup;
 			children = (
 				{G_SRC},
+				{F_ASSETS},
 				{G_FW},
 				{G_PROD},
-				{F_ASSETS},
 			);
 			sourceTree = "<group>";
 		}};
@@ -472,6 +531,7 @@ PBX = f"""// !$*UTF8*$!
 			isa = PBXNativeTarget;
 			buildConfigurationList = {CL_TGT};
 			buildPhases = (
+				{BP_CHK},
 				{BP_SRC},
 				{BP_FRM},
 				{BP_RES},
@@ -511,17 +571,6 @@ PBX = f"""// !$*UTF8*$!
 			);
 		}};
 /* End PBXProject section */
-
-/* Begin PBXResourcesBuildPhase section */
-		{BP_RES} = {{
-			isa = PBXResourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				{B_ASSETS},
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		}};
-/* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		{BP_SRC} = {{
@@ -612,6 +661,13 @@ def main():
     if not os.path.isdir(os.path.join(HERE, "..", "build", "Klepton.xcframework")):
         print("!! missing build/Klepton.xcframework — run `make xros` first", file=sys.stderr)
         return 1
+    # A missing catalog is not a build error — actool simply produces no icon
+    # and the app ships with the grey placeholder, which reads as "the icon did
+    # not work" rather than "the icon was never generated". Say which it is.
+    if not os.path.isdir(os.path.join(HERE, "Assets.xcassets", "AppIcon.solidimagestack")):
+        print("!! missing Assets.xcassets/AppIcon.solidimagestack — run visionos/mkicon.py first",
+              file=sys.stderr)
+        return 1
 
     proj = os.path.join(HERE, f"{NAME}.xcodeproj")
     os.makedirs(proj, exist_ok=True)
@@ -629,6 +685,8 @@ def main():
           f"{ENTITLEMENTS_FILE if ENTITLEMENTS else '(none - KLEPTON_ENTITLEMENTS=0)'}"
           + (f"  (dropped: {', '.join(_dropped)})" if ENTITLEMENTS and _dropped else ""))
     print(f"  PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID}")
+    print(f"  CFBundleDisplayName        = {DISPLAY_NAME}")
+    print(f"  ASSETCATALOG_COMPILER_APPICON_NAME = {APPICON or '(none)'}")
     print(f"  embedded guest frameworks: {', '.join(GUEST)}")
     print(f"  embedded ANGLE:            {', '.join(ANGLE)}")
     # Named either way. An absent MoltenVK is legitimate for three of the four

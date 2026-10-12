@@ -28,6 +28,82 @@ BUNDLE_ID="${KLEPTON_BUNDLE_ID:-$KLT_BUNDLE}"
 APK="$ROOT/$KLT_APK"
 ASSETS="$ROOT/$KLT_ASSETS"
 TREE="$KLT_TREE"
+# EXTRA FILES beside the OBB: loose files a guest reads by path out of
+# <files>/obb next to its .obb (Unity Addressables `*_assets_all.bundle`,
+# per-language packs, videos). They are not OBB-shaped, so the OBB block below
+# does not stage them. KL_OBB_EXTRA_DIR=<dir> names the directory (a row's
+# `obb_extra` names one relative to the repo root). Only its regular files go:
+# no dotfiles, no subdirectories, and no *.obb — those are the OBB's.
+EXTRA_SRC="${KL_OBB_EXTRA_DIR:-${KLT_OBB_EXTRA:+$ROOT/$KLT_OBB_EXTRA}}"
+extra_wanted() { [ -n "$EXTRA_SRC" ] && [ -d "$EXTRA_SRC" ]; }
+
+# A /sdcard game tree. Not OBB-shaped: the game data is a directory tree the
+# guest reaches under external storage, and kl_guest_extstorage_map points
+# /sdcard at the files dir — this container's Documents/android-files on device
+# (kl_app.c), the userdata dir on the host. Two targets have one and each
+# hardcodes its own directory NAME in the guest: hl2vr's ValveActivity2 says
+# "srceng", and Simpsons Hit & Run's libmain says "SimpsonsHitRun" (three
+# literals, /storage/emulated/0/SimpsonsHitRun). So the name is a target-table
+# field (`gamedest`) beside where the tree lives on THIS machine (`gamedata`) —
+# it was the literal "srceng" here until the second one arrived, which is the
+# table-in-a-fifth-place failure targets.py's header warns about, and it fails
+# SILENTLY: the gigabytes land, under a name the guest never looks up, and the
+# game reports missing data.
+#
+# The guest also WRITES into the tree (hl2/cfg), which the container allows and
+# the host's symlink allows too.
+GAMEDATA_DEST="${KLT_GAMEDEST:-}"
+# Where the tree is on THIS machine: KL_GAMEDATA_SRC, else the row's
+# `gamedata` (relative to the repo root), else userdata/<target>/<gamedest> —
+# the same convention the OBB source follows, so a host run and a device run
+# read the tree from one place.
+GAMEDATA_SRC="${KL_GAMEDATA_SRC:-${KLT_GAMEDATA:+$ROOT/$KLT_GAMEDATA}}"
+if [ -z "$GAMEDATA_SRC" ] && [ -n "$GAMEDATA_DEST" ]; then
+  GAMEDATA_SRC="$HOME/Library/Application Support/Klepton/userdata/$KLT_NAME/$GAMEDATA_DEST"
+fi
+gamedata_wanted() {
+  [ -n "$GAMEDATA_SRC" ] && [ -d "$GAMEDATA_SRC" ] && [ -n "$GAMEDATA_DEST" ]
+}
+# A tree with nowhere to go is a build mistake, not a target without a tree —
+# say so rather than staging nothing and letting the game name the symptom.
+if [ -n "$GAMEDATA_SRC" ] && [ -d "$GAMEDATA_SRC" ] && [ -z "$GAMEDATA_DEST" ]; then
+  echo "!! $KLT_NAME has gamedata but no gamedest in targets.py — nothing staged"
+  exit 1
+fi
+
+# REPAIRED FILES — a `repaired/` subdirectory of the extra-files directory,
+# staged LAST so its copies land on top of the originals.
+#
+# When one of those files has to be replaced (a rebuilt copy of a damaged
+# bundle, say), the replacement must NOT overwrite the source directory (the
+# original is the evidence) and must NOT be a hand-push either, or the next
+# full stage silently puts the old file back. So it lives beside the originals,
+# in `<extra dir>/repaired/<exact original filename>`, and this overlay is what
+# makes a fresh stage reproduce it. KL_REPAIRED_SRC=<dir> names another
+# directory; KL_SKIP_REPAIRED=1 stages the originals alone.
+#
+# `repaired/` is a DIRECTORY, so the `-maxdepth 1 -type f` walks below never
+# pick it up as a file in the first place — the overlay is the only path it
+# reaches the device by.
+REPAIRED_SRC="${KL_REPAIRED_SRC:-${EXTRA_SRC:+$EXTRA_SRC/repaired}}"
+repaired_wanted() {
+  [ "${KL_SKIP_REPAIRED:-0}" != 1 ] && [ -n "$REPAIRED_SRC" ] && [ -d "$REPAIRED_SRC" ] \
+    && compgen -G "$REPAIRED_SRC/*" > /dev/null 2>&1
+}
+# stage_repaired_over <dir> — copy repaired/*.* over an already-populated dir.
+# Loud about every file it replaces: a silent overlay is how you end up unable
+# to tell which bundle is actually on the device.
+stage_repaired_over() {
+    repaired_wanted || return 0
+    local dest="$1" n=0
+    for f in "$REPAIRED_SRC"/*; do
+      [ -f "$f" ] || continue
+      cp -c "$f" "$dest/" 2>/dev/null || cp "$f" "$dest/"
+      echo "[stage] REPAIRED: $(basename "$f") ($(stat -f %z "$f") B) overrides the original"
+      n=$((n + 1))
+    done
+    [ "$n" = 0 ] || echo "[stage] REPAIRED: $n file(s) from $REPAIRED_SRC"
+}
 # Present-or-absent, like the obb and files below. A NativeActivity port
 # (vicecity/libmiamivr) can ship no assets/ inside the APK at all — its data is
 # the staged files/ tree — and an unconditional copy of a directory that does not
@@ -65,6 +141,32 @@ fi
 OBB_REL="${KLT_OBB-obb}"
 OBB_RAW="${KLT_OBB_RAW:-0}"   # 1 = the obb dir holds LOOSE files, not a packaged *.obb
 OBB="${KL_OBB_DIR:-$HOME/Library/Application Support/Klepton/userdata/$KLT_NAME/$OBB_REL}"
+# What the source dir holds. Most targets stage *.obb; some Unreal titles ship
+# LOOSE .pak files instead of (or beside) OBBs, so the glob is per target. It is
+# used unquoted as "$OBB"/$OBB_PAT, so it has to stay ONE word (extglob).
+#
+#   deadpool  — loose paks plus `en.lang` (the localisation/audio pack, read
+#               from the same mount point; a `*.pak` glob would silently leave
+#               it behind). `pak1000*` are not retail chunks and are excluded:
+#               UE mounts loose paks alphabetically, last-wins, so a stray pak
+#               that sorts after the real chunks overrides them silently.
+#   fnaf      — the retail OBBs (main, overflow1, overflow2). `overflow3` is not
+#               retail and is excluded, for the same last-wins reason.
+#   pinballfx — BOTH: two OBBs and loose pakchunk*.pak in one directory.
+shopt -s extglob
+OBB_PAT="*.obb"
+[ "$KLT_NAME" = "deadpool" ]  && OBB_PAT="!(pak1000*).@(pak|lang)"
+[ "$KLT_NAME" = "fnaf" ]      && OBB_PAT="!(overflow3.*).obb"
+[ "$KLT_NAME" = "pinballfx" ] && OBB_PAT="*.@(obb|pak)"
+# ...and if there is none there, the extra-files directory is the OTHER place
+# it can be: a device copy often keeps the .obb and its loose files as siblings
+# in one directory, which is also how they are read back (both end up in
+# <files>/obb). Preferring userdata keeps every other target exactly as it was;
+# falling back means such a target needs no second copy to be staged from.
+if [ "${KL_SKIP_OBB:-0}" != 1 ] && [ "$OBB_RAW" != 1 ] && ! compgen -G "$OBB/$OBB_PAT" > /dev/null 2>&1 \
+   && extra_wanted && compgen -G "$EXTRA_SRC/$OBB_PAT" > /dev/null 2>&1; then
+  OBB="$EXTRA_SRC"
+fi
 if [ "${KL_SKIP_OBB:-0}" = 1 ]; then
   OBB=""
 elif [ "$OBB_RAW" = 1 ]; then
@@ -75,10 +177,10 @@ elif [ "$OBB_RAW" = 1 ]; then
     echo "[stage] no files in $OBB — staging none"
     OBB=""
   fi
-elif ! compgen -G "$OBB/*.obb" > /dev/null 2>&1; then
+elif ! compgen -G "$OBB/$OBB_PAT" > /dev/null 2>&1; then
   # Say WHICH directory was empty. "no OBB" is correct for several targets and a
   # staging mistake for the others, and they looked the same.
-  echo "[stage] no *.obb in $OBB — staging none"
+  echo "[stage] no $OBB_PAT in $OBB — staging none"
   OBB=""
 fi
 
@@ -173,6 +275,22 @@ if [ "${1:-}" = "--meta" ]; then META_ONLY=1; shift; fi
 
 TARGET="${1:-}"
 
+# stage_extra_local <dest-dir>  — local filesystem destination (simulator)
+#
+# `*.obb` is excluded: the .obb may sit in this same directory (see the OBB
+# fallback above), and the OBB block stages it — without the exclusion it
+# would be copied twice.
+stage_extra_local() {
+    extra_wanted || { echo "[stage] extra files: none for this target — skipping"; return; }
+    local dest="$1"
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    (cd "$EXTRA_SRC" && find . -maxdepth 1 -type f ! -name '.*' ! -name '*.obb' \
+        -exec cp -c {} "$dest/" \;)
+    stage_repaired_over "$dest"
+    echo "[stage] extra files: $(ls "$dest" | wc -l | tr -d ' ') -> $dest"
+}
+
 if [ -z "$TARGET" ]; then
   UDID=$(xcrun simctl list devices booted | grep -o '[0-9A-F-]\{36\}' | head -1)
   [ -n "$UDID" ] || { echo "!! no booted simulator"; exit 1; }
@@ -192,10 +310,36 @@ if [ -z "$TARGET" ]; then
   if [ -n "$ASSETS" ]; then cp -R "$ASSETS" "$DEST/$TREE/assets"; fi
   cp "$APK" "$DEST/$KLT_APK"
   [ ${#META[@]} -gt 0 ] && cp "${META[@]}" "$DEST/$TREE/"
+  # The extra files BEFORE the OBB, because that step clears its destination
+  # directory and for a Unity target that directory is the OBB's too (OBB_REL
+  # is "obb").
+  stage_extra_local "$DEST/android-files/obb"
+  # ...and the OBB file by file, dereferenced, rather than as a directory: the
+  # source may BE the extra-files directory (see the fallback above), and the
+  # loose files in it are that step's business, not a second copy here.
+  #
+  # `-c` first — CLONEFILE. The simulator's data container is on the same APFS
+  # volume as the source, and a loose-pak title can be tens of GB: cloned, it is
+  # instant and shares the source's extents until something writes. `-L`
+  # because what userdata holds are symlinks, and it is the pointed-at file
+  # that should be cloned. The plain `cp -L` fallback keeps a destination on
+  # another volume (or a non-APFS one) working, where clonefile cannot.
   if [ -n "$OBB" ]; then
-    rm -rf "$DEST/android-files/$OBB_REL"
-    mkdir -p "$DEST/android-files/$(dirname "$OBB_REL")"
-    cp -RL "$OBB" "$DEST/android-files/$OBB_REL"
+    mkdir -p "$DEST/android-files/$OBB_REL"
+    rm -f "$DEST/android-files/$OBB_REL"/$OBB_PAT
+    # The excluded files (see OBB_PAT above) are no longer MATCHED by the line
+    # above, so a container staged before the exclusion would keep them. Named
+    # explicitly so the cleanup happens on the next stage.
+    [ "$KLT_NAME" = "deadpool" ] && \
+      rm -f "$DEST/android-files/$OBB_REL"/pak1000*.pak
+    # ...and fnaf's overflow3, for the same reason.
+    [ "$KLT_NAME" = "fnaf" ] && \
+      rm -f "$DEST/android-files/$OBB_REL"/overflow3.*.obb
+    for f in "$OBB"/$OBB_PAT; do
+      [ -e "$f" ] || continue          # a dangling link on THIS machine
+      cp -cL "$f" "$DEST/android-files/$OBB_REL/" 2>/dev/null || \
+      cp -L  "$f" "$DEST/android-files/$OBB_REL/"
+    done
   fi
   if [ -n "$FILES" ]; then
     rm -rf "$DEST/android-files/$FILES_REL"
@@ -219,6 +363,16 @@ if [ -z "$TARGET" ]; then
     mkdir -p "$DEST/$TREE/qtplugins"
     cp "$ROOT/$KLT_QTPLUGINS"/libplugins_*.so "$DEST/$TREE/qtplugins/"
   fi
+  # The /sdcard tree, after the OBB and plugins: it is a destination of its
+  # own (android-files/<gamedest>), so nothing above can collide with it. cp -c
+  # is clonefile — gigabytes, instant on APFS, same reasoning as the extra-files dir.
+  if gamedata_wanted; then
+    rm -rf "$DEST/android-files/$GAMEDATA_DEST"
+    mkdir -p "$DEST/android-files/$GAMEDATA_DEST"
+    cp -Rc "$GAMEDATA_SRC/." "$DEST/android-files/$GAMEDATA_DEST/" 2>/dev/null || \
+      cp -R "$GAMEDATA_SRC/." "$DEST/android-files/$GAMEDATA_DEST/"
+    echo "[stage] gamedata: $(du -sh "$DEST/android-files/$GAMEDATA_DEST" | cut -f1) -> $DEST/android-files/$GAMEDATA_DEST"
+  fi
   echo "[stage] done: $(du -sh "$DEST" | cut -f1)"
   exit 0
 fi
@@ -230,6 +384,64 @@ copy() {   # <source> <destination-relative-to-container>
   xcrun devicectl device copy to --device "$TARGET" \
     --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
     --source "$1" --destination "$2"
+}
+# ...and the same thing for an upload big enough that the SOCKET is a risk.
+#
+# `devicectl device copy to` of one 15 GB directory is one transfer over one
+# socket, and a multi-GB set is the size where that stops arriving:
+# round 1 died 80 files in with `NSPOSIXErrorDomain error 54 — the socket was
+# closed unexpectedly`, having moved several GB. There is no resume, so the
+# retry is ours to do, and it is only useful per FILE — restarting a directory
+# copy re-sends everything that already landed.
+copy_retry() {   # <source> <destination-relative-to-container>
+  local n=0
+  until copy "$1" "$2" > /dev/null 2>&1; do
+    n=$((n + 1))
+    [ "$n" -lt 4 ] || { echo "[stage] !! gave up on $(basename "$1") after $n tries"; return 1; }
+    echo "[stage]    retry $n: $(basename "$1")"
+    sleep 5
+  done
+}
+# The LEDGER of what is already on the device — read OFF THE DEVICE, not
+# remembered locally.
+#
+# Round 2 is the reason. A local ledger file is a claim about what THIS Mac
+# uploaded, and there are three ways for that to be a lie about the device:
+#
+#   - installing rotates the data container, and everything the last run
+#     uploaded is then in a directory nobody will ever read again;
+#   - a `copy to` that dies mid-file leaves the destination CREATED and EMPTY,
+#     which is exactly what round 1 left behind: 54 of 80 names present and
+#     every large one Zero KB. A name-and-size ledger written before the fact
+#     would have called those done;
+#   - the device is shared with fourteen other ports and can be cleaned up
+#     underneath us.
+#
+# `devicectl device info files --json-output` reports name and size for the
+# directory, which is the same key the ledger uses, so asking the device costs
+# one call and removes all three. The file under build/ is now a CACHE of that
+# answer plus this run's own uploads, not state to be trusted across runs.
+device_ledger() {   # <container-subdirectory> <ledger-path>
+  local out; out=$(mktemp)
+  if xcrun devicectl device info files --device "$TARGET" \
+       --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
+       --subdirectory "$1" --no-recurse --json-output "$out" > /dev/null 2>&1
+  then
+    python3 - "$out" > "$2" <<'PY' || : > "$2"
+import json, sys
+for f in json.load(open(sys.argv[1]))["result"]["files"]:
+    if f.get("resources", {}).get("isDirectory"):
+        continue
+    print(f["name"], f["metadata"]["size"])
+PY
+  else
+    # No listing means no directory (or no app): nothing is on the device, and
+    # the caller has to create the directory before it can copy files into it.
+    : > "$2"
+    rm -f "$out"
+    return 1
+  fi
+  rm -f "$out"
 }
 copy_meta() {
   for m in "${META[@]:-}"; do
@@ -247,10 +459,98 @@ fi
 # -L: both the OBB directory and the retail one are deliberately symlinks into
 # an install elsewhere on this machine, and what is uploaded is what they point
 # at. Without it this line says 44 MB and then spends twenty minutes.
-echo "[stage] device $TARGET, $KLT_NAME ($(du -shcL ${ASSETS:+"$ASSETS"} "$APK" ${OBB:+"$OBB"} ${FILES:+"$FILES"} ${RETAIL:+"$RETAIL"} 2>/dev/null | tail -1 | cut -f1))"
-if [ -n "$ASSETS" ]; then copy "$ASSETS" "Documents/$TREE/assets"; fi
+  #
+  # An array, because the OBB source can be a directory whose path has spaces
+  # in it. Unquoted ${OBB:+$OBB} split it into several arguments and du
+  # complained about all of them.
+  SIZED=("$APK")
+  if [ -n "$ASSETS" ]; then SIZED+=("$ASSETS"); fi
+  if [ -n "$OBB" ]; then SIZED+=("$OBB"); fi
+  if [ -n "$FILES" ]; then SIZED+=("$FILES"); fi
+  if [ -n "$RETAIL" ]; then SIZED+=("$RETAIL"); fi
+  echo "[stage] device $TARGET, $KLT_NAME ($(du -shcL "${SIZED[@]}" 2>/dev/null | tail -1 | cut -f1))"
+  if [ -n "$ASSETS" ]; then copy "$ASSETS" "Documents/$TREE/assets"; fi
 copy "$APK"    "Documents/$KLT_APK"
 copy_meta
+# Extra files, BEFORE the OBB: this uploads a whole directory to
+# Documents/android-files/obb and the OBB lands in that same directory for a
+# Unity target, so the OBB goes second or not at all.
+#
+# A filtered staging dir of clonefiles (instant on APFS), then one upload of it.
+# Filtered twice: no dotfiles, and no *.obb — see stage_extra_local's note.
+if extra_wanted; then
+  STAGE_DIR="$PWD/$ROOT/build/obb-extra-stage/obb"
+  rm -rf "$PWD/$ROOT/build/obb-extra-stage"
+  mkdir -p "$STAGE_DIR"
+  (cd "$EXTRA_SRC" && find . -maxdepth 1 -type f ! -name '.*' ! -name '*.obb' -exec cp -c {} "$STAGE_DIR/" \;) || \
+  (cd "$EXTRA_SRC" && find . -maxdepth 1 -type f ! -name '.*' ! -name '*.obb' -exec cp {} "$STAGE_DIR/" \;)
+  # The repair goes over the top BEFORE the ledger is consulted, so the size in
+  # the ledger key is the repaired file's — which is exactly what makes a device
+  # still holding the tampered copy re-receive it (different size, key misses).
+  stage_repaired_over "$STAGE_DIR"
+  echo "[stage] extra files: uploading $(ls "$STAGE_DIR" | wc -l | tr -d ' ')"
+  # ONE directory copy while it fits in one socket's lifetime, FILE BY FILE
+  # when it does not: a couple of GB has always arrived in one go, fifteen
+  # never has.
+  #
+  # File by file costs one devicectl invocation each (~1 s of setup), which
+  # against 80 files is a rounding error next to re-sending 15 GB, and it buys
+  # two things a directory copy cannot have: a per-file retry, and a LEDGER —
+  # so a run that dies half way up resumes rather than starting over. The
+  # ledger is keyed by device, file name and size, because that is what makes
+  # "already there" a claim about THIS device rather than about this Mac.
+  #
+  # The trade against the directory copy is that nothing clears the
+  # destination first, so a file dropped from a newer source would linger. That
+  # is what `rm -rf build/obb-extra-stage` plus a fresh KL_STAGE=1 run does
+  # not fix and a note here has to: if the source's file SET changes, wipe
+  # Documents/android-files/obb on the device by hand.
+  EXTRA_BYTES=$(du -skL "$STAGE_DIR" | cut -f1)
+  EXTRA_N=$(ls "$STAGE_DIR" | wc -l | tr -d ' ')
+  # An EMPTY staging dir is not "upload nothing", it is a hard failure:
+  # `devicectl device copy to` of an empty directory onto a destination that
+  # does not exist yet dies with "Failed to retrieve the file node for
+  # Documents/android-files/obb (CoreDeviceError 7000)", and with `set -e` that
+  # takes the OBB upload below down with it. A source directory holding JUST
+  # the .obb filters to nothing, so the dir is legitimately empty and the OBB
+  # block is the only thing that has anything to do (it mkdir's its own way in
+  # by uploading a file into the path).
+  if [ "$EXTRA_N" = 0 ]; then
+    echo "[stage] extra files: nothing but the OBB in $EXTRA_SRC — no directory upload"
+  elif [ "$EXTRA_BYTES" -lt 4194304 ]; then
+    copy "$STAGE_DIR" "Documents/android-files/obb"
+  else
+    LEDGER="$PWD/$ROOT/build/obb-extra-uploaded-$TARGET.txt"
+    mkdir -p "$(dirname "$LEDGER")"
+    # Seed the ledger from the DEVICE (see device_ledger), before anything is
+    # written — a name that is there at zero bytes is not a name that is done.
+    if device_ledger "Documents/android-files/obb" "$LEDGER"; then
+      echo "[stage] extra files: device already holds $(wc -l < "$LEDGER" | tr -d ' ') file(s) in obb/"
+    else
+      # No listing means no directory, and the only thing here that creates one
+      # is a directory copy — so an empty one goes first.
+      EMPTY=$(mktemp -d)/obb; mkdir -p "$EMPTY"
+      copy "$EMPTY" "Documents/android-files/obb" > /dev/null 2>&1 || true
+      rm -rf "$(dirname "$EMPTY")"
+    fi
+    extra_n=0; extra_skip=0; extra_fail=0
+    extra_total=$(ls "$STAGE_DIR" | wc -l | tr -d ' ')
+    for f in "$STAGE_DIR"/*; do
+      [ -e "$f" ] || continue
+      key="$(basename "$f") $(stat -f %z "$f")"
+      extra_n=$((extra_n + 1))
+      if grep -qxF "$key" "$LEDGER"; then extra_skip=$((extra_skip + 1)); continue; fi
+      echo "[stage]  ($extra_n/$extra_total) $key"
+      if copy_retry "$f" "Documents/android-files/obb/$(basename "$f")"; then
+        echo "$key" >> "$LEDGER"
+      else
+        extra_fail=$((extra_fail + 1))
+      fi
+    done
+    echo "[stage] extra files: $((extra_n - extra_skip - extra_fail)) uploaded, $extra_skip already on device, $extra_fail failed"
+    [ "$extra_fail" = 0 ] || { echo "[stage] !! extra files incomplete — re-run with KL_STAGE=1"; exit 1; }
+  fi
+fi
 # The OBB, FILE BY FILE and through the RESOLVED path — not `copy "$OBB"`.
 #
 # The obb directory a host run reads is deliberately symlinks into bonelab_obb/
@@ -276,11 +576,26 @@ if [ -n "$OBB" ]; then
     copy "$real" "Documents/android-files/$OBB_REL"
     echo "[stage] done $OBB_REL/"
   else
-    for f in "$OBB"/*.obb; do
+    # ...with a device-read ledger: a game's .obb files can be several GB
+    # each, so a run that dies on the third must not re-send the first two.
+    # Read off the device rather than remembered, so a zero-byte survivor of
+    # a dead transfer counts as absent (see device_ledger).
+    OBB_LEDGER="$PWD/$ROOT/build/obb-uploaded-$TARGET.txt"
+    mkdir -p "$(dirname "$OBB_LEDGER")"
+    device_ledger "Documents/android-files/$OBB_REL" "$OBB_LEDGER" || : > "$OBB_LEDGER"
+    for f in "$OBB"/$OBB_PAT; do
       [ -e "$f" ] || continue          # a dangling link on THIS machine too
-      echo "[stage] device $TARGET, $KLT_NAME $f"
       real=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$f")
-      copy "$real" "Documents/android-files/$OBB_REL/$(basename "$f")"
+      obb_key="$(basename "$f") $(stat -Lf %z "$f")"
+      if grep -qxF "$obb_key" "$OBB_LEDGER"; then
+        echo "[stage] device $TARGET, $KLT_NAME $(basename "$f") — already on device"
+        continue
+      fi
+      echo "[stage] device $TARGET, $KLT_NAME $f"
+      # ...with the retry, for the reason copy_retry exists: multi-GB packs
+      # share the socket's fate.
+      copy_retry "$real" "Documents/android-files/$OBB_REL/$(basename "$f")" || exit 1
+      echo "$obb_key" >> "$OBB_LEDGER"
       echo "[stage] done $f"
     done
   fi
@@ -319,5 +634,12 @@ if [ -n "$KLT_QTPLUGINS" ]; then
   cp "$ROOT/$KLT_QTPLUGINS"/libplugins_*.so "$STAGE/"
   copy "$STAGE" "Documents/$TREE/qtplugins"
   rm -rf "$(dirname "$STAGE")"
+fi
+# The /sdcard tree last: gigabytes, so the size is said before the upload starts
+# (the same courtesy as the OBB line). A direct directory copy — the source is
+# a real directory on this machine, no symlink trap of the OBB kind.
+if gamedata_wanted; then
+  echo "[stage] device $TARGET, $KLT_NAME /sdcard tree -> $GAMEDATA_DEST ($(du -sh "$GAMEDATA_SRC" | cut -f1))"
+  copy "$GAMEDATA_SRC" "Documents/android-files/$GAMEDATA_DEST"
 fi
 echo "[stage] done"

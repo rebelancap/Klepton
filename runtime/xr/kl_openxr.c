@@ -46,11 +46,13 @@
 #include "kl_egl.h"
 #include "kl_glfb.h"
 #include "kl_env.h"
+#include "../gfx/kl_perf.h"
 // XR_KHR_vulkan_enable. Only kl_vulkan.h — never a Vulkan header: every Vulkan
 // handle in this file is a void *, which is what keeps it compiling on a
 // checkout with no MoltenVK vendored (the stub half of kl_vulkan.c answers
 // "not supported" and the extension is then never advertised).
 #include "kl_vulkan.h"
+#include "guest/kl_driver.h"   // kl_driver_upstream_defaults
 #include "klepton.h"
 
 // ------------------------------------------------------- transcribed from the spec
@@ -138,6 +140,11 @@ enum {
     XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR      = 1000025000,
     XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR       = 1000025001,
     XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR = 1000025002,
+    // XR_KHR_vulkan_enable2 (extension 91) reuses the three above under
+    // ...VULKAN2_KHR aliases and adds these three create/get-info structures.
+    XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR     = 1000090000,
+    XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR       = 1000090001,
+    XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR = 1000090003,
 };
 
 // The session states, and the order is the state machine: a runtime walks an
@@ -216,6 +223,31 @@ typedef struct { int32_t type; const void *next;
 typedef struct { int32_t type; void *next;
                  XrVersion minApiVersionSupported,
                            maxApiVersionSupported; } XrGraphicsRequirementsVulkanKHR;
+
+// XR_KHR_vulkan_enable2's three request structures. The Vulkan pointers are
+// `void *` for the reason above; `pfnGetInstanceProcAddr` is the APP's loader
+// entry (PFN_vkGetInstanceProcAddr), through which the runtime makes the
+// create call on the app's behalf.
+typedef void *(*klxr_vk_gipa)(void *instance, const char *name);
+typedef struct { int32_t type; const void *next;
+                 XrSystemId systemId;
+                 uint64_t createFlags;
+                 klxr_vk_gipa pfnGetInstanceProcAddr;
+                 const void *vulkanCreateInfo;      // const VkInstanceCreateInfo *
+                 const void *vulkanAllocator;
+               } XrVulkanInstanceCreateInfoKHR;
+typedef struct { int32_t type; const void *next;
+                 XrSystemId systemId;
+                 uint64_t createFlags;
+                 klxr_vk_gipa pfnGetInstanceProcAddr;
+                 void *vulkanPhysicalDevice;
+                 const void *vulkanCreateInfo;      // const VkDeviceCreateInfo *
+                 const void *vulkanAllocator;
+               } XrVulkanDeviceCreateInfoKHR;
+typedef struct { int32_t type; const void *next;
+                 XrSystemId systemId;
+                 void *vulkanInstance;
+               } XrVulkanGraphicsDeviceGetInfoKHR;
 
 typedef struct { int32_t type; const void *next;
                  int32_t primaryViewConfigurationType; } XrSessionBeginInfo;
@@ -567,8 +599,8 @@ enum { KLXR_VIEW_CONFIG_PRIMARY_STEREO = 2 };
     X(xrGetVulkanGraphicsRequirementsKHR)                                      \
     X(xrGetVulkanInstanceExtensionsKHR) X(xrGetVulkanDeviceExtensionsKHR)      \
     X(xrGetVulkanGraphicsDeviceKHR)                                            \
-    X(xrCreateVulkanInstanceKHR) X(xrCreateVulkanDeviceKHR)                    \
     X(xrGetVulkanGraphicsRequirements2KHR) X(xrGetVulkanGraphicsDevice2KHR)    \
+    X(xrCreateVulkanInstanceKHR) X(xrCreateVulkanDeviceKHR)                    \
     X(xrEnumerateDisplayRefreshRatesFB) X(xrGetDisplayRefreshRateFB)           \
     X(xrRequestDisplayRefreshRateFB)                                           \
     X(xrConvertTimespecTimeToTimeKHR) X(xrConvertTimeToTimespecTimeKHR)         \
@@ -807,7 +839,8 @@ static klxr_instance *klxr_inst(void *h) {
 enum { KLXR_GATE_ALWAYS = 0,      // unconditional
        KLXR_GATE_REFRESH = 1,     // ...unless KL_XR_REFRESH_EXT=0
        KLXR_GATE_VULKAN = 2,      // ...only when MoltenVK is actually reachable
-       KLXR_GATE_USER_PRESENCE = 3 };  // ...missioniss only (see below)
+       KLXR_GATE_VULKAN2 = 3,     // ...and KL_XR_VULKAN2 (enable2; see the row)
+       KLXR_GATE_USER_PRESENCE = 4 };  // ...missioniss only (see below)
 
 static const struct { const char *name; uint32_t version; int gate; } g_extensions[] = {
     { "XR_KHR_opengl_es_enable",       10, KLXR_GATE_ALWAYS },
@@ -851,12 +884,21 @@ static const struct { const char *name; uint32_t version; int gate; } g_extensio
     // understating it invites an app to take a compatibility path it does not
     // need.
     { "XR_KHR_vulkan_enable",           8, KLXR_GATE_VULKAN },
-    // XR_KHR_vulkan_enable2 — GTA Vice City VR (libmiamivr) REQUIRES this and
-    // loops on xrEnumerateInstanceExtensionProperties forever without it ("runtime
-    // does not expose XR_KHR_vulkan_enable2"). Same Vulkan half, same gate; the
-    // difference is only that the runtime makes the vkCreate* calls (see
-    // klxr_CreateVulkanInstanceKHR / ...DeviceKHR / ...Requirements2 / ...Device2).
-    { "XR_KHR_vulkan_enable2",          2, KLXR_GATE_VULKAN },
+    // XR_KHR_vulkan_enable2 — the Alyx jailbreak host requires it ("Required
+    // Vulkan binding unavailable: XR_KHR_vulkan_enable2" and nativeStart stops).
+    // The same half of the runtime as enable (v1) under the other contract:
+    // the RUNTIME makes the vkCreateInstance/vkCreateDevice calls, through the
+    // app's own vkGetInstanceProcAddr, after adding what it needs — and what
+    // it needs is the same two lists v1 answers (empty; see kl_vulkan.h). Same
+    // gate, for the same reason. Revision 2 is the extension's current one.
+    //
+    // KL_XR_VULKAN2 gates it. A guest offered both picks enable2 when it is
+    // there (Unity's OpenXR plugin does), so offering it moves a guest onto the
+    // runtime-side create path. Upstream offers it to every Vulkan guest; the
+    // default follows kl_driver_upstream_defaults() (on for upstream's rows
+    // and unknown ones, off for the rows measured on the enable path), and a
+    // row that needs it either way sets the variable in its env string.
+    { "XR_KHR_vulkan_enable2",          2, KLXR_GATE_VULKAN2 },
     // XR_EXT_performance_settings — JKXR, and it is the counter-example to the
     // paragraph at the top of this table: this guest lists it as a REQUIRED
     // extension in xrCreateInstance rather than probing for it, so withholding
@@ -970,6 +1012,9 @@ static int klxr_ext_gate_open(int gate) {
         // Asked once, here, so the answer cannot change between the
         // enumeration, xrCreateInstance's check and xrGetInstanceProcAddr.
         return kl_vulkan_xr_supported();
+    case KLXR_GATE_VULKAN2:
+        return kl_env_on("KL_XR_VULKAN2", kl_driver_upstream_defaults()) &&
+               klxr_ext_gate_open(KLXR_GATE_VULKAN);
     case KLXR_GATE_USER_PRESENCE: {
         // missioniss (Unity, OVRPlugin) resolves its IVRPlatformHelper to the
         // DEVICELESS helper — no head/controller pose, working menu+select — when
@@ -1270,7 +1315,8 @@ static XrResult klxr_CreateInstance(const XrInstanceCreateInfo *info, void **ins
                 known ? "enabled" : "NOT PRESENT");
         if (!known) { g_instance.magic = 0; KLXR_RET(KLXR_ERROR_EXTENSION_NOT_PRESENT); }
         if (strcmp(name, "XR_KHR_opengl_es_enable") == 0) g_instance.ext_opengl_es = 1;
-        if (strcmp(name, "XR_KHR_vulkan_enable") == 0)    g_instance.ext_vulkan = 1;
+        if (strcmp(name, "XR_KHR_vulkan_enable") == 0 ||
+            strcmp(name, "XR_KHR_vulkan_enable2") == 0)   g_instance.ext_vulkan = 1;
     }
 
     *instance = &g_instance;
@@ -1540,90 +1586,95 @@ static XrResult klxr_GetVulkanGraphicsRequirementsKHR(
     return KLXR_SUCCESS;
 }
 
-// ---- XR_KHR_vulkan_enable2 (GTA Vice City VR / libmiamivr) ----------------
-// The 2 form of the same extension. The difference is who calls vkCreateInstance
-// and vkCreateDevice: in enable1 the app does, and asks us four questions; in
-// enable2 the app hands US its vkGetInstanceProcAddr and its Vk*CreateInfo and we
-// make the calls, so the runtime can inject whatever instance/device state it
-// needs. We have none to inject — kl_vulkan.c serves both create calls the same
-// either way — so these are thin forwarders through the app's own gIPA (which, for
-// a guest here, resolves to kl_vulkan's synthetic loader). All Vulkan handles are
-// void * for the reason stated above the binding struct.
-typedef void *(*klxr_vk_gipa)(void *vk_instance, const char *name);
-typedef struct { int32_t type; const void *next; XrSystemId systemId;
-                 uint64_t createFlags; klxr_vk_gipa pfnGetInstanceProcAddr;
-                 const void *vulkanCreateInfo; const void *vulkanAllocator;
-               } XrVulkanInstanceCreateInfoKHR;
-typedef struct { int32_t type; const void *next; XrSystemId systemId;
-                 uint64_t createFlags; klxr_vk_gipa pfnGetInstanceProcAddr;
-                 void *vulkanPhysicalDevice; const void *vulkanCreateInfo;
-                 const void *vulkanAllocator;
-               } XrVulkanDeviceCreateInfoKHR;
-typedef struct { int32_t type; const void *next; XrSystemId systemId;
-                 void *vulkanInstance; } XrVulkanGraphicsDeviceGetInfoKHR;
-
-static XrResult klxr_CreateVulkanInstanceKHR(
-        void *instance, const XrVulkanInstanceCreateInfoKHR *ci,
-        void **vk_instance, int *vk_result) {
-    fprintf(stderr, "  [xr] >> xrCreateVulkanInstanceKHR\n");
-    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
-    if (!ci || !ci->pfnGetInstanceProcAddr || !vk_instance || !vk_result)
-        KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
-    if (ci->systemId != KLXR_SYSTEM_ID) KLXR_RET(KLXR_ERROR_SYSTEM_INVALID);
-    // vkCreateInstance is a global function: resolved through gIPA with a NULL
-    // instance (kl_vulkan's loader serves it regardless).
-    int (*create)(const void *, const void *, void **) =
-        (int (*)(const void *, const void *, void **))
-            ci->pfnGetInstanceProcAddr(NULL, "vkCreateInstance");
-    if (!create) {
-        fprintf(stderr, "  [xr] xrCreateVulkanInstanceKHR: app gIPA has no "
-                        "vkCreateInstance\n");
-        KLXR_RET(KLXR_ERROR_RUNTIME_FAILURE);
-    }
-    int r = create(ci->vulkanCreateInfo, ci->vulkanAllocator, vk_instance);
-    *vk_result = r;
-    fprintf(stderr, "  [xr] xrCreateVulkanInstanceKHR -> VkInstance %p (VkResult %d)\n",
-            *vk_instance, r);
-    return KLXR_SUCCESS;
-}
-
-static XrResult klxr_CreateVulkanDeviceKHR(
-        void *instance, const XrVulkanDeviceCreateInfoKHR *ci,
-        void **vk_device, int *vk_result) {
-    fprintf(stderr, "  [xr] >> xrCreateVulkanDeviceKHR\n");
-    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
-    if (!ci || !ci->pfnGetInstanceProcAddr || !vk_device || !vk_result)
-        KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
-    if (ci->systemId != KLXR_SYSTEM_ID) KLXR_RET(KLXR_ERROR_SYSTEM_INVALID);
-    int (*create)(void *, const void *, const void *, void **) =
-        (int (*)(void *, const void *, const void *, void **))
-            ci->pfnGetInstanceProcAddr(NULL, "vkCreateDevice");
-    if (!create) {
-        fprintf(stderr, "  [xr] xrCreateVulkanDeviceKHR: app gIPA has no "
-                        "vkCreateDevice\n");
-        KLXR_RET(KLXR_ERROR_RUNTIME_FAILURE);
-    }
-    int r = create(ci->vulkanPhysicalDevice, ci->vulkanCreateInfo,
-                   ci->vulkanAllocator, vk_device);
-    *vk_result = r;
-    fprintf(stderr, "  [xr] xrCreateVulkanDeviceKHR -> VkDevice %p (VkResult %d)\n",
-            *vk_device, r);
-    return KLXR_SUCCESS;
-}
+// ---------------------------------------------------------- XR_KHR_vulkan_enable2
+//
+// The enable2 contract moves the two create calls INTO the runtime:
+//
+//   xrGetVulkanGraphicsRequirements2KHR  == v1's (the struct type is an alias)
+//   xrCreateVulkanInstanceKHR            the runtime calls vkCreateInstance
+//   xrGetVulkanGraphicsDevice2KHR        == v1's, the instance in a struct
+//   xrCreateVulkanDeviceKHR              the runtime calls vkCreateDevice
+//
+// "After adding the extensions it needs": this runtime needs none on either
+// object (kl_vulkan_xr_instance_extensions/_device_extensions answer empty —
+// kl_vulkan.h says why), so the app's create info goes through unchanged, and
+// a non-empty list there would be a build-time change here, not a silent one:
+// the two calls below refuse rather than drop a required extension.
+//
+// The Vulkan result goes back in *vk_result and the XR result is SUCCESS when
+// the call was made — the spec's split: XR_ERROR_* is for a bad XR request, a
+// failed vkCreate* is the app's to read.
+static void *g_vk2_instance;     // the VkInstance xrCreateVulkanInstanceKHR made
 
 static XrResult klxr_GetVulkanGraphicsRequirements2KHR(
         void *instance, XrSystemId system_id, XrGraphicsRequirementsVulkanKHR *reqs) {
-    fprintf(stderr, "  [xr] >> xrGetVulkanGraphicsRequirements2KHR\n");
     return klxr_GetVulkanGraphicsRequirementsKHR(instance, system_id, reqs);
 }
 
+static XrResult klxr_CreateVulkanInstanceKHR(
+        void *instance, const XrVulkanInstanceCreateInfoKHR *info,
+        void **vk_instance, int32_t *vk_result) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!info || !vk_instance || !vk_result || !info->pfnGetInstanceProcAddr ||
+        !info->vulkanCreateInfo) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->systemId != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
+    if (kl_vulkan_xr_instance_extensions()[0]) {
+        fprintf(stderr, "  [xr] xrCreateVulkanInstanceKHR: this runtime now needs "
+                        "instance extensions (%s) and this call does not add them\n",
+                kl_vulkan_xr_instance_extensions());
+        return KLXR_ERROR_RUNTIME_FAILURE;
+    }
+    typedef int32_t (*create_fn)(const void *, const void *, void **);
+    create_fn create = (create_fn)info->pfnGetInstanceProcAddr(NULL, "vkCreateInstance");
+    if (!create) {
+        fprintf(stderr, "  [xr] xrCreateVulkanInstanceKHR: the app's "
+                        "vkGetInstanceProcAddr has no vkCreateInstance\n");
+        return KLXR_ERROR_RUNTIME_FAILURE;
+    }
+    *vk_result = create(info->vulkanCreateInfo, info->vulkanAllocator, vk_instance);
+    if (*vk_result == 0) g_vk2_instance = *vk_instance;
+    fprintf(stderr, "  [xr] xrCreateVulkanInstanceKHR -> VkResult %d, VkInstance %p\n",
+            *vk_result, *vk_result == 0 ? *vk_instance : NULL);
+    return KLXR_SUCCESS;
+}
+
 static XrResult klxr_GetVulkanGraphicsDevice2KHR(
-        void *instance, const XrVulkanGraphicsDeviceGetInfoKHR *gi,
+        void *instance, const XrVulkanGraphicsDeviceGetInfoKHR *info,
         void **vk_physical_device) {
-    fprintf(stderr, "  [xr] >> xrGetVulkanGraphicsDevice2KHR\n");
-    if (!gi) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
-    return klxr_GetVulkanGraphicsDeviceKHR(instance, gi->systemId,
-                                           gi->vulkanInstance, vk_physical_device);
+    if (!info) return KLXR_ERROR_VALIDATION_FAILURE;
+    return klxr_GetVulkanGraphicsDeviceKHR(instance, info->systemId,
+                                           info->vulkanInstance, vk_physical_device);
+}
+
+static XrResult klxr_CreateVulkanDeviceKHR(
+        void *instance, const XrVulkanDeviceCreateInfoKHR *info,
+        void **vk_device, int32_t *vk_result) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!info || !vk_device || !vk_result || !info->pfnGetInstanceProcAddr ||
+        !info->vulkanCreateInfo || !info->vulkanPhysicalDevice)
+        return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->systemId != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
+    if (kl_vulkan_xr_device_extensions()[0]) {
+        fprintf(stderr, "  [xr] xrCreateVulkanDeviceKHR: this runtime now needs "
+                        "device extensions (%s) and this call does not add them\n",
+                kl_vulkan_xr_device_extensions());
+        return KLXR_ERROR_RUNTIME_FAILURE;
+    }
+    // vkCreateDevice is an instance-level function: it is resolved against the
+    // instance the runtime created for this app (the only one enable2 lets it
+    // know about), through the app's own loader entry.
+    typedef int32_t (*create_fn)(void *, const void *, const void *, void **);
+    create_fn create = (create_fn)info->pfnGetInstanceProcAddr(g_vk2_instance, "vkCreateDevice");
+    if (!create) {
+        fprintf(stderr, "  [xr] xrCreateVulkanDeviceKHR: no vkCreateDevice through the "
+                        "app's vkGetInstanceProcAddr (instance %p)\n", g_vk2_instance);
+        return KLXR_ERROR_RUNTIME_FAILURE;
+    }
+    *vk_result = create(info->vulkanPhysicalDevice, info->vulkanCreateInfo,
+                        info->vulkanAllocator, vk_device);
+    fprintf(stderr, "  [xr] xrCreateVulkanDeviceKHR(physical %p) -> VkResult %d, VkDevice %p\n",
+            info->vulkanPhysicalDevice, *vk_result, *vk_result == 0 ? *vk_device : NULL);
+    return KLXR_SUCCESS;
 }
 
 // ---------------------------------------------------------- the session, and
@@ -1986,6 +2037,18 @@ static int64_t klxr_now(void) {
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
+// The two instants the boot gate reports against. Defined here, above every
+// writer, because the gate itself lives down in the frame path: t0 is
+// xrCreateSession — the moment the guest starts bringing VR up — and everything
+// the gate prints is an offset from it.
+static int64_t g_boot_t0;            // xrCreateSession
+static int64_t g_boot_profile_ns;    // first xrGetCurrentInteractionProfile
+
+// Is the head pose we would hand out a MEASUREMENT? Forward-declared here
+// because the two locate calls and klxr_space_pose_ex all ask it and all sit
+// above the frontend seam it reads. Defined beside the boot gate.
+static int klxr_head_pose_ready(void);
+
 static const char *klxr_state_name(int s) {
     switch (s) {
         case KLXR_SESSION_STATE_IDLE:         return "IDLE";
@@ -2062,6 +2125,11 @@ static XrResult klxr_CreateSession(void *instance, const XrSessionCreateInfo *in
     if (vk && !inst->vk_requirements_queried)
         KLXR_RET(KLXR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING);
 
+    // Bring-up starts here as far as the boot gate is concerned: every offset
+    // it prints is measured from this instant, so a reader can tell "the hands
+    // were already there" from "the hands took another second".
+    g_boot_t0 = klxr_now();
+
     memset(&g_session, 0, sizeof g_session);
     g_session.magic = KLXR_MAGIC_SESSION;
     g_session.instance = inst;
@@ -2080,6 +2148,7 @@ static XrResult klxr_CreateSession(void *instance, const XrSessionCreateInfo *in
         g_session.vk_instance = vk->instance;
         g_session.vk_phys     = vk->physicalDevice;
         g_session.vk_device   = vk->device;
+        kl_vulkan_xr_bind_device(vk->device);
         g_session.vk_queue_family = vk->queueFamilyIndex;
         g_session.vk_queue_index  = vk->queueIndex;
         fprintf(stderr, "  [xr] xrCreateSession: VkInstance %p physical %p device %p "
@@ -2770,6 +2839,11 @@ static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
     if (motion_known) *motion_known = 0;
     if (!sp) return base;
     if (sp->reference_type == KLXR_REF_SPACE_VIEW) {
+        // Untracked until a frontend has published one — see
+        // klxr_head_pose_ready. The pose is still filled in below (a caller
+        // that ignores the flags gets the same plausible placeholder it always
+        // got); the flags are what stop a guest banking it as its origin.
+        if (tracked) *tracked = klxr_head_pose_ready();
         kl_ovrp_get_guest_head_pose(&base.position.x, &base.position.y,
                                     &base.position.z, &base.orientation.x,
                                     &base.orientation.y, &base.orientation.z,
@@ -3543,6 +3617,12 @@ static XrResult klxr_GetCurrentInteractionProfile(void *session, XrPath top_leve
                                                   : KLXR_ACTIVE_PROFILE;
         klxr_StringToPath(s->instance, profile, &state->interactionProfile);
     }
+    // When the guest first asked which controller it has — the third seam of
+    // the boot race, and the one that is already race-free: the answer above
+    // does not wait for a controller to appear, it is the profile the guest
+    // itself suggested. Timestamped anyway, so the gate's line can show that it
+    // was answered early and rule it out rather than leave it arguable.
+    if (!g_boot_profile_ns) g_boot_profile_ns = klxr_now();
     static int said;
     if (!said++)
         fprintf(stderr, "  [xr] interaction profile for %s: %s\n",
@@ -3588,6 +3668,98 @@ static float klxr_eval(const klxr_action *a, int hand, const klxr_hand_input *in
 // The per-frame input snapshot. This must succeed even when nothing is bound —
 // an app that treats a failed sync as fatal is an app that never renders a
 // frame.
+
+// ---- KL_XR_FAKE_PRESS: drive a VR guest's menus with no controllers --------
+//
+// The host has no hands. kl_ovrp_controller_input reports `present = 0` for
+// both, every action is therefore inactive, and a guest whose front end is
+// driven entirely through OpenXR actions sits on its first menu screen forever.
+// That is fine until the bug you are chasing is PAST the menu: Simpsons Hit &
+// Run's world renders black on device, and the host — the one place with frame
+// dumps, an FBO census and a debugger — could not be got out of the language
+// select.
+//
+// So: `KL_XR_FAKE_PRESS=<action>@<ms>[,<action>@<ms>...]` pulses named boolean
+// actions on a timer. `select@1200` presses `select` for one sync every 1.2 s,
+// which walks a default-highlighted menu tree by itself.
+//
+//   KL_XR_FAKE_PRESS=select@1200 KL_GLFB=1 ./build/m_boot simpsons
+//
+// It is a HOST instrument and deliberately narrow:
+//
+//   - it only makes an action ACTIVE that the guest has bound (kind[h] != NONE);
+//     it never invents a binding, so the guest's own suggested-binding table
+//     still decides what exists.
+//   - it pulses for exactly one sync and releases on the next, so
+//     `changedSinceLastSync` sees a real edge in both directions — a held
+//     button reads as one press to an edge-triggered menu and as movement to a
+//     continuous one, and the difference matters.
+//   - it does nothing at all when the hand is genuinely present, so a device
+//     run with a controller in it is unaffected even if the variable leaks in.
+//
+// Not a robot: it cannot navigate to the third item of a list. It gets a guest
+// past screens whose default action is the one you want, which is the common
+// case for "New Game" and is all this was needed for.
+#define KLXR_FAKE_MAX 8
+static struct { char name[XR_MAX_ACTION_NAME_SIZE]; unsigned period_ms; } g_fake[KLXR_FAKE_MAX];
+static int g_fake_n = -1;
+
+static void klxr_fake_parse(void) {
+    g_fake_n = 0;
+    const char *e = kl_env_str("KL_XR_FAKE_PRESS", NULL);
+    if (!e || !*e) return;
+    const char *p = e;
+    while (*p && g_fake_n < KLXR_FAKE_MAX) {
+        const char *at = strchr(p, '@');
+        const char *comma = strchr(p, ',');
+        if (!at || (comma && at > comma)) break;      // no period: ignore the entry
+        size_t n = (size_t)(at - p);
+        if (n >= sizeof g_fake[0].name) n = sizeof g_fake[0].name - 1;
+        memcpy(g_fake[g_fake_n].name, p, n);
+        g_fake[g_fake_n].name[n] = 0;
+        g_fake[g_fake_n].period_ms = (unsigned)strtoul(at + 1, NULL, 10);
+        if (!g_fake[g_fake_n].period_ms) g_fake[g_fake_n].period_ms = 1000;
+        fprintf(stderr, "  [xr] KL_XR_FAKE_PRESS: \"%s\" every %u ms — a HOST "
+                        "instrument for driving a menu with no controllers\n",
+                g_fake[g_fake_n].name, g_fake[g_fake_n].period_ms);
+        g_fake_n++;
+        if (!comma) break;
+        p = comma + 1;
+    }
+}
+
+// Called from klxr_SyncActions with the real state already written, so a real
+// controller always wins. Returns non-zero if it changed anything.
+static void klxr_fake_apply(int64_t now_ns, const klxr_hand_input *in) {
+    if (g_fake_n < 0) klxr_fake_parse();
+    if (!g_fake_n) return;
+    for (int i = 0; i < KLXR_ACTION_MAX; i++) {
+        klxr_action *a = &g_actions[i];
+        if (!a->magic) continue;
+        int which = -1;
+        for (int f = 0; f < g_fake_n; f++)
+            if (!strcmp(a->name, g_fake[f].name)) { which = f; break; }
+        if (which < 0) continue;
+        int64_t period = (int64_t)g_fake[which].period_ms * 1000000;
+        if (period <= 0) continue;
+        // The pulse is one sync wide: on for the sync that crosses the period
+        // boundary, off for every other one. Derived from the clock rather than
+        // a counter so it does not depend on the guest's frame rate.
+        int on = (now_ns % period) < (period / 8);
+        for (int h = 0; h < 2; h++) {
+            if (a->kind[h] == KLXR_SRC_NONE) continue;   // the guest bound nothing here
+            if (in[h].present) continue;                 // a real hand: leave it alone
+            float v = on ? 1.0f : 0.0f;
+            if (v != a->value[h] && kl_env_on("KL_XR_FAKE_TRACE", 0))
+                fprintf(stderr, "  [xr] fake %s hand %d -> %.0f\n", a->name, h, v);
+            a->changed[h] = (v != a->value[h]);
+            if (a->changed[h]) a->change_time[h] = now_ns;
+            a->value[h]  = v;
+            a->active[h] = 1;
+        }
+    }
+}
+
 static XrResult klxr_SyncActions(void *session, const XrActionsSyncInfo *info) {
     KLXR_TRACE("xrSyncActions");
     klxr_session *s = klxr_sess(session);
@@ -3647,6 +3819,9 @@ static XrResult klxr_SyncActions(void *session, const XrActionsSyncInfo *info) {
             a->active[h] = active;
         }
     }
+    // ...and the host's stand-in for hands that are not there. After the real
+    // loop, so a present controller is never overwritten.
+    klxr_fake_apply(now, in);
     // First sync at which each hand is live, so a run says when input started
     // rather than only whether it ever did.
     for (int h = 0; h < 2; h++)
@@ -5100,6 +5275,138 @@ static void klxr_fovea_trace(int eye, float x0, float y0, float x1, float y1,
     memset(&fv[eye], 0, sizeof fv[eye]);
 }
 
+// ---- the boot gate: nothing the guest reads on frame 0 may be a placeholder --
+//
+// **The bug this exists to close.** A guest brings VR up in one straight line —
+// create the session, attach the actions, sample the head, sample the hands,
+// and DECIDE, once, what kind of session it is in. Everything after that
+// decision is downstream of it. On this frontend the two things it samples do
+// not arrive together and do not arrive at bring-up: the head pose comes from
+// ARKit's device anchor on the compositor's first frame, and the hands only
+// after visionOS has connected the Sense controllers AND rebuilt its spatial
+// providers around them — measured at +2.2 s after the first compositor frame
+// in every captured launch (`[cp] spatial controllers: []` at +0 ms, the real
+// list at +2.2 s). Bring-up reaches xrCreateSession at about +6 s, so the good
+// launch clears both by four seconds. Nothing enforces that four seconds.
+//
+// When it is not cleared, neither seam refuses — they answer plausibly:
+//
+//   * the head reads as the IDENTITY orientation at eye height (kl_ovrp's
+//     `g_head_set` is still 0), which a guest that captures its VR origin from
+//     the first pose banks as "the user is facing straight ahead, level" while
+//     the user is in fact looking down at the floor putting the headset on. The
+//     whole world is then pitched by that difference forever: the floor runs
+//     DOWNHILL.
+//   * both hands read as absent — kl_ovrp_hand_motion returns 0, so every
+//     action space is untracked and every action inactive. A guest whose aim
+//     comes from the controller and cannot find one falls back to its
+//     flat-screen aim: HL2VR's `vr_moveaim_mode`, a reticle pushed around the
+//     screen by the thumbstick. The crosshair behaves like a MOUSE CURSOR.
+//
+// Both of the tester's symptoms, from one missed sample, and a relaunch cures it
+// because a relaunch re-rolls the race. This is the hypothesis; the log line
+// below is what proves or kills it on the next occurrence.
+//
+// The fix is to make the first frame WAIT rather than to make the placeholder
+// better, because there is no better placeholder — "facing straight ahead at
+// eye height" is exactly what a correct pose looks like. xrWaitFrame is where a
+// runtime is allowed to hold an app back (it exists to throttle the frame loop)
+// and it is the last call before the guest's first rendered frame, so it is the
+// gate. Held once, on the first wait of the session, never again.
+//
+// Armed only where there is a frontend that publishes poses — `g_frame_pacer`
+// is set exactly by the visionOS compositor (kl_app.c) and by nothing else — so
+// the host path, which publishes no head pose at all in mono, is untouched and
+// waits for nothing. KL_XR_BOOT_GATE=0 disables it, =1 forces it on anywhere;
+// KL_XR_BOOT_GATE_MS sets the deadline (default 4000).
+static int klxr_boot_gate_ms(void) {
+    static int ms = -1;
+    if (ms < 0) {
+        ms = kl_env_int("KL_XR_BOOT_GATE_MS", 4000);
+        if (ms < 0) ms = 0;
+    }
+    return ms;
+}
+
+// Whether the gate is armed at all. Auto = "a display frontend is publishing".
+static int klxr_boot_gate_on(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_XR_BOOT_GATE", g_frame_pacer ? 1 : 0);
+    return on;
+}
+
+// The head pose as a claim about the world, rather than as seven floats.
+//
+// Before a frontend has published, kl_ovrp answers the identity orientation at
+// eye height — a pose, not a refusal — and OpenXR has exactly one way to say
+// "this is not a measurement": leave the VALID bits out. Saying so is the
+// second half of the boot-race fix and the half that survives the gate timing
+// out: a guest that recentres off an untracked head has been told not to.
+//
+// Only where a frontend is expected to publish at all. The host path runs
+// mono, never calls kl_ovrp_set_head_pose, and must keep locating its head —
+// which is why this is gated on the same frame pacer the boot gate is, and not
+// on the published flag alone. KL_XR_HONEST_HEAD=0 restores the old
+// always-valid answer.
+static int klxr_head_pose_ready(void) {
+    static int honest = -1;
+    if (honest < 0) honest = kl_env_on("KL_XR_HONEST_HEAD", 1);
+    if (!honest || !g_frame_pacer) return 1;
+    return kl_ovrp_head_pose_published();
+}
+
+static void klxr_boot_gate(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    if (!klxr_boot_gate_on()) return;
+
+    int64_t t_enter = klxr_now();
+    int64_t deadline = t_enter + (int64_t)klxr_boot_gate_ms() * 1000000LL;
+    int64_t head_ns = kl_ovrp_head_pose_published() ? t_enter : 0;
+    int64_t hand_ns[2] = { kl_ovrp_hand_pose_published(0) ? t_enter : 0,
+                           kl_ovrp_hand_pose_published(1) ? t_enter : 0 };
+
+    // 4 ms is well under a display period at any rate this runtime serves, so
+    // the gate costs at most one frame of latency past the instant the last
+    // seam goes live — and on a good launch it costs nothing, because
+    // everything is already true on entry and the loop never runs.
+    while (!head_ns || !hand_ns[0] || !hand_ns[1]) {
+        int64_t now = klxr_now();
+        if (!head_ns && kl_ovrp_head_pose_published()) head_ns = now;
+        for (int h = 0; h < 2; h++)
+            if (!hand_ns[h] && kl_ovrp_hand_pose_published(h)) hand_ns[h] = now;
+        if (head_ns && hand_ns[0] && hand_ns[1]) break;
+        if (now >= deadline) break;
+        usleep(4000);
+    }
+
+    int64_t t_exit = klxr_now();
+    int64_t t0 = g_boot_t0 ? g_boot_t0 : t_enter;
+    // "never" rather than a negative number: a seam that did not arrive inside
+    // the deadline has no offset, and printing one invites reading it as an
+    // offset. Four buffers because all four go into one printf.
+    char b[4][32];
+    const int64_t nsv[4] = { head_ns, hand_ns[0], hand_ns[1], g_boot_profile_ns };
+    for (int i = 0; i < 4; i++) {
+        if (nsv[i]) snprintf(b[i], sizeof b[i], "+%.0f ms",
+                             (double)(nsv[i] - t0) / 1e6);
+        else        snprintf(b[i], sizeof b[i], "NEVER");
+    }
+    // ONE line, and it is the whole diagnosis. On a good launch every offset is
+    // small and none is NEVER. On the launch the tester saw, the missing seam is
+    // the one reading NEVER — and if it is the hands, the flat-screen aim and
+    // the tilted world both follow from it.
+    fprintf(stderr,
+            "  [xr] boot gate: head pose %s, left hand %s, right hand %s, "
+            "profile %s; first frame held %.0f ms of %d ms%s\n",
+            b[0], b[1], b[2], b[3],
+            (double)(t_exit - t_enter) / 1e6, klxr_boot_gate_ms(),
+            (head_ns && hand_ns[0] && hand_ns[1]) ? ""
+                : " — TIMED OUT, the guest starts VR without them "
+                  "(tilted floor / thumbstick crosshair)");
+}
+
 static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
                                XrFrameState *state) {
     KLXR_TRACE("xrWaitFrame");
@@ -5114,12 +5421,28 @@ static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
     if (info) klxr_log_chain("xrWaitFrame", info->next);
     if (!s->running) KLXR_RET(KLXR_ERROR_SESSION_NOT_RUNNING);
 
+    // Before the pacer and before the latch: the first frame must not be
+    // latched against a pose no frontend has published.
+    klxr_boot_gate();
+
     // Block here if the driver has a display to be paced by, BEFORE the latch:
     // the pose this frame is pinned to must be the one the compositor just
     // published, not the one it had published by the time the guest last asked.
     // Getting that order wrong costs a whole frame of prediction and presents as
     // the temporal doubling the latch exists to prevent.
+    int64_t paced_t0 = klxr_now();
     if (g_frame_pacer) g_frame_pacer();
+    // The [perf] line's frame clock for an OpenXR guest — the third owner,
+    // beside kl_openvr's WaitGetPoses and kl_ovrp's WaitToBeginFrame. Same
+    // shape as kl_openvr: once per guest frame, on the guest's frame thread,
+    // right after the blocking wait, with the time spent in it. xrWaitFrame
+    // rather than xrEndFrame because the wait is the frame's one-per-frame
+    // boundary in all three (xrBeginFrame/xrEndFrame may repeat or be skipped
+    // for a discarded frame) and it is what xr_wait_ns is defined against.
+    // One tick: each wait advances the guest one display period. KL_PERF off
+    // (the default): returns at once.
+    kl_perf_role(KL_PERF_ROLE_WAIT);
+    kl_perf_frame(1, klxr_now() - paced_t0);
 
     kl_ovrp_frame_latch();
     // ...and open this frame's record against the pose just latched, which is
@@ -6110,7 +6433,8 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     {
         const char *out = kl_env_str("KL_GLFB_OUT", NULL);
         if (kl_glfb_enabled() &&
-            (out || kl_glfb_has_frame_sink() || kl_glfb_has_gpu_fence()))
+            (out || kl_glfb_has_frame_sink() || kl_glfb_has_gpu_fence() ||
+             kl_glfb_frametrace()))
             kl_glfb_present(out);
     }
     // ---------------------------------------------------------------------
@@ -6261,8 +6585,13 @@ static XrResult klxr_LocateViews(void *session, const XrViewLocateInfo *info,
     if (!base) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
 
     view_state->type = XR_TYPE_VIEW_STATE;
-    view_state->viewStateFlags = KLXR_VIEW_ORIENTATION_VALID | KLXR_VIEW_POSITION_VALID |
-                                 KLXR_VIEW_ORIENTATION_TRACKED | KLXR_VIEW_POSITION_TRACKED;
+    // Same claim as xrLocateSpace(VIEW) makes, and it must be the same claim:
+    // a guest told its head is untracked by one call and tracked by the other
+    // has been told nothing. Zero flags is the specified "no measurement".
+    view_state->viewStateFlags = klxr_head_pose_ready()
+        ? (KLXR_VIEW_ORIENTATION_VALID | KLXR_VIEW_POSITION_VALID |
+           KLXR_VIEW_ORIENTATION_TRACKED | KLXR_VIEW_POSITION_TRACKED)
+        : 0;
 
     XrResult r = klxr_two_call(capacity, count_out, 2);
     if (r != KLXR_SUCCESS || capacity == 0) return r;
@@ -6528,14 +6857,12 @@ static void klxr_install(void) {
                                    (void *)klxr_GetVulkanDeviceExtensionsKHR},
         {"xrGetVulkanGraphicsDeviceKHR",
                                    (void *)klxr_GetVulkanGraphicsDeviceKHR},
-        {"xrCreateVulkanInstanceKHR",
-                                   (void *)klxr_CreateVulkanInstanceKHR},
-        {"xrCreateVulkanDeviceKHR",
-                                   (void *)klxr_CreateVulkanDeviceKHR},
         {"xrGetVulkanGraphicsRequirements2KHR",
                                    (void *)klxr_GetVulkanGraphicsRequirements2KHR},
         {"xrGetVulkanGraphicsDevice2KHR",
                                    (void *)klxr_GetVulkanGraphicsDevice2KHR},
+        {"xrCreateVulkanInstanceKHR", (void *)klxr_CreateVulkanInstanceKHR},
+        {"xrCreateVulkanDeviceKHR",   (void *)klxr_CreateVulkanDeviceKHR},
         {"xrEnumerateDisplayRefreshRatesFB",
                                    (void *)klxr_EnumerateDisplayRefreshRatesFB},
         {"xrGetDisplayRefreshRateFB", (void *)klxr_GetDisplayRefreshRateFB},

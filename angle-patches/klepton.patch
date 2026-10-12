@@ -41,7 +41,26 @@ diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/m
 index 71f0c61..dbc9481 100644
 --- a/src/libANGLE/renderer/metal/DisplayMtl.mm
 +++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
-@@ -959,6 +959,13 @@ void DisplayMtl::initializeExtensions() const
+@@ -855,6 +855,18 @@ bool IsMetalDisplayAvailable()
+ 
+     // Note that we currently implement textures as combined image+samplers, so the limit is
+     // the minimum of supported samplers and sampled images.
++    //
++    // Klepton: everything assigned here is re-clamped by Context::limitCaps() once the
++    // context exists, and a clamp is silent — a backend number above the frontend ceiling
++    // is not an error, it is just gone. These two asserts are what makes raising
++    // mtl::kMaxShaderSamplers fail to BUILD rather than fail to take effect. Klepton's
++    // guests create ES 3.0 contexts, so the combined ceiling is the ES 3.1-and-below one.
++    static_assert(mtl::kMaxShaderSamplers <= gl::IMPLEMENTATION_MAX_SHADER_TEXTURES,
++                  "per-stage sampler count exceeds the frontend ceiling and would be "
++                  "clamped away by Context::limitCaps()");
++    static_assert(mtl::kMaxGLSamplerBindings <= gl::IMPLEMENTATION_MAX_ES31_ACTIVE_TEXTURES,
++                  "combined sampler bindings exceed the ES<=3.1 frontend ceiling and would "
++                  "be clamped away by Context::limitCaps()");
+     mNativeCaps.maxCombinedTextureImageUnits                         = mtl::kMaxGLSamplerBindings;
+     mNativeCaps.maxShaderTextureImageUnits[gl::ShaderType::Fragment] = mtl::kMaxShaderSamplers;
+     mNativeCaps.maxShaderTextureImageUnits[gl::ShaderType::Vertex]   = mtl::kMaxShaderSamplers;
+@@ -959,6 +971,13 @@ void DisplayMtl::initializeExtensions() const
      mNativeExtensions.textureMirrorClampToEdgeEXT   = true;
      mNativeExtensions.depthClampEXT                 = true;
      mNativeExtensions.rgbxInternalFormatANGLE       = mFeatures.hasTextureSwizzle.enabled;
@@ -56,10 +75,10 @@ index 71f0c61..dbc9481 100644
      // EXT_debug_marker is not implemented yet, but the entry points must be exposed for the
      // Metal backend to be used in Chrome (http://anglebug.com/42263519)
 diff --git a/src/libANGLE/renderer/metal/FrameBufferMtl.mm b/src/libANGLE/renderer/metal/FrameBufferMtl.mm
-index 2825a7c..49f308d 100644
+index 2825a7c..d1d6717 100644
 --- a/src/libANGLE/renderer/metal/FrameBufferMtl.mm
 +++ b/src/libANGLE/renderer/metal/FrameBufferMtl.mm
-@@ -29,6 +29,33 @@ namespace rx
+@@ -29,6 +29,33 @@
  {
  namespace
  {
@@ -93,7 +112,7 @@ index 2825a7c..49f308d 100644
  // Override clear color based on texture's write mask
  void OverrideMTLClearColor(const mtl::TextureRef &texture,
                             const mtl::ClearColorValue &clearColor,
-@@ -567,6 +594,56 @@ angle::Result FramebufferMtl::blit(const gl::Context *context,
+@@ -567,6 +594,56 @@ void RoundValueAndAdjustCorrespondingValue(float a,
      baseParams.unpackFlipX = false;
      baseParams.unpackFlipY = false;
  
@@ -150,7 +169,7 @@ index 2825a7c..49f308d 100644
      return blitWithDraw(context, srcFrameBuffer, blitColorBuffer, blitDepthBuffer,
                          blitStencilBuffer, filter, baseParams);
  }
-@@ -1144,6 +1221,46 @@ angle::Result FramebufferMtl::prepareRenderPass(const gl::Context *context,
+@@ -1144,6 +1221,46 @@ void RoundValueAndAdjustCorrespondingValue(float a,
          desc.stencilAttachment = {};
      }
  
@@ -197,11 +216,58 @@ index 2825a7c..49f308d 100644
      if (desc.numColorAttachments == 0 && mDepthRenderTarget == nullptr &&
          mStencilRenderTarget == nullptr)
      {
+@@ -1644,7 +1761,21 @@ void RoundValueAndAdjustCorrespondingValue(float a,
+         ANGLE_TRY(Copy2DTextureSlice0Level0ToTempTexture(context, texture, &texture));
+     }
+ 
+-    if (features.copyTextureToBufferForReadOptimization.enabled)
++    // ...and on a texture the CPU is not allowed to touch, it is not an
++    // optimization at all — it is the only path that can work.
++    //
++    // The direct path below ends in mtl::Texture::getBytes, which calls
++    // -[MTLTexture getBytes:] on a mapping that a storageMode = .private texture
++    // never had. ANGLE states the requirement as ASSERT(isCPUAccessible()), and a
++    // release build compiles that away, so the guard is gone in exactly the builds
++    // that ship: the read then faults inside the Metal driver, below GL, where no
++    // glGetError can report it (klepton phase 10 died there on frame 0).
++    //
++    // Private eye textures are the ordinary case here, not an edge: every eye stage
++    // is an EGLImage over a Compositor Services render target, which is .private by
++    // construction. So take the blit-encoder copy whenever the texture cannot be
++    // read directly, not only when a feature flag that is isAMD() says to.
++    if (features.copyTextureToBufferForReadOptimization.enabled || !texture->isCPUAccessible())
+     {
+         mtl::BufferRef buffer;
+         ANGLE_TRY(CopyTextureSliceLevelToTempBuffer(context, texture, renderTarget->getLevelIndex(),
 diff --git a/src/libANGLE/renderer/metal/mtl_common.h b/src/libANGLE/renderer/metal/mtl_common.h
 index 85cc743..1b76b7e 100644
 --- a/src/libANGLE/renderer/metal/mtl_common.h
 +++ b/src/libANGLE/renderer/metal/mtl_common.h
-@@ -113,7 +113,29 @@ constexpr size_t kDefaultAttributeSize = 4 * sizeof(float);
+@@ -100,7 +100,22 @@ constexpr uint32_t kMaxColorTargetBitsApple4Plus     = 512;
+ constexpr uint32_t kMaxColorTargetBitsMacAndCatalyst = std::numeric_limits<uint32_t>::max();
+ 
+ constexpr uint32_t kMaxShaderUBOs = 16;
+-constexpr uint32_t kMaxUBOSize    = 16384;
++// Klepton: 16384 is the GLES 3.0 spec MINIMUM, not a Metal limit — DisplayMtl
++// says so itself where it uses this ("Default according to GLES 3.0 spec"), and
++// ANGLE's own ceiling, gl::IMPLEMENTATION_MAX_UNIFORM_BLOCK_SIZE, is 65536. On
++// Apple GPUs a constant-address-space buffer binding is not capped at 16 KiB;
++// nothing here was measuring the hardware.
++//
++// Unity's GPU instancing walks straight into it. It patches its own
++// UNITY_RUNTIME_INSTANCING_ARRAY_SIZE token into the GLSL at load time and asks
++// for 160, 192 or 224 elements of two mat4s — 128 bytes each — so
++// UnityInstancing_PerDraw0/PerDraw2 want 20480..28672 and every program
++// carrying one fails to LINK. SUPERHOT VR loses 120 programs that way, which is
++// most of what its world is made of, and a program that does not link draws
++// nothing at all.
++//
++// 65536 is the ceiling ANGLE already static_asserts against in DisplayMtl.mm.
++constexpr uint32_t kMaxUBOSize    = 65536;
+ 
+ constexpr uint32_t kMaxShaderXFBs = gl::IMPLEMENTATION_MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS;
+ 
+@@ -113,7 +128,29 @@ constexpr size_t kDefaultAttributeSize = 4 * sizeof(float);
  
  // Metal limits
  constexpr uint32_t kMaxShaderBuffers     = 31;
@@ -232,7 +298,7 @@ index 85cc743..1b76b7e 100644
  constexpr size_t kInlineConstDataMaxSize = 4 * 1024;
  constexpr size_t kDefaultUniformsMaxSize = 16 * 1024;
  constexpr uint32_t kMaxViewports         = 1;
-@@ -142,7 +164,25 @@ constexpr uint32_t kTextureToBufferBlittingAlignment = 256;
+@@ -142,7 +179,25 @@ constexpr uint32_t kTextureToBufferBlittingAlignment = 256;
  constexpr size_t kConstantBufferOffsetAlignment = 32;  // Metal3 minimum constant buffer alignment.
  
  // Front end binding limits
@@ -259,7 +325,7 @@ index 85cc743..1b76b7e 100644
  constexpr uint32_t kMaxGLUBOBindings     = 2 * kMaxShaderUBOs;
  
  // Binding index start for vertex data buffers:
-@@ -423,6 +463,70 @@ class Context : public ErrorHandler
+@@ -423,6 +478,70 @@ class Context : public ErrorHandler
      DisplayMtl *mDisplay;
  };
  
@@ -347,7 +413,7 @@ index d5f657b..c1658d0 100644
  #include "libANGLE/angletypes.h"
  #include "libANGLE/renderer/metal/DisplayMtl.h"
  
-@@ -87,5 +91,211 @@ mtl::CommandQueue &Context::cmdQueue()
+@@ -87,5 +91,211 @@
      return mDisplay->cmdQueue();
  }
  
@@ -642,7 +708,7 @@ diff --git a/src/libANGLE/renderer/metal/mtl_render_utils.mm b/src/libANGLE/rend
 index 0710ffe..ad3916b 100644
 --- a/src/libANGLE/renderer/metal/mtl_render_utils.mm
 +++ b/src/libANGLE/renderer/metal/mtl_render_utils.mm
-@@ -59,7 +59,11 @@ struct BlitParamsUniform
+@@ -59,7 +59,11 @@
      int srcLevel         = 0;
      int srcLayer         = 0;
      uint8_t dstLuminance = 0;  // dest texture is luminace
@@ -712,7 +778,7 @@ diff --git a/src/libANGLE/renderer/metal/mtl_state_cache.mm b/src/libANGLE/rende
 index ec81f97..39b8d35 100644
 --- a/src/libANGLE/renderer/metal/mtl_state_cache.mm
 +++ b/src/libANGLE/renderer/metal/mtl_state_cache.mm
-@@ -580,6 +580,14 @@ bool RenderPassDesc::equalIgnoreLoadStoreOptions(const RenderPassDesc &other) co
+@@ -580,6 +580,14 @@ void ToObjC(const RenderPassStencilAttachmentDesc &desc,
          return false;
      }
  
@@ -727,7 +793,7 @@ index ec81f97..39b8d35 100644
      return depthAttachment.equalIgnoreLoadStoreOptions(other.depthAttachment) &&
             stencilAttachment.equalIgnoreLoadStoreOptions(other.stencilAttachment);
  }
-@@ -600,7 +608,8 @@ bool RenderPassDesc::operator==(const RenderPassDesc &other) const
+@@ -600,7 +608,8 @@ void ToObjC(const RenderPassStencilAttachmentDesc &desc,
      }
      return depthAttachment == other.depthAttachment &&
             stencilAttachment == other.stencilAttachment && defaultWidth == other.defaultWidth &&
@@ -737,7 +803,7 @@ index ec81f97..39b8d35 100644
  }
  
  // Convert to Metal object
-@@ -627,6 +636,19 @@ void RenderPassDesc::convertToMetalDesc(MTLRenderPassDescriptor *objCDesc,
+@@ -627,6 +636,19 @@ void ToObjC(const RenderPassStencilAttachmentDesc &desc,
      ToObjC(depthAttachment, objCDesc.depthAttachment);
      ToObjC(stencilAttachment, objCDesc.stencilAttachment);
  

@@ -56,17 +56,50 @@ enum Immersive {
         klEnvOn("KL_IMMERSIVE", default: kl_app_target_is_steamlink() == 0)
     }
 
-    // .mixed by default now that the picture works. The guest renders an opaque
-    // world so passthrough shows through nowhere it matters, and being able to
-    // see the room is worth a great deal while the thing being judged is how the
-    // scene SITS — scale, distance and IPD are all much easier to call against
-    // real surroundings than against a black void. KL_FULL=1 restores .full,
-    // which is what shipping a VR title eventually wants.
-    // The native OpenXR VR kind (GTA Vice City) is an in-world title and defaults
-    // to FULLY immersive — .mixed leaves its menu a window floating in passthrough.
-    // Every other target keeps .mixed as the development default. KL_FULL in the
-    // environment overrides either way (KL_FULL=0 forces .mixed back).
-    static var mixed: Bool { !klEnvOn("KL_FULL", default: kl_app_target_wants_full() != 0) }
+    // .mixed or .full, decided per target — and this is the setting the room
+    // breaks through.
+    //
+    // .mixed was the right default while the picture was being *found*: the guest
+    // renders an opaque world, so passthrough shows through nowhere it matters,
+    // and seeing the room makes scale, distance and IPD judgeable against real
+    // surroundings instead of against a black void.
+    //
+    // It is the wrong default for a title someone is PLAYING. In .mixed the
+    // system is compositing the room with our content every frame, and it decides
+    // per pixel and per moment what wins — so a person who walks in, a monitor, a
+    // desk edge flicker into the scene. That is not visionOS's close-range people
+    // awareness (which is a safety feature and cannot be turned off, see
+    // superhot/STATUS.md); it is us asking for the room and then being surprised
+    // to get it. Phase 11: The tester played SUPERHOT worn and reported exactly this.
+    //
+    // So the default is now the target's own answer — `opaque_world` in kl_app.c's
+    // TARGETS table, on for superhot and off for the other two, which leaves Beat
+    // Saber and Steam Link behaving precisely as they did. KL_FULL is unchanged
+    // and still decides it outright in either direction: KL_FULL=1 forces .full,
+    // KL_FULL=0 forces .mixed, and unset means "whatever this title wants".
+    static var mixed: Bool {
+        !klEnvOn("KL_FULL", default: kl_app_target_opaque_world() != 0)
+    }
+
+    /// Whether the wearer's real arms and hands are drawn over the immersive
+    /// scene.
+    ///
+    /// visionOS shows them by default, which is right for an app the wearer
+    /// reaches into and wrong for a VR title that models the hands itself:
+    /// SUPERHOT draws low-poly hands, puts guns in them and throws them, and the
+    /// real pair arrives in the same place, tracked slightly differently, doing
+    /// something slightly different. Two left hands, disagreeing.
+    ///
+    /// `.hidden` for a target whose guest draws its own (`own_hands` in kl_app.c),
+    /// `.automatic` otherwise — so Beat Saber's behaviour is unchanged by this
+    /// commit, and a BS player who wants it can flip it the same way. `KL_HANDS`
+    /// overrides in both directions: `KL_HANDS=1` puts the real limbs back
+    /// (useful for judging whether the guest's hands are tracking the same
+    /// pose), `KL_HANDS=0` takes them away.
+    static var upperLimbs: Visibility {
+        klEnvOn("KL_HANDS", default: kl_app_target_own_hands() == 0)
+            ? .automatic : .hidden
+    }
 
     // How many times the CompositorLayer closure has been entered. SwiftUI may
     // re-evaluate a scene, and a second layer would mean the render loop the log
@@ -113,6 +146,16 @@ enum Immersive {
 enum Lifecycle {
     static func scenePhaseChanged(to phase: ScenePhase) {
         NSLog("[app] scene phase -> \(phase)")
+        // The crown press delivers .inactive at once but .background only when
+        // the system gets round to it (measured ~30 s). The music belongs to
+        // the immersive moment: go silent on the first, and still exit on the
+        // second. .active restores — the boot transition passes through a
+        // 2 s .inactive on the way in, which this round-trips harmlessly.
+        switch phase {
+        case .inactive: KleptonAudio.setSilenced(true)
+        case .active:   KleptonAudio.setSilenced(false)
+        default: break
+        }
         // Coming back is the audio's cue, and it needs one: this OS silently
         // stops calling CoreAudio's render callback across a scene transition —
         // the boot window being closed while the immersive space runs is one,
@@ -126,12 +169,27 @@ enum Lifecycle {
         // the state that would let us skip it is precisely the state this
         // platform lies about.
         if phase == .active { kl_audio_resume() }
+        // And the controllers need one for the same reason the audio does.
+        // GameController stops forwarding events to an app that is not
+        // frontmost, and a glanced-at visionOS notification takes the
+        // foreground away without ever backgrounding us — so `.active` is the
+        // only signal this process gets that input may need re-establishing.
+        // See KleptonControllers.appBecameActive.
+        if phase == .active { KleptonControllers.appBecameActive() }
         guard phase == .background else { return }
+        // The pipeline cache save is throttled (kl_vulkan.c); write its tail
+        // now, while the process is certainly still alive to do it.
+        kl_vulkan_pipeline_cache_flush()
         guard klEnvOn("KL_EXIT_ON_BACKGROUND", default: true) else {
             NSLog("[app] backgrounded; KL_EXIT_ON_BACKGROUND=0, staying alive")
             return
         }
         NSLog("[app] backgrounded — exiting (KL_EXIT_ON_BACKGROUND)")
+        // The last word on whether the run made a sound. This is the ONLY exit a
+        // headset run ever takes — the report at the end of kl_app_lifecycle
+        // belongs to the synthetic sweep and has never run on device — so if the
+        // audio numbers are not printed here they are not printed at all.
+        kl_audio_heartbeat(stderr)
         // Flush before exit rather than relying on it. The guest's log is a
         // file in the container (kl_app.c redirects stdout/stderr there) and it
         // is the only account of the run that survives; `exit` does flush
@@ -181,14 +239,17 @@ struct KleptonApp: App {
                 KleptonCompositor(layerRenderer).startRenderLoop()
             }
         }
-        // .mixed vs .full is read from the observed chroma object (set by boot
-        // once the target is known — see KleptonChroma.immersionFull and
-        // Immersive.mixed), NOT from a static read here: the scene graph is built
-        // before kl_app_configure, so a static read always saw the pre-target
-        // default. Observing the object means .full takes hold reactively before
-        // the space opens, for the native VR kind (GTA Vice City). KL_FULL wins.
-        .immersionStyle(selection: .constant(chroma.immersionFull ? .full : .mixed),
+        // Per target now — see Immersive.mixed. Superhot asks for .full so the
+        // room cannot composite into a game being played; Beat Saber and Steam
+        // Link keep .mixed. KL_FULL decides it outright either way.
+        .immersionStyle(selection: .constant(Immersive.mixed ? .mixed : .full),
                         in: .mixed, .full)
+        // The wearer's real arms — see Immersive.upperLimbs. Hidden for a guest
+        // that draws its own hands, which is superhot and only superhot today.
+        // On the Scene, like persistentSystemOverlays below and for the same
+        // reason: a CompositorLayer has no view hierarchy to attach a View-level
+        // modifier to.
+        .upperLimbVisibility(Immersive.upperLimbs)
         // See Immersive.systemOverlays. On the scene, not on a view inside it:
         // a CompositorLayer has no view hierarchy for the View-level modifier to
         // attach to, so the Scene-level one is the only one that applies here.

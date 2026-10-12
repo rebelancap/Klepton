@@ -26,8 +26,10 @@
 //      our arithmetic on two fingertip joints, which was tried twice and was
 //      unstable both times. The fingertip distance survives as the trigger's
 //      analog value and as the fallback if no spatial event ever arrives.
-//      No other button exists on a hand, but a trigger is the one a menu
-//      clicks with.
+//      The **hand trigger** (grip — what a Touch controller grabs with) is a
+//      second gesture, thumb to MIDDLE fingertip, because the system publishes
+//      exactly one recogniser and it is spoken for. Between them a hand can
+//      select and it can hold, which is every control SUPERHOT VR needs.
 //
 //  So this file is a merge, not a switch: Sense wins per hand where it is
 //  present, hands fill in the rest, and a Sense controller that is paired for
@@ -44,6 +46,7 @@ import Foundation
 import ARKit
 import CoreHaptics
 import GameController
+import QuartzCore
 import SwiftUI
 import simd
 
@@ -447,23 +450,150 @@ final class KleptonControllers {
     // MARK: - Discovery
 
     /// The spatial controllers paired right now.
+    ///
+    /// **The category is the primary key and the vendor name is the backstop**,
+    /// because ETT round 21's device run could not tell two very different
+    /// failures apart. That run logged `[cp] spatial controllers: []` 0.1 s
+    /// after launch and then, in eleven minutes and 42 000 frames, not one
+    /// further controller line — and "no Sense controller was ever switched on"
+    /// and "a Sense pair was present under a productCategory this filter drops"
+    /// produce byte-for-byte that same silence. `installControllerLog` settles
+    /// which it was; this fallback means the second one is not also a dead run.
+    /// Anything it lets through still has to survive `Accessory(device:)`, which
+    /// is per-controller and already caught, so a wrong guess costs one line.
     static func spatialControllers() -> [GCController] {
         guard #available(visionOS 26.0, *) else { return [] }
-        return GCController.controllers().filter {
-            $0.productCategory == GCProductCategorySpatialController
+        let all = GCController.controllers()
+        let byCategory = all.filter { $0.productCategory == GCProductCategorySpatialController }
+        if !byCategory.isEmpty { return byCategory }
+        let byName = all.filter { ($0.vendorName ?? "").localizedCaseInsensitiveContains("Sense") }
+        if !byName.isEmpty, !loggedNameFallback {
+            loggedNameFallback = true
+            NSLog("[cp] spatial controllers taken by NAME, not category: "
+                  + "\(byName.map { "\($0.vendorName ?? "?") [\($0.productCategory)]" }) "
+                  + "— GCProductCategorySpatialController matched none of them")
         }
+        return byName
     }
 
-    /// Has the paired set changed since the last time this was asked?
+    nonisolated(unsafe) private static var loggedNameFallback = false
+
+    /// Every GameController the process can see, named on connect and on
+    /// disconnect — and once at startup for whatever is already attached.
+    ///
+    /// `spatialControllersChanged()` compares the *filtered* set, so it stays
+    /// silent both when nothing is attached and when everything attached is
+    /// filtered out. These observers are unfiltered on purpose: they are the
+    /// only line that can say a controller reached this process at all, which
+    /// is the one thing round 21's log could not establish.
+    static func installControllerLog() {
+        // Ask for events while we are not frontmost.
+        //
+        // The header says a controller's inputs "will not be forwarded to the
+        // application" while it is not frontmost unless this is set, and that
+        // it is ignored on iOS/tvOS — visionOS is named by neither sentence, so
+        // this is a request that either helps or costs nothing. It is the one
+        // knob that could keep the buttons alive THROUGH a glanced-at
+        // notification rather than only after it; the fallback in `pollButtons`
+        // and the rebuild in `appBecameActive` are what cover it if the OS
+        // ignores this.
+        GCController.shouldMonitorBackgroundEvents = true
+        let c = NotificationCenter.default
+        c.addObserver(forName: .GCControllerDidConnect, object: nil, queue: nil) { n in
+            if let g = n.object as? GCController { describe(g, "connected") }
+        }
+        c.addObserver(forName: .GCControllerDidDisconnect, object: nil, queue: nil) { n in
+            if let g = n.object as? GCController { describe(g, "disconnected") }
+        }
+        let all = GCController.controllers()
+        NSLog("[cp] GameController population at startup: \(all.count)")
+        for g in all { describe(g, "already attached") }
+    }
+
+    private static func describe(_ c: GCController, _ what: String) {
+        NSLog("[cp] GameController \(what): \"\(c.vendorName ?? "?")\" "
+              + "category=\"\(c.productCategory)\"")
+    }
+
+    /// How long a controller-set edge waits for the next one before the rebuild
+    /// it asks for is actually taken, and the ceiling on that wait.
+    ///
+    /// A Sense pair does not drop and re-attach cleanly — a radio bobble takes
+    /// both controllers away and brings them back one at a time. Launch 23
+    /// caught exactly that: four edges over 1.6 s (17:05:31.552 → 17:05:33.153),
+    /// **three** provider rebuilds for one bobble, and a guest window that dipped
+    /// 60.6 → 54.1 fps because each rebuild is an `ARKitSession.run` with an
+    /// accessory list rebuilt behind it. Every intermediate rebuild in a burst is
+    /// waste by construction: the only set worth building the provider from is
+    /// the one the radio settles on.
+    ///
+    /// 400 ms is longer than the gap between the two controllers of a pair coming
+    /// back (~200 ms in that log) and short enough that a deliberate power-on
+    /// still feels immediate. `coalesceMaxHold` is the escape: a set that keeps
+    /// flapping past 2 s gets its rebuild anyway rather than starving.
+    private static let coalesceWindow: CFTimeInterval = 0.400
+    private static let coalesceMaxHold: CFTimeInterval = 2.0
+
+    /// The burst in flight, if any: when it opened, when its last edge landed,
+    /// and how many edges it has absorbed. Touched only from the poll below,
+    /// which is once per frame on one thread.
+    private var burstOpened: CFTimeInterval = 0
+    private var burstLastEdge: CFTimeInterval = 0
+    private var burstEdges = 0
+
+    /// Has the paired set changed since the last time this was asked, and has it
+    /// held still long enough to be worth rebuilding from?
     ///
     /// Polled rather than driven off `GCControllerDidConnect`, because the set
     /// is what the provider is built from and a notification would only send us
     /// back here to read it anyway. Cheap: an array compare of a list that is
     /// almost always empty or two long.
+    ///
+    /// The coalescing lives here rather than at the call site because the timer
+    /// this needs is already in hand — the caller is a once-a-frame poll, so the
+    /// window is a deadline compared on each poll rather than a `DispatchWorkItem`
+    /// that would have to be cancelled and rescheduled onto another queue. Same
+    /// effect, and nothing new runs on the compositor thread: a pending burst
+    /// costs one `CACurrentMediaTime()` and an array compare, and the rebuild
+    /// itself is the caller's `Task` exactly as before (see the round-26 haptics
+    /// lesson below — the compositor thread waits on nothing).
+    ///
+    /// Semantics are otherwise unchanged: any edge, in any direction, still
+    /// produces a rebuild. It produces ONE, at the end of the burst, from the set
+    /// the radio settled on.
     func spatialControllersChanged() -> Bool {
+        // A regained foreground counts as a change even when the set is
+        // identical — see `appBecameActive`. Consumed here rather than tested,
+        // so one reactivation forces exactly one rebuild.
+        //
+        // Never debounced: a foreground seam is a single event with no burst
+        // behind it, and the whole point of it is to rebuild a possibly-dead
+        // provider NOW. It also absorbs any burst in flight, because the rebuild
+        // it forces reads the same live set that burst was waiting for.
+        let forced = Self.reactivated
+        Self.reactivated = false
         let now = Self.spatialControllers()
-        guard now != tracked else { return false }
-        tracked = now
+        if forced {
+            tracked = now
+            burstEdges = 0
+            return true
+        }
+
+        let t = CACurrentMediaTime()
+        if now != tracked {
+            tracked = now
+            if burstEdges == 0 { burstOpened = t }
+            burstEdges += 1
+            burstLastEdge = t
+            return false
+        }
+
+        guard burstEdges > 0 else { return false }
+        guard t - burstLastEdge >= Self.coalesceWindow
+                || t - burstOpened >= Self.coalesceMaxHold else { return false }
+        NSLog("[cp] spatial controller set changed — rebuild coalesced "
+              + "(\(burstEdges) edges in \(Int((burstLastEdge - burstOpened) * 1000)) ms)")
+        burstEdges = 0
         return true
     }
 
@@ -518,6 +648,55 @@ final class KleptonControllers {
               + "axes \(p.axes.keys.sorted()) "
               + "dpads \(p.dpads.keys.sorted())")
     }
+
+    /// How long each hand has been reading the LIVE input instead of a queued
+    /// state, and whether that has already been said out loud.
+    ///
+    /// The fallback in `pollButtons` makes a dead input-state queue harmless,
+    /// which also makes it invisible — and "harmless" is a claim about this
+    /// build, not about the platform. One line when a hand has gone a full
+    /// second (90 frames) with an empty queue and one when it starts filling
+    /// again is what will say, on the next device run, whether the queue really
+    /// is what dies across a focus loss or whether something else does.
+    nonisolated(unsafe) private static var emptyQueueRun = [0, 0]
+    nonisolated(unsafe) private static var emptyQueueSaid = [false, false]
+
+    private static func noteInputSource(hand: Int, queued: Bool) {
+        guard hand == 0 || hand == 1 else { return }
+        if queued {
+            if emptyQueueSaid[hand] {
+                NSLog("[cp] hand \(hand): input-state queue is delivering again "
+                      + "after \(emptyQueueRun[hand]) empty frames")
+            }
+            emptyQueueRun[hand] = 0
+            emptyQueueSaid[hand] = false
+            return
+        }
+        emptyQueueRun[hand] += 1
+        if emptyQueueRun[hand] == 90 && !emptyQueueSaid[hand] {
+            emptyQueueSaid[hand] = true
+            NSLog("[cp] hand \(hand): input-state queue has been empty for 90 "
+                  + "frames — reading the live input instead (buttons still work)")
+        }
+    }
+
+    /// The app is frontmost again.
+    ///
+    /// GameController gates event forwarding on frontmost-ness, and visionOS
+    /// takes the foreground away for a glanced-at notification without ever
+    /// backgrounding the process — so the app comes back to a controller seam
+    /// that may or may not have resumed on its own. Nothing here assumes it
+    /// did: the next `spatialControllersChanged()` is forced to answer yes, so
+    /// the accessory provider and the ARKit session behind it are rebuilt from
+    /// whatever `GCController.controllers()` says NOW, on the same path a first
+    /// connect takes. Rebuilding a healthy pair costs one session re-run; not
+    /// rebuilding a dead one costs the rest of the session.
+    static func appBecameActive() {
+        NSLog("[cp] app is frontmost again — forcing a controller rebuild")
+        reactivated = true
+    }
+
+    nonisolated(unsafe) private static var reactivated = false
 
     /// Element names seen pressed at least once, across every controller.
     nonisolated(unsafe) private static var pressSeen = Set<String>()
@@ -889,7 +1068,12 @@ final class KleptonControllers {
         // pointer's origin walks at the instant of the click, which is a ray
         // that leaves the button as you press it. That is indistinguishable
         // from an unreliable trigger and is not a trigger bug at all.
-        if !pinchHeld[hand], let sk = anchor.handSkeleton {
+        //
+        // **The grab gesture freezes it too, and there it matters more.** A
+        // trigger that walks costs aim; a GRIP that walks costs the held
+        // object's position for as long as it is held, which is a gun that
+        // drifts out of the hand rather than a ray that misses once.
+        if !pinchHeld[hand], !grabHeld[hand], let sk = anchor.handSkeleton {
             let base = sk.joint(.middleFingerMetacarpal)
             let tip  = sk.joint(.middleFingerKnuckle)
             if base.isTracked && tip.isTracked {
@@ -963,8 +1147,11 @@ final class KleptonControllers {
         // stream, which reports its own `.removed`. Clearing them on the
         // GameController schedule would drop a pose that is still being
         // tracked.
-        let spatial = GCController.controllers()
-            .filter { $0.productCategory == GCProductCategorySpatialController }
+        // Through the shared helper, NOT a second copy of the filter: the
+        // category-then-name rule lives in one place so a controller the
+        // provider is built from can never be one this loop skips — a pair that
+        // tracked and could not press would be the least legible failure here.
+        let spatial = Self.spatialControllers()
         var attached = [false, false]
         for c in spatial { attached[Self.hand(of: c)] = true }
 
@@ -988,11 +1175,39 @@ final class KleptonControllers {
             // contains: "PlayStation VR2 Sense Controller (L)".
             let hand = Self.hand(of: c)
 
+            // **The queue is an optimisation; the live input is the truth.**
+            //
+            // `nextInputState()` pops a QUEUED state and, in the header's own
+            // words, "returns nil when there are no more input states pending".
+            // It is a diff stream, not a sampler. `guard … else { continue }`
+            // therefore skipped the whole controller on any frame the queue
+            // happened to be empty — and because the two hands are CLEARED at
+            // the top of this function, skipping is not "keep the last value",
+            // it is "every button released, trigger at zero, stick centred".
+            //
+            // That is survivable while states arrive constantly, which they do
+            // while the app is frontmost. It is NOT survivable across a focus
+            // loss: visionOS hands a glanced-at notification the foreground,
+            // GameController stops forwarding events to an app that is not
+            // frontmost (`shouldMonitorBackgroundEvents`), and if the queue does
+            // not resume feeding us afterwards, every button is dead for the
+            // rest of the run with no log line and no recovery path — while
+            // ARKit accessory tracking, which is a different framework on a
+            // different session, carries on delivering poses. The tester's report is
+            // exactly that shape: hands still move, nothing presses, relaunch
+            // fixes it.
+            //
+            // `GCControllerLiveInput` (`c.input`) conforms to
+            // `GCDevicePhysicalInputState` itself and always carries the CURRENT
+            // element values, with no queue involved. So: take a queued state
+            // when there is one — it is the freshest and preserves the existing
+            // behaviour exactly — and fall back to the live input when there is
+            // not. A stalled queue then costs nothing at all.
             c.input.inputStateQueueDepth = 1
-            // nil is "nothing new since you last asked", NOT "everything is
-            // released". Leave this hand's last sample standing — see the
-            // clear-on-attachment note above, which is the other half of this.
-            guard let s = c.input.nextInputState() else { continue }
+            var s: any GCDevicePhysicalInputState = c.input
+            var fromQueue = false
+            if let queued = c.input.nextInputState() { s = queued; fromQueue = true }
+            Self.noteInputSource(hand: hand, queued: fromQueue)
             let b = s.buttons, ax = s.axes, dp = s.dpads
 
             // The PSVR2 Sense element names, per controller. Both controllers
@@ -1242,6 +1457,38 @@ final class KleptonControllers {
     /// queue.
     private var hapticEngine: [Int: CHHapticEngine] = [:]
     private var hapticPlayer: [Int: CHHapticAdvancedPatternPlayer] = [:]
+    /// **Every CoreHaptics call runs here and only here — never on the
+    /// compositor thread.** `CHHapticEngine` creation, `start`, `stop` and the
+    /// players are all synchronous XPC round-trips into gamecontrollerd, and
+    /// gamecontrollerd dies: a physical knock on a Sense controller took it
+    /// down mid-session (r21), and the lazy engine rebuild then parked the
+    /// compositor thread inside `xpc_connection_send_message_with_reply_sync`
+    /// waiting on the dead daemon. No frames were submitted, and ~2 s later
+    /// the system killed the frozen immersive app (SIGKILL, namespace 0x28 =
+    /// WAKEBOARD). Haptics are a luxury; frames are life. The compositor hands
+    /// levels over `hapticsQueue` and never waits for it.
+    private let hapticsQueue = DispatchQueue(label: "klepton.haptics", qos: .userInitiated)
+    /// Per hand: is a work item still in flight on `hapticsQueue`? Guarded by
+    /// `lock`. While the queue is wedged in XPC the compositor skips the hand's
+    /// haptics for the frame instead of queueing a backlog behind the hang.
+    private var hapticsBusy = [false, false]
+    /// How many frames of envelope were dropped because the queue was still in
+    /// flight, and the worst single CoreHaptics call this run took. Guarded by
+    /// `lock` (the worst is written from the haptics queue, read from the
+    /// compositor). These are the only running measure of how close the frame
+    /// loop came to the 2-second compositor watchdog before this queue existed
+    /// — a run with a 900 ms worst call is a run that would have died.
+    private var hapticDropped: UInt64 = 0
+    private var hapticWorstMs: Double = 0
+    /// Below this a slow call is not worth a line; the report is for stalls.
+    private static let hapticSlowMs: Double = 50
+    /// Engine-rebuild backoff, per hand, guarded by `lock`. gamecontrollerd
+    /// coming apart looks like up → stopped → up → stopped once a second; each
+    /// failed life doubles the wait before the next rebuild is even attempted,
+    /// and an engine that survived a while earns a clean slate.
+    private var hapticRetryAt: [TimeInterval] = [0, 0]
+    private var hapticBackoff: [TimeInterval] = [0, 0]
+    private var hapticEngineUpAt: [TimeInterval] = [0, 0]
     /// Per hand: is the player started, is it paused, when did it last go
     /// silent, and the burst being logged.
     private var hapticRunning = [false, false]
@@ -1297,12 +1544,47 @@ final class KleptonControllers {
             guard Self.hapticsEnabled else { continue }
             let level = live ? min(max(amplitude * Self.gain, 0), 1) : 0
             traceBurst(hand: hand, level: level, at: now)
-            if Self.pulseMode || hapticPulseMode[hand] {
-                if level > 0 { playPulse(hand: hand, level: level, seconds: seconds) }
-            } else {
-                drive(hand: hand, level: level, at: now)
+            // Hand the level to the haptics queue without ever waiting on it.
+            // If the previous item is still in flight (the queue is inside an
+            // XPC call — possibly a hung one), this frame's level is dropped
+            // for that hand: a stale envelope sample costs nothing, a queued
+            // backlog behind a hang costs the actuator playing history, and
+            // waiting costs the process (see `hapticsQueue`).
+            lock.lock()
+            let busy = hapticsBusy[hand]
+            if !busy { hapticsBusy[hand] = true }
+            lock.unlock()
+            guard !busy else { lock.lock(); hapticDropped &+= 1; lock.unlock(); continue }
+            hapticsQueue.async { [self] in
+                let t0 = CACurrentMediaTime()
+                if Self.pulseMode || hapticPulseMode[hand] {
+                    if level > 0 { playPulse(hand: hand, level: level, seconds: seconds) }
+                } else {
+                    drive(hand: hand, level: level, at: now)
+                }
+                let ms = (CACurrentMediaTime() - t0) * 1000
+                lock.lock()
+                hapticsBusy[hand] = false
+                if ms > hapticWorstMs { hapticWorstMs = ms }
+                lock.unlock()
             }
         }
+    }
+
+    /// What the haptics path cost this window, for the present-order census.
+    /// nil when there is nothing to say, so a run whose haptics never stalled
+    /// costs no line. The point of the line is the counterfactual: every
+    /// millisecond here would have been a millisecond of frozen frame loop
+    /// before the calls moved off it.
+    func hapticsSummary() -> String? {
+        lock.lock()
+        let dropped = hapticDropped
+        let worst = hapticWorstMs
+        lock.unlock()
+        guard dropped != 0 || worst >= Self.hapticSlowMs else { return nil }
+        return String(format: "haptics: worst CoreHaptics call %.0f ms, "
+                      + "%llu frame(s) of envelope dropped while it was busy "
+                      + "(the frame loop was never blocked)", worst, dropped)
     }
 
     /// The continuous path: hold one looping player per hand and move its
@@ -1419,8 +1701,16 @@ final class KleptonControllers {
     }
 
     private func hapticsEngine(for hand: Int) -> CHHapticEngine? {
-        lock.lock(); let existing = hapticEngine[hand]; lock.unlock()
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        let existing = hapticEngine[hand]
+        let retryAt = hapticRetryAt[hand]
+        lock.unlock()
         if let existing { return existing }
+        // In backoff after a failed or short-lived engine: don't knock on
+        // gamecontrollerd again yet. Creation is the call that blocks hardest
+        // when the daemon is down, and a daemon mid-crash answers nobody.
+        if now < retryAt { return nil }
         guard #available(visionOS 26.0, *) else { return nil }
         guard let device = Self.spatialControllers().first(where: { Self.hand(of: $0) == hand })
         else { return nil }
@@ -1440,6 +1730,7 @@ final class KleptonControllers {
         guard let engine = made else {
             noteHaptics("[cp] haptics: no engine for hand \(hand); "
                         + "localities \(haptics.supportedLocalities)")
+            armHapticsBackoff(hand, at: now)
             return nil
         }
         engine.stoppedHandler = { [weak self] reason in
@@ -1457,11 +1748,32 @@ final class KleptonControllers {
         }
         do { try engine.start() } catch {
             noteHaptics("[cp] haptics: hand \(hand) engine would not start: \(error)")
+            armHapticsBackoff(hand, at: now)
             return nil
         }
         NSLog("[cp] haptics: hand \(hand) engine up on \(device.vendorName ?? "?")")
-        lock.lock(); hapticEngine[hand] = engine; lock.unlock()
+        lock.lock()
+        hapticEngine[hand] = engine
+        hapticEngineUpAt[hand] = ProcessInfo.processInfo.systemUptime
+        lock.unlock()
         return engine
+    }
+
+    /// A failed creation, a failed start, or an engine that died young doubles
+    /// the wait before the next rebuild attempt (2 s → 30 s cap). An engine
+    /// that lived ≥ 30 s before dying resets the ladder: that is ordinary
+    /// churn (controller sleep, session handoff), not a daemon coming apart.
+    private func armHapticsBackoff(_ hand: Int, at now: TimeInterval) {
+        lock.lock()
+        if hapticEngineUpAt[hand] != 0, now - hapticEngineUpAt[hand] >= 30 {
+            hapticBackoff[hand] = 0
+        }
+        hapticEngineUpAt[hand] = 0
+        hapticBackoff[hand] = min(max(hapticBackoff[hand] * 2, 2), 30)
+        hapticRetryAt[hand] = now + hapticBackoff[hand]
+        let wait = hapticBackoff[hand]
+        lock.unlock()
+        NSLog("[cp] haptics: hand \(hand) engine rebuild backed off \(Int(wait)) s")
     }
 
     private func dropHapticsEngine(_ hand: Int) {
@@ -1473,7 +1785,13 @@ final class KleptonControllers {
         hapticRunning[hand] = false
         hapticSilentSince[hand] = 0
         lock.unlock()
-        engine?.stop()
+        // A drop is an engine that died on us — count it against the rebuild
+        // ladder so a daemon in a crash loop is not re-knocked every frame.
+        armHapticsBackoff(hand, at: ProcessInfo.processInfo.systemUptime)
+        // `stop` is the same synchronous XPC as everything else in CoreHaptics,
+        // and this is reachable from the provider-rebuild path on the
+        // compositor thread. Queue it; nothing here waits on the result.
+        if let engine { hapticsQueue.async { engine.stop() } }
     }
 
     /// Every engine, for a disconnect or teardown.
@@ -1485,7 +1803,12 @@ final class KleptonControllers {
         hapticRunning = [false, false]
         hapticSilentSince = [0, 0]
         lock.unlock()
-        for (_, e) in engines { e.stop() }
+        // Same rule as `dropHapticsEngine`: the stops are XPC, the caller is
+        // the compositor thread (forgetAccessoryPoses, provider rebuild), and
+        // nobody needs the result — queue them.
+        if !engines.isEmpty {
+            hapticsQueue.async { for (_, e) in engines { e.stop() } }
+        }
     }
 
     /// Once per distinct message. These are all "this device cannot do
@@ -1622,12 +1945,131 @@ final class KleptonControllers {
         pinchFires = [0, 0]; pinchNoSkeleton = [0, 0]
         pinchFromSystem = [0, 0]; pinchFromDistance = [0, 0]
         spatialEvents = 0; spatialNoChirality = 0
+        reportGrab()
     }
     private static let pinchTrace =
         ProcessInfo.processInfo.environment["KL_PINCH_TRACE"] != "0"
 
     /// Debounced press state for the *fallback* pinch trigger, per hand.
     private var pinchHeld = [false, false]
+
+    // MARK: - The grab, i.e. the hand trigger
+
+    /// The hand trigger (grip), from a thumb-to-MIDDLE-fingertip pinch.
+    ///
+    /// A Touch controller has two analog pulls and the guest uses both of them
+    /// for different verbs: `indexTrigger` *selects* (click a menu, fire a gun)
+    /// and `handTrigger` *holds* (pick the gun up, and keep holding it). Until
+    /// now a hand-tracked run could only do the first — `handTrigger` came from
+    /// a paired Sense controller's `Grip` button and from nowhere else — so
+    /// SUPERHOT VR, which parks at its hub waiting to be grabbed, had no input
+    /// that could answer.
+    ///
+    /// **Why a second fingertip pinch and not a fist/curl metric.** A curl
+    /// wants several joints per finger resolved into an angle against a
+    /// reference frame, and those joints are exactly the ones ARKit drops in
+    /// and out of `isTracked` as the hand rotates — the same dropout that
+    /// already had to be engineered around for the grip *pose* above. A
+    /// two-joint distance is one subtraction on the two joints a hand
+    /// skeleton reports most reliably, it reuses the trigger's own
+    /// calibrate-and-hysteresis machinery verbatim, and its failure mode is
+    /// legible in one number. A fist is also the *worse* discriminator here,
+    /// not the better one: making a fist curls the index finger too, so a fist
+    /// asserts the index trigger as well and "grab" becomes "grab and fire".
+    ///
+    /// **The false positive to watch for** is the middle finger trailing the
+    /// index into an index pinch and landing inside the grab threshold. That
+    /// is a measurement, not a guess to settle here: the trace below reports
+    /// the closest middle-thumb distance seen per hand per two seconds, so one
+    /// worn round with the trigger exercised says whether the defaults need
+    /// separating. `KL_GRAB_OPEN` / `KL_GRAB_CLOSED` are the tuning, and they
+    /// default to the pinch's own numbers because nothing has measured them
+    /// apart yet.
+    ///
+    /// Deliberately independent of the index pinch, with no mutual exclusion:
+    /// SUPERHOT holds a gun with the grip and fires it with the trigger *at the
+    /// same time*, so any rule that lets one gesture cancel the other drops the
+    /// gun on every shot.
+    private func grabGesture(_ anchor: HandAnchor, hand: Int) -> Float {
+        guard let sk = anchor.handSkeleton else { grabNoSkeleton[hand] += 1; return 0 }
+        let thumb = sk.joint(.thumbTip), middle = sk.joint(.middleFingerTip)
+        guard thumb.isTracked && middle.isTracked else {
+            grabNoSkeleton[hand] += 1; return 0
+        }
+        let o = anchor.originFromAnchorTransform
+        let a = (o * thumb.anchorFromJointTransform).columns.3
+        let b = (o * middle.anchorFromJointTransform).columns.3
+        let d = simd_length(SIMD3<Float>(a.x - b.x, a.y - b.y, a.z - b.z))
+        let t = max(0, min(1, (Self.grabOpen - d) / (Self.grabOpen - Self.grabClosed)))
+        grabLast[hand] = d
+        grabMin[hand] = min(grabMin[hand], d)
+        grabPeak[hand] = max(grabPeak[hand], t)
+        return t
+    }
+
+    /// Same two-point calibration as the trigger, same units, own knobs — the
+    /// middle finger is longer than the index and opposes the thumb at a
+    /// different angle, so there is no reason to assume one number fits both.
+    /// They start equal because no device round has measured them apart.
+    private static let grabOpen: Float = envMetres("KL_GRAB_OPEN", 0.05)
+    private static let grabClosed: Float = min(envMetres("KL_GRAB_CLOSED", 0.03),
+                                               grabOpen - 0.005)
+
+    /// `KL_GRAB=0` — no grab gesture at all, `handTrigger` back to
+    /// accessory-only. The A/B for "is the thing that just went wrong the new
+    /// gesture", which on a title that grabs is worth one character to answer.
+    private static let grabEnabled =
+        ProcessInfo.processInfo.environment["KL_GRAB"] != "0"
+
+    /// Debounced press state for the grab, per hand.
+    private var grabHeld = [false, false]
+
+    private var grabMin: [Float] = [9, 9]
+    private var grabPeak: [Float] = [0, 0]
+    private var grabFires: [Int] = [0, 0]
+    private var grabNoSkeleton: [Int] = [0, 0]
+    /// The most recent measured distance, per hand — what an EDGE happened at,
+    /// as opposed to `grabMin`'s tightest point of the whole report window.
+    /// A release edge reported at the minimum would name the moment the grab
+    /// was firmest, which is the one distance it certainly was not.
+    private var grabLast: [Float] = [9, 9]
+
+    /// Press/release EDGES, rate-limited per hand.
+    ///
+    /// The two-second summary says whether the gesture ever fired; it cannot
+    /// say whether it fired once or chattered thirty times, and chatter is the
+    /// specific failure a threshold on a noisy millimetre produces. An edge
+    /// line carries the distance that caused it, so a blind worn round comes
+    /// back with the number the threshold should have been. Rate-limited so a
+    /// chattering threshold costs a few lines rather than the whole log: at
+    /// most one line per hand per `grabEdgeMinGap`, with the suppressed edges
+    /// still counted into the summary's `down` count.
+    private var grabEdgeNextLog: [TimeInterval] = [0, 0]
+    private static let grabEdgeMinGap: TimeInterval = 0.5
+    private func traceGrabEdge(hand: Int, down: Bool, distance: Float) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now >= grabEdgeNextLog[hand] else { return }
+        grabEdgeNextLog[hand] = now + Self.grabEdgeMinGap
+        NSLog(String(format: "[cp] grab %@ %@ (middle-thumb %.3f m)",
+                     hand == 0 ? "L" : "R", down ? "press" : "release", distance))
+    }
+
+    /// Folded into the pinch trace's own two-second tick, and silenced by the
+    /// same knob: the two gestures share one hand and are read in one glance.
+    private func reportGrab() {
+        func fmt(_ h: Int) -> String {
+            grabMin[h] > 8
+                ? String(format: "no skeleton (%d frames)", grabNoSkeleton[h])
+                : String(format: "%.3f m -> %.2f, %d down",
+                         grabMin[h], grabPeak[h], grabFires[h])
+        }
+        NSLog("[cp] grab:  L \(fmt(0)) | R \(fmt(1)) "
+              + String(format: "(open %.3f closed %.3f%@)",
+                       Self.grabOpen, Self.grabClosed,
+                       Self.grabEnabled ? "" : ", KL_GRAB=0 — not pressing"))
+        grabMin = [9, 9]; grabPeak = [0, 0]
+        grabFires = [0, 0]; grabNoSkeleton = [0, 0]
+    }
 
     // MARK: - The system pinch
 
@@ -1750,6 +2192,42 @@ final class KleptonControllers {
                     pinchFires[hand] += 1
                     let bit = hand == 0 ? OVRPRawButton.lIndexTrigger
                                         : OVRPRawButton.rIndexTrigger
+                    st.buttons |= bit; st.touches |= bit
+                }
+
+                // **The grab, i.e. the hand trigger.** Same machinery one
+                // finger over, and deliberately after the pinch rather than
+                // merged with it: the two are independent gestures on
+                // independent joints, and the guest wants them at once.
+                //
+                // The measurement runs even with `KL_GRAB=0` so the trace
+                // still reports what the gesture WOULD have done — an A/B that
+                // also blinds the instrument answers half the question.
+                let g = grabGesture(anchor, hand: hand)
+                let grabbed = Self.grabEnabled
+                    && (grabHeld[hand] ? (g > 0.30) : (g > 0.55))
+                if grabbed != grabHeld[hand] {
+                    traceGrabEdge(hand: hand, down: grabbed, distance: grabLast[hand])
+                }
+                // Analog, pinned to 1.0 on the press, exactly as the index
+                // trigger is: OVRInput exposes `handTrigger` as an axis and
+                // thresholds it itself, so a bit that says pressed over an
+                // axis that says 0.6 is a disagreement the guest resolves the
+                // wrong way half the time.
+                //
+                // ...and that is exactly why `KL_GRAB=0` has to zero the AXIS
+                // and not just withhold the bit. OVRInput's virtual
+                // `PrimaryHandTrigger` thresholds the float itself, so a knob
+                // that suppressed only the raw bit would leave a full
+                // middle-thumb touch reading 1.0 and the guest grabbing
+                // anyway — an off switch that does not switch anything off,
+                // which is worse than not having one.
+                st.handTrigger = Self.grabEnabled ? (grabbed ? 1 : g) : 0
+                grabHeld[hand] = grabbed
+                if grabbed {
+                    grabFires[hand] += 1
+                    let bit = hand == 0 ? OVRPRawButton.lHandTrigger
+                                        : OVRPRawButton.rHandTrigger
                     st.buttons |= bit; st.touches |= bit
                 }
             } else {

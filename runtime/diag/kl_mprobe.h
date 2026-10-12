@@ -21,4 +21,25 @@
 // KL_PROBE_EVERY frames (default 120). No-op unless KL_PROBE_INPUT=1.
 void kl_mprobe_tick(unsigned frame);
 
+// The same idea pointed at a scripted sequence instead of at input: read a
+// live object's FIELDS rather than call its methods, so a state machine that
+// has stopped advancing can be asked where it stopped. Disassembly can list
+// the steps a coroutine queues; only the running object knows which one it is
+// sitting on. Prints every KL_PROBE_TIMELINE frames; off when that is unset.
+//
+// KL_PROBE_CLASSREF=<hex>[,<hex>...] is the companion: an il2cpp class-ref
+// slot (an image offset, read out of a disassembled `adrp/ldr` pair) resolved
+// to a type NAME plus that type's static fields and their values. Compiled
+// il2cpp code names nothing — a gate that early-outs an entire Update is an
+// anonymous byte at `statics+0x14` until something reads the slot at runtime.
+void kl_mprobe_timeline(unsigned frame);
+
+// KL_PROBE_ENUM="Namespace.Type[/Nested][,...]" — print a managed enum's names
+// and VALUES, read out of the running guest by reflection. Callable as soon as
+// the IL2CPP runtime is up, which is the point: the values are what
+// kl_ovrplat's message types have to be, and a guest that stops before the
+// frame pump on the host (Arkham Shadow does) still has to be askable. The
+// frame pump calls it too, once, on its first probing tick.
+void kl_mprobe_enums(void);
+
 #endif

@@ -15,6 +15,7 @@
 // That is exactly the shape a driver-local workaround has, so it is here now
 // and BOTH drivers call it.
 #include "kl_guestpoke.h"
+#include "kl_egl.h"        // kl_gl_cap_max_combined_texture_units
 #include "klepton.h"
 
 #include <ctype.h>
@@ -187,11 +188,26 @@ static int addr_mapped(const void *p, size_t len) {
 // dispatches through. The process then dies in an unrelated subsystem thousands
 // of frames later, on device and in the viewer alike, branching through a slot
 // holding whatever the page held. Stale unit-0 textures are the lesser fault.
-struct poke_cap_row { const char *ver; uint32_t singleton; uint32_t field; int use; };
+// `max` is the fourth measurement and the one that is easiest to forget to take.
+// The field is a bound on a FIXED array inside libunity that Unity never sized
+// from GL, so writing the driver's number into it does not grant permission, it
+// invites the same unbounded index this whole area exists to stop — and the
+// array's size is per-build, not per-driver. Both measured builds die well
+// short of the driver's 128:
+//
+//     2019.4      (BS 1.28)   64 clean, 96 SIGSEGV (pc <host>+0, a wild call)
+//     2022.3.33f1 (BS 1.40)   96/97 clean, 127/128 SIGSEGV (libunity+0xbd8114,
+//                             address 0xde100000de1 — content read as a pointer)
+//
+// each measured on host at 1200 frames with everything else equal. An unmeasured
+// build gets 64, which is the largest value any build here has been shown to
+// tolerate; raise it only after running the same A/B on that build.
+struct poke_cap_row { const char *ver; uint32_t singleton; uint32_t field; int use; int max; };
 static const struct poke_cap_row k_poke_caps[] = {
     // Unity 2019.4 — Beat Saber 1.28/1.6.0, the long-standing reference build.
     // Getter 0x313710 serves *(base + 0x122e340); cap at +0xe8.
-    { "2019.4", 0x122e340, 0xe8, 0 },
+    // max 64: 96 takes this build down inside the frame pump.
+    { "2019.4", 0x122e340, 0xe8, 0, 64 },
     // Unity 2022.3 — Beat Saber 1.40 (2026-08-12). Measured by the recipe above:
     //   0x14b20b  "OpenGL Error: Invalid texture unit!"
     //   0xbd29b8  bl 0x6420f0            ; the singleton getter
@@ -205,7 +221,11 @@ static const struct poke_cap_row k_poke_caps[] = {
     // test, and VRChat is a different 2022.3 build with a different singleton,
     // so a "2022.3" key would aim this store at Beat Saber's address inside
     // VRChat's libunity. A minor version is not a build.
-    { "2022.3.33f1", 0x13d7cc0, 0xec, 0 },
+    // max 96: the GLES 3.2 spec minimum for combined units, which is the count a
+    // conformant guest may assume without asking — exactly what this field
+    // encodes. It clears the highest unit this build has been seen to bind (72,
+    // on song load) by 24, and sits inside the measured-clean region.
+    { "2022.3.33f1", 0x13d7cc0, 0xec, 0, 96 },
     // Unity 2022.3.22f2-DWR — VRChat (2026-08-13). Same recipe, and the guard
     // is INLINE in this build rather than behind a getter, so steps 3 and 4
     // collapse into one read:
@@ -218,7 +238,8 @@ static const struct poke_cap_row k_poke_caps[] = {
     // 0x19943c0 lands in the RW LOAD's BSS (va 0x18c7970, filesz 0x1ca90 <
     // memsz 0x111676), which is what a singleton pointer filled at runtime
     // looks like.
-    { "2022.3.22f2-DWR", 0x19943c0, 0xec, 1 },
+    // max 64: unmeasured on this build, so the conservative floor.
+    { "2022.3.22f2-DWR", 0x19943c0, 0xec, 1, 64 },
     // Unity 2019.1.10f1 — Liminal (2026-08-23). The engine was rejecting units
     // >= 32 ~68k times a session, so its dialog/dynamic text sampled a stale
     // unit-0 texture and rendered as tofu boxes. Measured by the recipe above
@@ -231,7 +252,8 @@ static const struct poke_cap_row k_poke_caps[] = {
     // 0x149e280 lands in the RW LOAD (va 0x13b2000, memsz 0x1b3d18 -> 0x1565d18),
     // a singleton pointer filled at runtime. Field 0xe8 is the same slot 2019.4
     // uses; the singleton address is this build's own.
-    { "2019.1.10f1", 0x149e280, 0xe8, 1 },
+    // max 64: unmeasured on this build, so the conservative floor.
+    { "2019.1.10f1", 0x149e280, 0xe8, 1, 64 },
 };
 #define POKE_NROWS (sizeof k_poke_caps / sizeof k_poke_caps[0])
 
@@ -251,14 +273,29 @@ void kl_guest_poke_texture_unit_cap(void) {
     static int calls;
     const int first = (++calls == 1);
     const char *pv = getenv("KL_POKE_CAP");
-    // The knobs are read HERE rather than at the call sites: a gate living in
-    // one driver is a difference between the host and the headset with nothing
-    // to report it. The raise is 64, matching the vendored ANGLE build
-    // (kMaxShaderSamplers=32, combined 64), and is applied only to rows marked
-    // `use`; KL_POKE_CAP=<n> sets the value and forces it on an unlisted or
-    // unused row; KL_POKE_CAP_OFF=1 leaves the guest alone entirely.
+    // The knobs are read HERE rather than at the call sites, because there are
+    // two of them now and a gate that lives in one driver is a difference
+    // between the host and the headset with nothing to report it.
+    //
+    // The default was a hand-written 64 "matching the vendored ANGLE rebuild",
+    // and that copy drifted the moment ANGLE's ceiling moved: the driver began
+    // accepting units the guest still refused. So it now FOLLOWS the description
+    // (kl_gl_cap_max_combined_texture_units, which under a real driver is what
+    // ANGLE itself reported) — clamped to the row's measured `max`, and the clamp
+    // is as load-bearing as the raise. This field bounds a fixed libunity array,
+    // and driver >= array is not implied: 2019.4 dies at 96, 2022.3.33f1 at 127,
+    // and the driver now says 128. See the table above the rows.
+    //
+    // KL_POKE_CAP=<n> overrides — unclamped, because raising it deliberately is
+    // how the next row's `max` gets measured — and forces the poke on an unlisted
+    // Unity version; KL_POKE_CAP_OFF=1 leaves the guest alone entirely.
+    //
+    // The raise is additionally gated per row by `use`: a measured row may
+    // DECLINE the store, which is what both Beat Saber rows do — Unity's own
+    // 32-unit check is load-bearing as a guard, and raising it trades stale
+    // unit-0 textures for a later branch through a poisoned dispatch slot.
     if (!pv && getenv("KL_POKE_CAP_OFF")) return;
-    int poke_n = pv ? atoi(pv) : 64;
+    int poke_n = pv ? atoi(pv) : (int)kl_gl_cap_max_combined_texture_units();
     if (poke_n <= 1) return;
 
     const char *ver = unity_version();
@@ -292,6 +329,15 @@ void kl_guest_poke_texture_unit_cap(void) {
         return;
     }
     if (!row) row = &k_poke_caps[0];
+    // The clamp, applied once the row is known — it is a property of THIS build's
+    // array, not a global. An explicit KL_POKE_CAP is left alone on purpose.
+    if (!pv && poke_n > row->max) {
+        if (first)
+            fprintf(stderr, "  [poke] texture-unit cap: driver offers %d, clamped to %d "
+                            "— Unity %s's own array is what bounds this, not GL\n",
+                    poke_n, row->max, row->ver);
+        poke_n = row->max;
+    }
     const uint32_t POKE_SINGLETON = row->singleton;
     const uint32_t POKE_FIELD     = row->field;
 

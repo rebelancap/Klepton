@@ -72,4 +72,38 @@ int kl_gl_cap_internalformativ(uint32_t target, uint32_t internalformat,
 int kl_gl_cap_floatv(uint32_t pname, float *data);
 int kl_gl_cap_integer64v(uint32_t pname, int64_t *data);
 
+// The texture-unit caps, and the door that stops them from being a second,
+// hand-maintained copy of the vendored ANGLE's number.
+//
+// The description we hand the guest has to agree with what the real driver will
+// enforce: Unity sizes its own texture-unit state from GL_MAX_COMBINED_TEXTURE_-
+// IMAGE_UNITS and then indexes that state by unit with no bound of its own, so a
+// number larger than ANGLE's does not produce a polite GL error, it produces a
+// write past the end of Unity's array. Beat Saber 1.40 died exactly there.
+//
+// So under a real driver the answers are ADOPTED from it rather than asserted:
+// kl_glfb calls this once with what ANGLE actually reports, and the built-in
+// literals in kl_egl.c are only the null-renderer fallback. Values <= 0 are
+// ignored, and a shrink is honoured as loudly as a grow.
+void kl_gl_cap_adopt_texture_units(int32_t per_stage, int32_t combined);
+
+// What the description currently promises for GL_MAX_COMBINED_TEXTURE_IMAGE_-
+// UNITS — post-adoption if adoption has happened. The one number anything else
+// that has to agree with the driver (kl_guestpoke's Unity cap poke) should ask
+// for, rather than carrying its own copy.
+int32_t kl_gl_cap_max_combined_texture_units(void);
+
+// Extensions ADOPTED from the backend, the same way the texture-unit caps are:
+// kl_glfb hands over ANGLE's own glGetString(GL_EXTENSIONS) once the real
+// context exists, and a name from the runtime's candidate list is added to what
+// the guest is told only if the driver named it first. See kl_egl.c for the
+// candidates and why each is there — the short version is that srceng was
+// decompressing a 4.9 GB DXT texture pack to RGBA8888 on the CPU because our
+// extension string mentioned no compression, and sampling every floor at its
+// worst axis because it mentioned no anisotropy.
+void        kl_gl_cap_adopt_backend_extensions(const char *backend_ext);
+int         kl_gl_cap_backend_has_dxt(void);
+int         kl_gl_cap_adopted_extension_count(void);
+const char *kl_gl_cap_adopted_extension(int i);
+
 #endif

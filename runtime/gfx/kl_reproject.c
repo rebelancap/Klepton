@@ -148,6 +148,7 @@ static const char kl_msl_reproject[] =
 "    float    chromaMin;\n"
 "    float    chromaMax;\n"
 "    packed_float3 chromaKey;  // packed: matches the C side's three floats\n"
+"    float    guard;      // outer-ring stretch, fraction of the half-extent\n"
 "};\n"
 "\n"
 // The sRGB EOTF, piecewise as the spec has it rather than a 2.2 power. The
@@ -311,8 +312,22 @@ static const char kl_msl_reproject[] =
 "    g.y += (k == 2u || k == 4u || k == 5u) ? 1u : 0u;\n"
 "    float2 c = float2(g) / float2(float(nx), float(ny));\n"
 "    float d = u.depth;          // KL_REPROJECT_DEPTH\n"
-"    float x = mix(-u.tangents.x, u.tangents.y, c.x) * d;\n"
-"    float y = mix(-u.tangents.w, u.tangents.z, c.y) * d;\n"
+    // THE GUARD BAND. `c` is the position parameter and the uv is read from the
+    // grid at the UNSHIFTED `g` below, so pushing the outermost ring outward
+    // here stretches the outer row/column of cells and leaves every texture
+    // coordinate exactly where it was. Nothing new is sampled — the uv never
+    // leaves the block, so the other eye's half of a DoubleWide texture stays
+    // out of reach — and the margin is filled with the outermost texels rather
+    // than with the black that was there before. See kl_reproject.h's `guard`.
+"    float2 cq = c;\n"
+"    if (u.guard > 0.0) {\n"
+"        if (g.x == 0u)  cq.x = -u.guard;\n"
+"        if (g.x == nx)  cq.x = 1.0 + u.guard;\n"
+"        if (g.y == 0u)  cq.y = -u.guard;\n"
+"        if (g.y == ny)  cq.y = 1.0 + u.guard;\n"
+"    }\n"
+"    float x = mix(-u.tangents.x, u.tangents.y, cq.x) * d;\n"
+"    float y = mix(-u.tangents.w, u.tangents.z, cq.y) * d;\n"
 "    VOut o;\n"
 "    o.slice = u.slice;\n"
 "    o.srgb = u.srgbDecode;\n"
@@ -599,6 +614,32 @@ void kl_reproject_grid_identity(simd_float2 *out) {
     out[4] = simd_make_float2(1.0f, 1.0f);
 }
 
+uint32_t kl_proj_layer_grid_dim(void) {
+    // Read per call (once per composited frame), so a frontend that sets it
+    // with setenv after a compositor has first asked is still honoured. Cheap —
+    // one getenv and an strtol. DEFAULT 64 for every guest (driver, 2026-10-04:
+    // the 1x1 grid's head-speed zoom was confirmed fixed on the headset by hla
+    // launch 5); KL_PROJ_LAYER_GRID=1 is the pre-fix grid for a port's A/B.
+    const char *e = getenv("KL_PROJ_LAYER_GRID");
+    long v = e && *e ? strtol(e, NULL, 10) : 64;
+    if (v < 1) v = 1;
+    if (v > KL_REPROJECT_GRID_MAX) v = KL_REPROJECT_GRID_MAX;
+    return (uint32_t)v;
+}
+
+void kl_proj_layer_grid(simd_float2 *out, uint32_t dim) {
+    if (!out) return;
+    if (dim <= 1 || dim > KL_REPROJECT_GRID_MAX) {
+        kl_reproject_grid_identity(out);
+        return;
+    }
+    // The identity at `dim` x `dim`: no viewport, no rate map, a 1x1 "screen"
+    // over a 1x1 "texture", so every coordinate is exactly g / dim — the same
+    // numbers the 1x1 grid holds at its corners, at more vertices.
+    kl_reproject_grid_build_eye(out, 0, dim, dim, NULL, 1.0f, 1.0f, 1.0f, 1.0f,
+                                NULL, NULL);
+}
+
 void kl_reproject_grid_build(simd_float2 *out, uint32_t nx, uint32_t ny,
                              const float *vp,
                              float screen_w, float screen_h,
@@ -705,6 +746,31 @@ static simd_float4x4 klr_pose_matrix(const float p[7]) {
     simd_float4x4 m = klr_rotation_of_quat(p[0], p[1], p[2], p[3]);
     m.columns[3] = simd_make_float4(p[4], p[5], p[6], 1.0f);
     return m;
+}
+
+// The guard band's own census. r16 shipped a constant and the worn log had no
+// line to falsify it with — which is how a margin that was under-sized before
+// the head moved survived a round. This is the line: how much correction the
+// pass is really applying, and how much margin that asks for, over a window.
+// Every KL_REPROJECT_GUARD_EVERY builds (0 silences it); the default is 1200,
+// which is 5 s at 120 Hz with two eyes.
+static void klr_guard_seen(float theta_rad, float guard) {
+    static long n, every = -1;
+    static float worst_theta, worst_guard, sum_theta;
+    static long clamped;
+    if (every < 0) every = (long)kl_env_int("KL_REPROJECT_GUARD_EVERY", 1200);
+    if (every == 0) return;
+    if (theta_rad > worst_theta) worst_theta = theta_rad;
+    if (guard > worst_guard) worst_guard = guard;
+    if (guard >= 0.25f) clamped++;
+    sum_theta += theta_rad;
+    if (++n < every) return;
+    fprintf(stderr, "  [rp] guard: correction mean %.3f deg / worst %.3f deg over "
+                    "%ld builds — margin worst %.4f%s\n",
+            (double)(sum_theta / (float)n) * 57.29577951f,
+            (double)worst_theta * 57.29577951f, n, (double)worst_guard,
+            clamped ? " *** CLAMPED at the 0.25 ceiling ***" : "");
+    n = 0; worst_theta = 0; worst_guard = 0; sum_theta = 0; clamped = 0;
 }
 
 kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, int eye,
@@ -856,6 +922,125 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     simd_float4x4 chain = simd_mul(simd_mul(simd_inverse(render_m), device_m),
                                    view_rot);
     u.model_view = simd_inverse(chain);
+
+    // ---- THE TRANSLATION CENSUS (round 12) — observation only ---------------
+    //
+    // The central quantity in this file's own argument had never been measured:
+    // how far the eye actually MOVES between the pose the guest rendered with
+    // and the pose the frame is displayed at. Everything above is written as if
+    // it were "several centimetres", and the whole case for naming a near depth
+    // rests on that. `[cp] timewarp` prints the ROTATION between the two poses
+    // and has always been silent on the translation.
+    //
+    // **This block cannot change what is displayed, and here is why rather than
+    // an assurance that it does not.** It is placed AFTER `u.model_view` is
+    // assigned, so every matrix this function returns is already final when it
+    // runs. It reads `rendered->p*`, `origin_from_device.columns[3]` and
+    // `s_depth`, all already computed above; it writes only to the file-static
+    // counters declared inside it; it has no branch that skips or alters any
+    // work; and it produces no value anything reads. Deleting it changes no
+    // pixel.
+    //
+    // On by default, because a knob nobody remembers to set is this port's own
+    // KL_OVRP_EYE_FORCE failure repeated — eight rounds of host runs that could
+    // not see the device's geometry because the flag was off. KL_RP_TRANS_CENSUS=0
+    // silences it. Rate-limited to one line per 1200 samples (two eyes a frame,
+    // so ~600 frames, ~5 s at 120 Hz): one fprintf every five seconds.
+    //
+    // WHAT THE NUMBERS ARE. `dP` is the eye's displacement between the two
+    // poses. Uncorrected, content at distance d is displaced by |dP|/d radians.
+    // This pass corrects exactly the parallax of a plane at `u.depth`, so what
+    // is LEFT for content at d is |dP| * (1/d - 1/depth) — the payoff number,
+    // signed on purpose: positive is under-correction (near content still
+    // swims), negative is over-correction (the far field acquires a swim it did
+    // not have). Both are printed, at 1.5 m for the near field (a floor
+    // underfoot, a plank in the hands) and at infinity for the sky, so one line
+    // says what the chosen depth buys AND what it costs.
+    //
+    // FAILING LOUDLY. A window in which not one sample had a usable render pose
+    // prints so and prints no statistics. That case is real — before the guest
+    // reaches ovrp_BeginFrame there is no record — and a plausible 0.00 mm there
+    // would be indistinguishable from a head that genuinely did not move, which
+    // is exactly the reading this instrument exists to make trustworthy.
+    {
+        static unsigned long long n, usable;
+        static double sum_mm, worst_mm;
+        if (kl_env_on("KL_RP_TRANS_CENSUS", 1)) {
+            n++;
+            if (rendered && rendered->serial) {
+                usable++;
+                double dx = (double)origin_from_device.columns[3][0] - rendered->px;
+                double dy = (double)origin_from_device.columns[3][1] - rendered->py;
+                double dz = (double)origin_from_device.columns[3][2] - rendered->pz;
+                double mm = sqrt(dx*dx + dy*dy + dz*dz) * 1000.0;
+                sum_mm += mm;
+                if (mm > worst_mm) worst_mm = mm;
+            }
+            if (n >= 1200) {
+                if (!usable) {
+                    fprintf(stderr,
+                            "  [rp] translation census FAILED: not one of %llu "
+                            "samples carried a render pose, so there is no "
+                            "displacement to report — this is NOT a still head\n",
+                            n);
+                } else {
+                    const double DEG = 57.29577951308232;
+                    double d = (double)s_depth > 0 ? (double)s_depth : 1.0;
+                    double mean_mm = sum_mm / (double)usable;
+                    double near_deg = worst_mm / 1000.0 * (1.0 / 1.5 - 1.0 / d) * DEG;
+                    double far_deg  = worst_mm / 1000.0 * (0.0       - 1.0 / d) * DEG;
+                    fprintf(stderr,
+                            "  [rp] translation: eye moved %.2f mm mean / %.2f mm "
+                            "worst between the render pose and the display pose "
+                            "over %llu sample(s) (%llu had no record). Corrected "
+                            "for a plane at %.1f m, the worst leaves %+.3f deg on "
+                            "content at 1.5 m and %+.3f deg at infinity "
+                            "(+ under-corrected, - over-corrected; compare the "
+                            "rotation in [cp] timewarp delta)\n",
+                            mean_mm, worst_mm, usable, n - usable, d,
+                            near_deg, far_deg);
+                }
+                n = usable = 0; sum_mm = worst_mm = 0.0;
+            }
+        }
+    }
+
+    // ---- the guard band, sized from the correction it actually has to cover
+    //
+    // r16 baked 0.03 off a worst delta of 0.9 deg, and the r17 worn log says
+    // that was under-sized before the head moved at all:
+    //
+    //   [rp] warp eye0 assumes: ... (drawable ..., view rot 1.077 deg)
+    //
+    // `chain` is the whole rotation the quad is turned by, and the eye's own
+    // cant is INSIDE it — so the correction is never zero on this display, and
+    // at 1.077 deg (0.0188 rad) the corner wants ~0.038. A constant sized off
+    // one measurement is a constant that is wrong on the next title, so it is
+    // measured here instead, per eye per frame, out of the matrix that does the
+    // turning. The angle of a rotation matrix is acos((trace - 1) / 2).
+    //
+    // The factor is 2, for the reason kl_reproject.h gives at length and
+    // t_reproject asserts: the CORNER moves by sqrt(2) theta relative to its
+    // own half-extent, and a little over that covers the grid's quantisation.
+    // KL_REPROJECT_GUARD is now the FLOOR rather than the value — 0 still
+    // restores the pre-r16 black, and a number still pins it for an A/B.
+    static float s_floor = -1.0f;
+    if (s_floor < 0.0f) {
+        float v = kl_env_float("KL_REPROJECT_GUARD", 0.03);
+        s_floor = (v >= 0.0f && v <= 0.25f) ? v : 0.03f;
+    }
+    float g = s_floor;
+    if (s_floor > 0.0f) {
+        float tr = chain.columns[0].x + chain.columns[1].y + chain.columns[2].z;
+        float c = (tr - 1.0f) * 0.5f;
+        if (c > 1.0f) c = 1.0f; else if (c < -1.0f) c = -1.0f;
+        float theta = acosf(c);                       // radians, always >= 0
+        float want = 2.0f * theta + 0.005f;
+        if (want > g) g = want;
+        if (g > 0.25f) g = 0.25f;                     // the shader's own ceiling
+        klr_guard_seen(theta, g);
+    }
+    u.guard = g;
     return u;
 }
 
@@ -967,6 +1152,115 @@ kl_overlay_uniforms kl_overlay_build(const kl_ovrp_overlay *ov, int eye,
     u.visible = 1;
     u.opaque = kl_env_on("KL_OVERLAY_OPAQUE", 0) ? 1u : 0u;
     return u;
+}
+
+// ---------------------------------------------------------------------------
+// The composite audit. See kl_reproject.h for why it exists and what it is for.
+//
+// The one rule it must not restate in its own words is `sanitise` in
+// KleptonCompositor.unwarpGrid, so it is transcribed here in the same order and
+// with the same comparisons; a divergence between the two is a check that
+// passes while the display is wrong, which is the failure mode this whole file
+// keeps running into.
+static int klr_audit_sanitise(const int r[4], const int of[2],
+                              int tw, int th, float out[4]) {
+    float vp[4] = { (float)r[0], (float)r[1], (float)r[2], (float)r[3] };
+    int dropped = 0;
+    if (vp[2] > 0 && of[0] > 0 && of[1] > 0 && (of[0] != tw || of[1] != th)) {
+        vp[0] = vp[1] = vp[2] = vp[3] = 0;
+        dropped = 1;
+    }
+    if (vp[2] <= 0 || vp[3] <= 0 ||
+        (vp[0] == 0 && vp[1] == 0 && (int)vp[2] == tw && (int)vp[3] == th)) {
+        vp[0] = vp[1] = vp[2] = vp[3] = 0;
+    }
+    out[0] = vp[0]; out[1] = vp[1]; out[2] = vp[2]; out[3] = vp[3];
+    return dropped;
+}
+
+int kl_composite_audit_eyes(const kl_ovrp_render_pose *rec,
+                            int tex_w, int tex_h, int shared_storage,
+                            kl_composite_audit *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof *out);
+    // The whole-texture answer is what a compositor falls back to at every one
+    // of the exits below, so it is what the struct says until something narrows
+    // it. Stating it up front means a caller that reads `uv` after a fault gets
+    // the rect the display would really have sampled.
+    for (int e = 0; e < 2; e++) {
+        out->uv[e][0] = 0; out->uv[e][1] = 0; out->uv[e][2] = 1; out->uv[e][3] = 1;
+    }
+    if (!(tex_w > 0) || !(tex_h > 0)) {
+        out->fault = 1; out->kind = KL_CF_NO_TEXTURE;
+        snprintf(out->why, sizeof out->why,
+                 "no eye texture: there is nothing for a compositor to sample");
+        return out->fault;
+    }
+    if (!rec || !rec->serial) {
+        out->fault = 1; out->kind = KL_CF_NO_RECORD;
+        snprintf(out->why, sizeof out->why,
+                 "NO COMPLETED FRAME RECORD — a compositor places both eyes with "
+                 "the symmetric 90 deg default and applies no crop at all");
+        return out->fault;
+    }
+    out->have_record = 1;
+    float vp[2][4];
+    for (int e = 0; e < 2; e++) {
+        out->crop_dropped |= klr_audit_sanitise(rec->viewport[e], rec->viewport_of,
+                                                tex_w, tex_h, vp[e]);
+        out->cropped[e] = vp[e][2] > 0 && vp[e][3] > 0;
+        if (out->cropped[e]) {
+            out->uv[e][0] = vp[e][0] / (float)tex_w;
+            out->uv[e][1] = vp[e][1] / (float)tex_h;
+            out->uv[e][2] = vp[e][2] / (float)tex_w;
+            out->uv[e][3] = vp[e][3] / (float)tex_h;
+        }
+    }
+    // How much of eye 0's rect eye 1 also reads. One number, and it is the
+    // whole of the doubling question on shared storage: 0 is two halves of one
+    // canvas, 1 is two eyes reading the same texels.
+    {
+        float ax0 = out->uv[0][0], ax1 = ax0 + out->uv[0][2];
+        float ay0 = out->uv[0][1], ay1 = ay0 + out->uv[0][3];
+        float bx0 = out->uv[1][0], bx1 = bx0 + out->uv[1][2];
+        float by0 = out->uv[1][1], by1 = by0 + out->uv[1][3];
+        float ix = (ax1 < bx1 ? ax1 : bx1) - (ax0 > bx0 ? ax0 : bx0);
+        float iy = (ay1 < by1 ? ay1 : by1) - (ay0 > by0 ? ay0 : by0);
+        float area = out->uv[0][2] * out->uv[0][3];
+        out->overlap = (ix > 0 && iy > 0 && area > 0) ? (ix * iy) / area : 0.0f;
+    }
+    if (out->crop_dropped) {
+        out->fault = 1; out->kind = KL_CF_CROP_REFUSED;
+        snprintf(out->why, sizeof out->why,
+                 "the render viewport describes a %dx%d eye texture and the one in "
+                 "hand is %dx%d — the crop is REFUSED (kl_ovrp.h viewport_of) and "
+                 "each eye samples the whole texture",
+                 rec->viewport_of[0], rec->viewport_of[1], tex_w, tex_h);
+        return out->fault;
+    }
+    if (shared_storage && out->overlap > 0.05f) {
+        out->fault = 1; out->kind = KL_CF_DOUBLED;
+        snprintf(out->why, sizeof out->why,
+                 "both eyes sample the SAME storage and their rects overlap by "
+                 "%.0f%% — every eye sees the whole canvas, i.e. the picture "
+                 "TWICE (crop eye0 %s, eye1 %s)",
+                 (double)(out->overlap * 100.0f),
+                 out->cropped[0] ? "yes" : "NO", out->cropped[1] ? "yes" : "NO");
+        return out->fault;
+    }
+    for (int e = 0; e < 2; e++) {
+        if (out->uv[e][0] < -1e-4f || out->uv[e][1] < -1e-4f ||
+            out->uv[e][0] + out->uv[e][2] > 1.0f + 1e-4f ||
+            out->uv[e][1] + out->uv[e][3] > 1.0f + 1e-4f) {
+            out->fault = 1; out->kind = KL_CF_OUT_OF_RANGE;
+            snprintf(out->why, sizeof out->why,
+                     "eye %d samples outside its own texture: uv %.3f,%.3f "
+                     "%.3fx%.3f", e, (double)out->uv[e][0], (double)out->uv[e][1],
+                     (double)out->uv[e][2], (double)out->uv[e][3]);
+            return out->fault;
+        }
+    }
+    return 0;
 }
 
 float kl_reproject_ndc_depth(const kl_reproject_uniforms *u) {

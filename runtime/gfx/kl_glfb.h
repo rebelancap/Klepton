@@ -27,18 +27,58 @@ void *kl_glfb_flat_surface(int *w, int *h);
 // it is driving GLES 3.2.
 void *kl_glfb_sym(const char *name);
 
-// Bind the context to the calling thread. Call from eglMakeCurrent: a GL context
-// is per-thread, and the guest's render thread is not the one that created it.
-void kl_glfb_make_current(void);
+// Bind the guest's context to the calling thread. Call from eglMakeCurrent: a
+// GL context is per-thread, and the guest's render thread is not the one that
+// created it. `guest_ctx` is the guest's own EGLContext handle — each distinct
+// one is backed by its own real ANGLE context in a single share group, which is
+// what lets UE4 drive GL from the RHIThread while the game thread holds another.
+void kl_glfb_make_current(void *guest_ctx);
+
+// Seed ANGLE's per-thread TLS on a guest thread. Call once from the guest
+// thread trampoline, before the thread can issue GL: the DEBUG ANGLE the host
+// links asserts on that TLS at the top of every GLES entry point and
+// dereferences NULL when a thread reaches GL without ever touching EGL. See the
+// block above the definition in kl_glfb.c. No-op until GL is up, and off with
+// KL_GLFB_THREAD_TLS=0.
+void kl_glfb_thread_tls_touch(void);
 
 // The release half: call from eglMakeCurrent when the guest makes no context
-// current. Migration mode frees the root context for the next thread.
+// current. Frees this thread's guest context for the next thread to take.
 void kl_glfb_release_current(void);
 
 // Read the eye framebuffer back and write <dir>/frame_NNN.png. Returns the number
 // of frames presented so far. When a frame sink is registered the buffer goes
 // there instead (dir may then be NULL) and no PNG is written.
 unsigned kl_glfb_present(const char *dir);
+
+// r26 -- arm the capture and the frame trace from the guest side.
+//
+// KL_GLFB_OUT_ARM_CSM arms on the first depth-only framebuffer, which on a
+// guest that runs shadow cascades from the first world frame means "the front
+// end", minutes before whatever is actually being investigated. This is the
+// other door: the target's own guest interposer calls it when it knows the
+// interesting moment has arrived (SHAR calls it from
+// InteriorManager::Enter -- the player pressing the button on a doorway), and
+// KL_GLFB_OUT_ARM_INTERIOR=1 makes that arm the gate. Idempotent, safe from any
+// thread, and inert unless the knob is set. Either arm is sufficient when both
+// KL_GLFB_OUT_ARM_CSM and KL_GLFB_OUT_ARM_INTERIOR are on.
+void kl_glfb_arm_capture(void);
+
+// ---- the SHAR radar capture, round 37 --------------------------------------
+//
+// Driven from the BeginRadarCapture / EndRadarCapture interposers in kl_sdl.c,
+// because the bug they close is the guest's and the guest is where the call
+// sites are; the GL lives here. See the "round 37: EndRadarCapture" block in
+// kl_glfb.c for what BeginRadarCapture gets wrong and why the smallest fix is
+// to remember the binding it was entered with.
+int32_t kl_glfb_shar_radar_binding(void);
+void    kl_glfb_shar_radar_restore(int32_t want);
+void    kl_glfb_shar_radar_endpass(void);
+
+// KL_GLFB_FRAMETRACE=N, cached. Non-zero means the ordered per-frame
+// clear/draw/bind trace is wanted, which is what makes the swap worth calling
+// kl_glfb_present on even with no capture directory and no frontend attached.
+int kl_glfb_frametrace(void);
 
 // The frontend seam, frame out. Registering a sink turns the per-swap capture
 // into a handoff: instead of PNG-encoding to KL_GLFB_OUT, the readback buffer
@@ -99,6 +139,77 @@ void kl_glfb_gl_census(FILE *f);
 // black" and "the guest never drew into the eye texture" are the same symptom
 // and completely different work.
 void kl_glfb_draw_census(FILE *f);
+
+// The program-link ledger: how many linked, the slowest one, and — the reason
+// this exists — the link that was still running when the report was written. A
+// wedged render thread inside ANGLE's link event leaves no other trace, and r10
+// spent 33 s in one without the log ever naming the program.
+void kl_glfb_link_census(FILE *f);
+// r22: the cached-binary link path, which had no instrument at all.
+void kl_glfb_program_binary_census(FILE *f);
+
+// The generation of klfb_rewrite_glsl's OUTPUT, and it belongs to the shader
+// cache exactly as much as the driver's build number does.
+//
+// A guest's ProgramBinaryCache stores the compiled form of the GLSL WE handed
+// ANGLE, not the GLSL the guest wrote — so a change to any rewrite rule leaves
+// every cached blob a compiled copy of the OLD text, and the guest reloads it
+// happily and silently. r24 had to bake a one-shot KL_SHADER_CACHE_DROP token
+// by hand because a rewrite change had no way to invalidate a cache it does not
+// own; this is that, made automatic and general.
+//
+// BUMP THIS whenever klfb_rewrite_glsl emits different text. It is folded into
+// shader_cache_guard's fingerprint beside kern.osversion and hw.model, so the
+// drop then happens by itself, on every target, exactly once per install.
+//
+//   1  everything up to and including r23
+//   2  r25 — scene depth: DepthbufferFetchES2 samples the depth attachment
+//   3  r27 — volumetric fog: a vertex-stage sampler3D textureLod becomes
+//            vec4(0,0,0,1), UE4's own value for "no volumetric fog"
+//   4  r28 — the fog COMPOSITE: a fragment shader that reads in_TEXCOORD7
+//            shadows it with vec4(0,0,0,1), removing the composite itself.
+//            The mechanism test the volumetric guess skipped.
+//   5  r29 — NO text change: the bump is deliberate and is here to drop the
+//            PROGRAM BINARY cache. r29's worn log named the fill's program and
+//            could not dump its GLSL, because a program linked from a cached
+//            binary has no attached shaders and this process never saw its
+//            source. One long compile buys the named program's own text.
+#define KL_GLFB_REWRITE_GEN 5
+
+// The sampler-LOD ledger: mipmapped minification filters, level caps, LOD
+// clamps and biases, anisotropy, glGenerateMipmap, and how many levels the
+// guest's texture allocations asked for. Written to answer the one question
+// r20's mip-level reading of the tetris blue fill could not ask from a log —
+// whether the content being sampled has a mip chain at all. Free, always on.
+void kl_glfb_lod_census(FILE *f);
+
+// The MIP-CHAIN ledger (r30): for every texture the guest allocated with more
+// than one level, how many of those levels ever received an upload and how many
+// bytes each got, against the bytes its dimensions imply. NOMIP=1 removed the
+// blue fill, so the sample came from a level above 0; this says whether that
+// level had real content in it or was allocated storage nobody ever wrote.
+// Free — the destination texture name comes from the bind tracker rather than a
+// glGetIntegerv round trip — and always on.
+void kl_glfb_mipchain_census(FILE *f);
+
+// The eye-stage association: which texture names are registered as which stage,
+// which framebuffers the sixteen-slot map holds, and which eye framebuffers only
+// the wider colour table knows about. r11 drew 189,574 times into eye textures
+// and filed none of them, and this is the state that says why.
+void kl_glfb_eye_map_census(FILE *f);
+
+// The censuses above, printed periodically DURING the run.
+//
+// On device the exit report is unreachable: KL_EXIT_ON_BACKGROUND=0 is baked
+// for these targets (the app must not exit when its window closes) and a force
+// quit is SIGKILL, so kl_egl_report never runs. Two rounds of the Tetris
+// bring-up were diagnosed from a HOST exit report describing a bug that only
+// happens on device. Call this from the compositor's own loop.
+//
+// `why` NULL means "the timer, if it is due"; a string means "flush now and
+// label it", for the layer-paused transition — the one event a closed window is
+// guaranteed to deliver. KL_GLFB_CENSUS_SECS sets the period (default 15 s).
+void kl_glfb_live_census(const char *why);
 
 // The eye-texture seam, texture identity out. kl_ovrp's SetupEyeTexture2 calls
 // this with the GL texture name Unity handed down; the capture finds "the
@@ -173,6 +284,50 @@ int      kl_glfb_render_stages(uint32_t *mask, uint32_t *binds, uint64_t *tid);
 // bookkeeping — so a stage that stops being drawn into is visible here even
 // when every other counter still looks healthy.
 uint64_t kl_glfb_stage_draw_count(int stage);
+
+// ...and the question none of the counters above can answer: is there a PICTURE
+// in the stage, or is it black?
+//
+// Every observation on this seam is about addressing — which stage was bound,
+// how often, by whom — and a guest that draws black into the right texture
+// reads identically to one that draws a scene. Under KL_GLFB_STAGE_PROBE=N this
+// reads two 32x32 patches out of every registered (eye, stage) every Nth call
+// and reports min/mean/max over RGB, so a device log can say which of the two
+// it is. Call it from the guest's render thread once the frame's draws are in
+// (kl_ovrp's EndFrame); it is a no-op without the knob, and a no-op on a thread
+// with no current context.
+void kl_glfb_probe_stages(int frame);
+
+// ---------------------------------------------------------------------------
+// DoubleWide.
+//
+// A guest that asked for ovrpLayout_DoubleWide renders BOTH eyes into the eye-0
+// texture — one viewport per eye, side by side — and never touches eye 1's
+// swapchain at all. kl_ovrp turns this on where it bridges the request (it is
+// the only thing that knows the guest asked); KL_GLFB_DOUBLEWIDE=0/1 overrides.
+//
+// What it changes: `kl_glfb_eye_mtl_texture(1, stage)` answers with EYE 0's
+// texture and EYE 0's slice. Both eyes then sample the one picture the guest
+// drew, and the compositor's per-eye render viewport — the two rects
+// ovrp_EndFrame4 files, turned into one unwarp block per eye by
+// kl_reproject_grid_build_eye — crops each eye's half out of it. That IS the
+// per-eye source rect the old note here said was missing: it was built for
+// BONELAB's symmetric projection and serves this unchanged, at full resolution
+// and through the eye texture's rate map.
+//
+// `kl_glfb_split_doublewide` is the OLD answer and is now opt-in behind
+// KL_GLFB_DOUBLEWIDE_SPLIT=1: it blits each half out to a whole eye texture at
+// EndFrame. **It is wrong on device** — it works in logical screen coordinates
+// on FOVEATED storage, un-squeezing a picture the unwarp grid is about to
+// un-squeeze again, and reading unwritten texels for the right half. r13 saw
+// all three of its symptoms in one headset session: a stretched, displaced left
+// eye, a black right eye, and a flicker as un-split stages came round. Kept
+// only for a present path with no per-eye viewport at all (the host viewer).
+// `stage_mask` is kl_glfb_render_stages()'s — the stages the frame's draws
+// actually landed in.
+int  kl_glfb_doublewide(void);
+void kl_glfb_set_doublewide(int on);
+void kl_glfb_split_doublewide(uint32_t stage_mask);
 
 // ---------------------------------------------------------------------------
 // The Metal interop seam. Proven on host and device before any of this
