@@ -74,6 +74,8 @@ static const char *ue4_meta_str(const char *key);   // defined below; used by co
 // is skipped with a note; only the entry library failing is fatal.
 static const char *const UE4_CHAIN[] = {
     "libc++_shared.so",
+    "libEOSSDK.so",         // Epic Online Services — Tetris Effect links it,
+                            // RE4 and Deadpool VR do not ship it
     // FMOD, dependencies first (libfmodstudio is built on the libfmod core).
     // libUE4 has these as DT_NEEDED and binds FMOD_* / FMOD::* against them, but
     // the translated libUE4 carries no LC_LOAD_DYLIB, so a symbol only resolves
@@ -82,7 +84,8 @@ static const char *const UE4_CHAIN[] = {
     // first FMOD_Debug_Initialize aborted. Loaded here, before libUE4, they bind.
     "libfmod.so",
     "libfmodstudio.so",
-    "libovraudio64.so",     // the Oculus audio spatializer
+    "libovraudio64.so",     // the Oculus audio spatializer — RE4/Deadpool VR
+                            // ship it, Tetris Effect does not
     "libplaycore.so",       // Google Play core — the OBB downloader's half
     UE4_LIB,
 };
@@ -475,55 +478,58 @@ int kl_ue4_load(FILE *out) {
         kl_run_init(img);
     }
 
-    // FMOD's Android platform layer — the AudioTrack/OpenSL output and the JavaVM
-    // it needs for AudioManager queries — is set up in libfmod's JNI_OnLoad, which
-    // on Android is called by System.loadLibrary("fmod"). Here libfmod is mapped by
-    // the chain above (kl_load_auto), which only runs DT_INIT, never JNI_OnLoad. So
-    // call it explicitly, with the synthetic JavaVM, before libUE4's own JNI_OnLoad.
-    // Without it FMOD::getGlobals returns FMOD_ERR_INTERNAL (28) -> System::create
-    // fails -> Studio never comes up -> no banks, no events (vampire: silent). The
-    // DT_NEEDED path has its own hook (kl_maybe_jni_onload); this covers the UE4
-    // chain, which is how every FMOD title here actually loads it.
-    {
-        char fpath[1200];
-        snprintf(fpath, sizeof fpath, "%s/libfmod.so", g_libdir);
-        kl_image *fmod = kl_find_image(fpath);
-        if (fmod) {
-            int (*fonload)(void *, void *) = (int (*)(void *, void *))
-                kl_sym(fmod, "JNI_OnLoad");
-            if (fonload) {
-                kl_jni_local_frame_push();
-                int fr = fonload(kl_jni_vm(), NULL);
-                kl_jni_local_frame_pop();
-                if (out) { fprintf(out, "  libfmod JNI_OnLoad -> 0x%08x "
-                                        "(FMOD Android platform init)\n", fr); fflush(out); }
-            }
-        }
-    }
-
-    // JNI_OnLoad. UE4 exports all three doors — JNI_OnLoad,
-    // ANativeActivity_onCreate and android_main — and Android runs them in that
-    // order: System.loadLibrary first (which is what calls JNI_OnLoad), then
-    // the activity, then the engine's own thread inside android_main.
+    // JNI_OnLoad — for EVERY library in the chain that exports one, not just
+    // libUE4.
     //
-    // NOT fatal if it is absent, unlike the Unity path where JNI_OnLoad IS the
-    // entry point. Here it is the engine registering its GameActivity natives,
-    // and a build that registers them statically instead would be a different
-    // shape rather than a broken one — so this reports and carries on, and the
+    // UE4 exports all three doors — JNI_OnLoad, ANativeActivity_onCreate and
+    // android_main — and Android runs them in that order: System.loadLibrary
+    // first (which is what calls JNI_OnLoad), then the activity, then the
+    // engine's own thread inside android_main.
+    //
+    // The part that was missing is that GameActivity.java calls
+    // System.loadLibrary for each packaged library, so Android's linker calls
+    // JNI_OnLoad on each of them — that is the ONLY moment a library gets
+    // handed a JavaVM*, and a library loaded as somebody's DT_NEEDED never
+    // gets one. Running it for libUE4 alone left every other library in the
+    // chain without a VM, and the cost of that was invisible until it was
+    // enormous: libEOSSDK.so caches the VM in its JNI_OnLoad, and without it
+    // `EOS_Initialize` returns **17000, EOS_Android_JavaVMNotStored**. Epic
+    // Online Services then never starts, the Redpoint subsystem factory
+    // produces nothing, and Tetris Effect dereferences the resulting null
+    // `GetOnlineSubsystem(FName("RedpointEOS"))` at level BeginPlay — a
+    // SIGSEGV an hour of rendering work away from the missing call.
+    //
+    // Chain order, dependencies first, with libUE4 last exactly as it is in
+    // UE4_CHAIN: a library's JNI_OnLoad may call into what it links against.
+    //
+    // NOT fatal if a library has no JNI_OnLoad, and not fatal if libUE4's is
+    // absent either, unlike the Unity path where JNI_OnLoad IS the entry
+    // point. Here it is the engine registering its GameActivity natives, and a
+    // build that registers them statically instead would be a different shape
+    // rather than a broken one — so this reports and carries on, and the
     // NativeActivity door is what the run actually turns on.
     typedef int (*jni_onload_fn)(void *vm, void *reserved);
-    jni_onload_fn onload = (jni_onload_fn)kl_sym(g_ue4, "JNI_OnLoad");
-    if (!onload) {
-        if (out) fprintf(out, "  no JNI_OnLoad — the activity door is the entry\n");
-        return 0;
+    int ue4_saw_onload = 0;
+    for (size_t i = 0; i < sizeof UE4_CHAIN / sizeof *UE4_CHAIN; i++) {
+        char path[1200];
+        snprintf(path, sizeof path, "%s/%s", g_libdir, UE4_CHAIN[i]);
+        kl_image *img = kl_find_image(path);
+        if (!img) continue;
+        jni_onload_fn onload = (jni_onload_fn)kl_sym(img, "JNI_OnLoad");
+        if (!onload) continue;
+        kl_jni_local_frame_push();
+        int version = onload(kl_jni_vm(), NULL);
+        kl_jni_local_frame_pop();
+        if (img == g_ue4) ue4_saw_onload = 1;
+        if (out) {
+            fprintf(out, "  JNI_OnLoad %-22s returned 0x%08x\n",
+                    UE4_CHAIN[i], version);
+            fflush(out);
+        }
     }
-    kl_jni_local_frame_push();
-    int version = onload(kl_jni_vm(), NULL);
-    kl_jni_local_frame_pop();
-    if (out) {
-        fprintf(out, "  JNI_OnLoad returned 0x%08x\n", version);
-        fflush(out);
-    }
+    if (!ue4_saw_onload && out)
+        fprintf(out, "  no JNI_OnLoad in %s — the activity door is the entry\n",
+                UE4_LIB);
     return 0;
 }
 

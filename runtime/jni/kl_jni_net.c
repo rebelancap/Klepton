@@ -476,6 +476,14 @@ const klj_binding klj_bind_net[] = {
     {"android/content/Context", "getResources",
      "()Landroid/content/res/Resources;", klj_Context_getResources},
     {"java/lang/System", "load", "(Ljava/lang/String;)V", klj_System_load},
+    // ...and the bare-NAME form beside the absolute-path one. Bound to
+    // UnityPlayer.loadLibrary because that function already IS
+    // System.loadLibrary's semantics — "lib" + name + ".so" under the native
+    // library dir, opened through the same guest dlopen and landing in the same
+    // image registry. Unity's wrapper exists only because the engine prefers its
+    // own door; the managed code makes the plain call. One resolver for both
+    // names, so a library cannot end up open twice under two paths.
+    {"java/lang/System", "loadLibrary", "(Ljava/lang/String;)V", klj_UnityPlayer_loadLibrary},
     {"com/epicgames/mobile/eossdk/LibraryLoader", "load", "()V", klj_EOS_LibraryLoader_load},
     // EOSSDK.init(activity) — EOS bring-up after the loader ran. Online/account
     // services; a no-op lets the game boot offline (the platform SDKs are all
