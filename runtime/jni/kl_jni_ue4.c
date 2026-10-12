@@ -56,6 +56,41 @@ static char g_ue4_msg_buttons[512];
 // Routing the synthetic ones at the same Display handlers Unity reads is the
 // display-panel group answer again — two engines asking one device the same
 // question must not get two numbers.
+//
+// Unreal 5 renamed the synthetic keys along with everything else: `ue4.display`,
+// `ue4.display.getRefreshRate` and `ue4.displaymetrics.dpi` are spelled
+// `unreal.*` in 5.3 (Pinball FX VR), and the Java behind them is the same
+// method with the same sparse-switch. So they are ALIASED here rather than
+// duplicated below, the same choice kl_jni.c's class fold makes.
+//
+// Only the display family, and that limit is the point: `unreal.GameActivity.*`
+// keys are GENUINE manifest entries in a UE5 APK (CookedFlavors,
+// bValidateTextureFormats) and must reach the Bundle read untouched. A blanket
+// `unreal.` -> `ue4.` prefix swap would send them looking for a key the manifest
+// does not have.
+//
+// What this cost when it was missing: `unreal.displaymetrics.dpi` fell through
+// to the manifest, answered "", and FAndroidDeviceProfileSelector split "" on
+// "," and indexed element 0 of the empty array — SIGSEGV at address 0x8, on a
+// guest worker thread, eight instructions later, naming nothing.
+static const char *klj_ue5_meta_alias(const char *k) {
+    static const struct { const char *ue5, *ue4; } alias[] = {
+        {"unreal.displaymetrics.dpi",     "ue4.displaymetrics.dpi"},
+        {"unreal.displaymetrics.metrics", "ue4.displaymetrics.metrics"},
+        {"unreal.display",                "ue4.display"},
+        {"unreal.display.getRefreshRate", "ue4.display.getRefreshRate"},
+        {"unreal.display.PresentationDeadlineNanos",
+         "ue4.display.PresentationDeadlineNanos"},
+        {"unreal.display.AppVsyncOffsetNanos",
+         "ue4.display.AppVsyncOffsetNanos"},
+        {0, 0}
+    };
+    if (!k) return "";
+    for (int i = 0; alias[i].ue5; i++)
+        if (strcmp(k, alias[i].ue5) == 0) return alias[i].ue4;
+    return k;
+}
+
 static klj_val klj_GA_hasMetaDataKey(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
     const char *k = n > 0 ? klj_str(a[0].l) : NULL;
@@ -69,7 +104,7 @@ static klj_val klj_GA_getMetaDataBoolean(void *env, void *self, const klj_val *a
 }
 static klj_val klj_GA_getMetaDataInt(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
-    const char *k = n > 0 ? klj_str(a[0].l) : "";
+    const char *k = klj_ue5_meta_alias(n > 0 ? klj_str(a[0].l) : "");
     // The graphics API decision, and it is made HERE rather than by the RHI:
     // UE4 offers Vulkan only when the platform reports the vulkan.version
     // feature, and the activity reads that out of
@@ -112,9 +147,21 @@ static klj_val klj_GA_getMetaDataInt(void *env, void *self, const klj_val *a, in
     if (strcmp(k, "android.hardware.vulkan.version") == 0
         || strcmp(k, "android.hardware.vulkan.level") == 0) {
         int level = strcmp(k, "android.hardware.vulkan.level") == 0;
+        // KL_UE4_VULKAN: 0 withholds the feature entirely (the A/B that
+        // restores the pre-Vulkan refusal); 1 or unset keeps the default,
+        // VK_MAKE_VERSION(1,1,0); anything larger is used AS the version word,
+        // so a guest that wants a different number can be given one without a
+        // rebuild. Unreal decides from the NUMBER, not from a probe: Pinball FX
+        // VR (UE5.3) given 1.0.3 dlopens libvulkan.so, calls nothing through
+        // it, and puts up "This device does not support Vulkan but the app was
+        // not packaged with ES 3.1 support"; given 1.1 it reaches
+        // vkCreateInstance and vkCreateDevice.
         const char *env_v = getenv("KL_UE4_VULKAN");
-        int on = env_v ? (int)strtol(env_v, NULL, 0) != 0 : 1;
-        int v = !on ? 0 : level ? 1 : ((1 << 22) | (1 << 12));  /* VK_MAKE_VERSION(1,1,0) — UE5 minimum */
+        long want = env_v ? strtol(env_v, NULL, 0) : 1;
+        int on = want != 0;
+        int v = !on ? 0 : level ? 1
+              : want > 1 ? (int)want
+              : ((1 << 22) | (1 << 12));   /* VK_MAKE_VERSION(1,1,0) — UE5 minimum */
         KLJ_LOG("GetMetaDataInt(\"%s\") -> 0x%x%s", k, v,
                 on ? "" : " (no Vulkan feature presented — KL_UE4_VULKAN=0)");
         return (klj_val){.j = (uint64_t)(int64_t)v};
@@ -124,7 +171,7 @@ static klj_val klj_GA_getMetaDataInt(void *env, void *self, const klj_val *a, in
 }
 
 static klj_val klj_GA_getMetaDataLong(void *env, void *self, const klj_val *a, int n) {
-    const char *k = n > 0 ? klj_str(a[0].l) : "";
+    const char *k = klj_ue5_meta_alias(n > 0 ? klj_str(a[0].l) : "");
     if (strcmp(k, "ue4.display.PresentationDeadlineNanos") == 0)
         return klj_Display_getPresentationDeadlineNanos(env, self, a, n);
     if (strcmp(k, "ue4.display.AppVsyncOffsetNanos") == 0)
@@ -133,7 +180,7 @@ static klj_val klj_GA_getMetaDataLong(void *env, void *self, const klj_val *a, i
     return (klj_val){.j = (uint64_t)(v ? strtoll(v, NULL, 10) : 0)};
 }
 static klj_val klj_GA_getMetaDataFloat(void *env, void *self, const klj_val *a, int n) {
-    const char *k = n > 0 ? klj_str(a[0].l) : "";
+    const char *k = klj_ue5_meta_alias(n > 0 ? klj_str(a[0].l) : "");
     if (strcmp(k, "ue4.display.getRefreshRate") == 0)
         return klj_Display_getRefreshRate(env, self, a, n);
     const char *v = kl_jni_manifest_meta(k);
@@ -141,7 +188,7 @@ static klj_val klj_GA_getMetaDataFloat(void *env, void *self, const klj_val *a, 
 }
 static klj_val klj_GA_getMetaDataString(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
-    const char *k = n > 0 ? klj_str(a[0].l) : "";
+    const char *k = klj_ue5_meta_alias(n > 0 ? klj_str(a[0].l) : "");
     // `getprop:<name>` is a system property read wearing a meta-data key's
     // clothes, and the properties are the ones kl_libc's sysprop table already
     // answers — so this goes through that rather than growing a second table.

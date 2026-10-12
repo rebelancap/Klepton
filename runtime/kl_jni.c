@@ -252,10 +252,39 @@ static unsigned   g_nwanted;
 
 pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
+// Unreal Engine 5 renamed Epic's Java package: `com.epicgames.ue4.*` became
+// `com.epicgames.unreal.*` — GameActivity, MediaPlayer14 and its three track-
+// info inner classes, the VolumeReceiver/BatteryReceiver/HeadsetReceiver trio,
+// MessageBox01. It is a RENAME and not a new API: the method names, signatures
+// and semantics the four kl_jni_*.c tables transcribe are identical either side
+// of it (verified against Pinball FX VR's UE5.3.2 GameActivity.smali against
+// Deadpool VR's 4.27 one).
+//
+// So it is folded HERE, at the one funnel every class name enters the surface
+// through — klj_FindClass, kl_jni_class and kl_jni_new_object all call this —
+// rather than by duplicating some sixty table rows under a second spelling. A
+// duplicated table is a table that goes stale in one half, and the half that
+// goes stale is the one no target exercises yet.
+//
+// The fold is one-directional and narrow on purpose: only this exact package
+// prefix, only onto ue4's. Anything else keeps the name it was asked for, and
+// the interned name is the FOLDED one, so klj_class_name, the g_supers walk and
+// every klj_object's `cls` pointer all agree on one spelling downstream.
+#define KLJ_UE5_PKG "com/epicgames/unreal/"
+#define KLJ_UE4_PKG "com/epicgames/ue4/"
+
+static const char *klj_fold_class_name(const char *name, char *buf, size_t n) {
+    if (strncmp(name, KLJ_UE5_PKG, sizeof KLJ_UE5_PKG - 1) != 0) return name;
+    snprintf(buf, n, KLJ_UE4_PKG "%s", name + sizeof KLJ_UE5_PKG - 1);
+    return buf;
+}
+
 // Interning gives every class name one stable address, so a klj_object can hold
 // a bare `const char *cls` that stays valid forever, and the "have we seen this
 // before" log dedupe falls out of the same lookup.
- klj_class *klj_intern_class_locked(const char *name) {
+ klj_class *klj_intern_class_locked(const char *asked) {
+    char fold[256];
+    const char *name = klj_fold_class_name(asked, fold, sizeof fold);
     for (unsigned i = 0; i < g_nclasses; i++)
         if (strcmp(g_classes[i].name, name) == 0) return &g_classes[i];
     if (g_nclasses == KLJ_MAX_CLASSES) { KLJ_LOG("class table full at %s", name); kl_fatal_prepare(); abort(); }
@@ -2100,6 +2129,12 @@ static const klj_field g_fields[] = {
     // below the app's targetSdkVersion of 30, so Unity takes the compatibility
     // paths the title actually shipped against. Revisit if a path needs 30+.
     KLJ_FINT("android/os/Build$VERSION", "SDK_INT", 29),
+    // ...and its preview twin, which Unreal 5.3 (Pinball FX VR) reads right
+    // after SDK_INT. It is 0 on every SHIPPED Android build and non-zero only
+    // on a developer preview, which this device is declared not to be; the
+    // engine adds it to SDK_INT to get an effective API level, so 0 is both the
+    // truthful answer and the one that leaves SDK_INT meaning what it says.
+    KLJ_FINT("android/os/Build$VERSION", "PREVIEW_SDK_INT", 0),
     // UE4's GameActivity copies SDK_INT into a static of its own in its class
     // initializer and then branches on THAT everywhere (13 sites in RE4's
     // GameActivity alone). A guest whose Java we stand in for never runs that

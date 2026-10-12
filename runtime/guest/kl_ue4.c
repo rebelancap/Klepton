@@ -102,11 +102,65 @@ static char g_libdir[1024];
 static char g_err[512] = "no error";
 static kl_image *g_ue4;
 
+// ---- the 4.x / 5.x dialect ------------------------------------------------
+//
+// Between UE4.27 and UE5, Epic renamed its Java package and its entry library:
+// `com.epicgames.ue4.*` became `com.epicgames.unreal.*`, `libUE4.so` became
+// `libUnreal.so`, and with them went the exported native symbols
+// (`Java_com_epicgames_ue4_GameActivity_native*` ->
+// `Java_com_epicgames_unreal_…`) and every `<meta-data>` key the manifest
+// carries. NOTHING ELSE about the door changed: the NativeActivity entry, the
+// onCreate/onResume transcription below, the argument shapes and the
+// AndroidThunkJava_* surface are the same calls under new names.
+//
+// So it is a spelling, not a second door. The entry library, activity class and
+// native prefix are set together from the target row (kl_ue4_configure);
+// manifest keys fall back across the two spellings in ue4_meta_raw; the JNI
+// surface folds `com/epicgames/unreal/` onto `com/epicgames/ue4/` at its
+// class-intern funnel (kl_jni.c, klj_fold_class_name); and guest natives are
+// looked up in both spellings (ue4_native_symbol, below). This prints which
+// spelling the guest is in, read off the MANIFEST — the guest's own statement
+// about itself — beside the entry library, so a mismatch between the two is
+// visible in the first lines of the boot log.
+static void ue4_dialect(FILE *out) {
+    int unreal = kl_jni_manifest_meta("com.epicgames.unreal.GameActivity.ProjectName") != NULL
+              || strcmp(g_entry_so, "libUnreal.so") == 0;
+    if (!out) return;
+    const char *branch = kl_jni_manifest_meta(
+        unreal ? "com.epicgames.unreal.GameActivity.EngineBranch"
+               : "com.epicgames.ue4.GameActivity.EngineBranch");
+    const char *ver = kl_jni_manifest_meta(
+        unreal ? "com.epicgames.unreal.GameActivity.EngineVersion"
+               : "com.epicgames.ue4.GameActivity.EngineVersion");
+    fprintf(out, "  [ue4] dialect:  com.epicgames.%s (%s, engine %s %s)\n",
+            unreal ? "unreal" : "ue4", g_entry_so, branch ? branch : "?", ver ? ver : "?");
+    fflush(out);
+}
+
 // A native of the guest's, by exported symbol. Registered with the JNI surface
 // so `AndroidThunkJava_*` handlers can make the call GameActivity.java would
 // have made; see kl_jni.h's kl_jni_set_guest_native_resolver.
+//
+// The JNI surface asks in 4.27's spelling, because that is the one spelling its
+// tables keep — the same choice kl_jni.c's klj_intern_class_locked makes when
+// it folds `com/epicgames/unreal/` onto `com/epicgames/ue4/`. A 5.x guest
+// exports `Java_com_epicgames_unreal_…`, so the same fold happens HERE, at the
+// one funnel every such lookup passes through, rather than at each call site.
+//
+// What the miss costs is worth naming, because it is silent: on Pinball FX
+// `AndroidThunkJava_InitHMDs` resolved NULL and that is an error nowhere —
+// nativeInitHMDs is simply never called, no HMD module ever gets its PreInit,
+// and the guest runs on with no XR path at all.
 static void *ue4_native_symbol(const char *symbol) {
-    return (g_ue4 && symbol) ? kl_sym(g_ue4, symbol) : NULL;
+    if (!g_ue4 || !symbol) return NULL;
+    void *p = kl_sym(g_ue4, symbol);
+    if (p) return p;
+    static const char ue4_pfx[] = "Java_com_epicgames_ue4_";
+    if (strncmp(symbol, ue4_pfx, sizeof ue4_pfx - 1)) return NULL;
+    char alt[256];
+    snprintf(alt, sizeof alt, "Java_com_epicgames_unreal_%s",
+             symbol + sizeof ue4_pfx - 1);
+    return kl_sym(g_ue4, alt);
 }
 
 static int ue4_fail(const char *why) {
@@ -382,6 +436,7 @@ int kl_ue4_configure(const char *libdir, const char *entry_lib, FILE *out) {
     // Everything else — assets, apk, files, native lib dir — has already been
     // set from the target row by kl_target_apply_host(). Restating any of it
     // here is how two descriptions of one guest start to drift.
+    ue4_dialect(out);
     kl_jni_set_activity_class(g_activity);
     // ...and the way back. UE4's Java front end calls natives on itself, so a
     // driver standing in for that Java has to be able to make those calls; the
