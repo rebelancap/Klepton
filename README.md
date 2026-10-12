@@ -1,5 +1,22 @@
 # Klepton
 
+> **This branch (`public`) is a maintained fork.** It is upstream
+> [shinyquagsire23/Klepton](https://github.com/shinyquagsire23/Klepton) at
+> `ce74582` plus the runtime work from porting about twenty titles, each
+> verified on a Vision Pro. The same changes are offered upstream as
+> reviewable pull requests: [#9](https://github.com/shinyquagsire23/Klepton/pull/9)
+> fixed foveated rendering for Vulkan guests,
+> [#10](https://github.com/shinyquagsire23/Klepton/pull/10) x18 veneers,
+> [#11](https://github.com/shinyquagsire23/Klepton/pull/11) libc/pthread,
+> [#12](https://github.com/shinyquagsire23/Klepton/pull/12) audio,
+> [#13](https://github.com/shinyquagsire23/Klepton/pull/13) OVRPlugin/XR layer,
+> [#20](https://github.com/shinyquagsire23/Klepton/pull/20) Unreal/JNI/NDK,
+> [#21](https://github.com/shinyquagsire23/Klepton/pull/21) GL path.
+> Builds with the upstream instructions below (`BUILDING.md`); the knobs are
+> in `DEBUG_ENV_VARS.md`, foveation in `docs/FOVEATION.md`, and each target
+> row in `visionos/targets.py` carries the per-title settings that worked
+> (its `env` field). Upstream's `main` is untouched on this fork.
+
 Running Android ARM64 VR APKs on Apple Vision Pro, no JIT required!
 
 ## Architecture
