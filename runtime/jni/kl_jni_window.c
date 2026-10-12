@@ -40,6 +40,19 @@ static klj_val klj_Window_getDecorView(void *env, void *self, const klj_val *a, 
     return klj_singleton("android/view/View", &view);
 }
 
+// UnityPlayer.getView() — the SurfaceView the player owns. The C# reach for it
+// is the line after the mUnityPlayer read that brought that field into the
+// table above:
+//   currentActivity.Get<AndroidJavaObject>("mUnityPlayer").Call(..., "getView")
+// and it is what a plugin passes to a window/insets/touch API. A distinct View
+// from the window's decor view, because on Android they are distinct; both are
+// the same class here, so every android/view/View binding answers for either.
+static klj_val klj_UnityPlayer_getView(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *view;
+    return klj_singleton("android/view/View", &view);
+}
+
 static klj_val klj_Window_setFlags(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
     KLJ_LOG("Window.setFlags(0x%llx, mask 0x%llx) — recorded, not applied",
@@ -233,11 +246,96 @@ static klj_val klj_InputDevice_getMotionRange(void *env, void *self, const klj_v
     return (klj_val){.l = NULL};   // no InputDevice-backed axis exists
 }
 
+// InputDevice.hasKeys(int... keyCodes) -> boolean[], one flag per key asked.
+//
+// Rewired asks this one, and only this one, to decide whether a device is a
+// DualShock 4 wearing a generic gamepad keymap (`IsDeviceKeyMapped`,
+// `DS4_GAMEPAD_KEYMAP_DISALLOWED_KEYS`): a real DS4 reports the disallowed
+// keys, a controller that merely looks like one does not. Our devices are the
+// two synthetic Touch controllers, which are NOT DualShocks and carry no
+// Android keymap at all — every button reaches the guest through OVRPlugin's
+// GetControllerState4, never as a key code. So the honest answer is all-false,
+// which is also the answer that keeps Rewired from mis-identifying a Touch
+// controller as a DS4 and remapping its buttons to a PlayStation layout.
+//
+// The array must be the same LENGTH as the one asked with — Rewired indexes it
+// positionally — so it is sized from the argument rather than from a constant.
+static klj_val klj_InputDevice_hasKeys(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    int len = 0;
+    if (n > 0 && a[0].l) {
+        klj_array *keys = klj_arr(a[0].l);
+        if (keys) len = keys->len;
+    }
+    void *out = klj_new_array('Z', NULL, len);
+    KLJ_LOG("InputDevice.hasKeys(%d keys) -> all false (Touch carries no Android keymap)", len);
+    return (klj_val){.l = out};
+}
+
+// `com.zenstudios.PinballFX_VR.BluetoothHelper.getConnectedInputDevices()` —
+// a game class rather than a platform one, and it lives HERE because the
+// surface it stands in for is the InputDevice family directly above: its whole
+// body is `for (id : InputDevice.getDeviceIds())` building one string per
+// device as `"ID: <id> | Type: <t> | Name: <name>"`, where the type is
+// "Gamepad" when `(sources & 0x401) == 0x401`, "Keyboard" when
+// `(sources & 0x101) == 0x101`, and "Unknown" otherwise.
+//
+// So this is not a stub — it is that loop, run over the same two controllers
+// klj_InputDevice_getDeviceIds already reports, with the same sources
+// klj_InputDevice_getSources already answers (GAMEPAD|JOYSTICK, so every one
+// of them types as "Gamepad"). Deriving it rather than hard-coding two strings
+// is what keeps it from disagreeing with the device list if that list ever
+// changes.
+//
+// The class's OTHER method, GetConnectedBluetoothDevices(Context), is a
+// genuine BluetoothManager walk and is deliberately NOT answered until a boot
+// asks for it: its no-adapter arm returns the single string "Bluetooth not
+// supported or disabled", which is a UI string, and inventing it before
+// something reads it would be guessing at a screen nobody has seen.
+static klj_val klj_ZenBT_getConnectedInputDevices(void *env, void *self,
+                                                  const klj_val *a, int n) {
+    (void)a; (void)n;
+    void *ids = klj_InputDevice_getDeviceIds(env, self, NULL, 0).l;
+    int count = ids ? klj_arr(ids)->len : 0;
+    void *arr = klj_new_array('L', "java/lang/String", count);
+    void **out = klj_arr(arr)->data;
+    const int32_t *v = ids ? klj_arr(ids)->data : NULL;
+    for (int i = 0; i < count; i++) {
+        klj_val idv = {.j = (uint64_t)(uint32_t)v[i]};
+        void *dev = klj_InputDevice_getDevice(env, self, &idv, 1).l;
+        klj_inputdev *d = dev ? klj_inputdev_of(dev) : NULL;
+        int sources = (int)klj_InputDevice_getSources(env, dev, NULL, 0).j;
+        const char *type = (sources & KLJ_SOURCE_GAMEPAD) == KLJ_SOURCE_GAMEPAD
+                             ? "Gamepad"
+                         : (sources & 0x101) == 0x101 ? "Keyboard"
+                                                      : "Unknown";
+        char line[192];
+        snprintf(line, sizeof line, "ID: %d | Type: %s | Name: %s",
+                 (int)v[i], type, d && d->name ? d->name : "");
+        out[i] = kl_jni_new_string(line);
+    }
+    KLJ_LOG("BluetoothHelper.getConnectedInputDevices() -> %d device(s), from "
+            "the same list InputDevice.getDeviceIds() reports", count);
+    return (klj_val){.l = arr};
+}
+
 static klj_val klj_InputManager_registerListener(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     // Same shape as registerDisplayListener: recorded, and nothing is owed a
     // callback because our device set never changes.
     KLJ_LOG("InputManager.registerInputDeviceListener — recorded; the device set never changes");
+    return (klj_val){.l = NULL};
+}
+
+// ...and its pair. Rewired's Android input source (Paint the Town Red ships
+// Rewired_Android.dll; `unregisterInputDeviceListener` is in its il2cpp string
+// heap next to the register call) tears the listener down on shutdown and on
+// every platform-helper reinitialise. Nothing was recorded, so nothing is
+// undone — but the call has to EXIST, or the teardown path aborts a boot that
+// otherwise worked.
+static klj_val klj_InputManager_unregisterListener(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("InputManager.unregisterInputDeviceListener — nothing was owed a callback");
     return (klj_val){.l = NULL};
 }
 
@@ -259,7 +357,6 @@ static klj_val klj_InputManager_getInputDevice(void *env, void *self, const klj_
 
 static klj_val klj_InputManager_getInputDeviceIds(void *env, void *self, const klj_val *a, int n) {
     return klj_InputDevice_getDeviceIds(env, self, a, n);
-    return (klj_val){.j = 0};
 }
 
  klj_val klj_AudioManager_getStreamVolume(void *env, void *self, const klj_val *a, int n) {
@@ -363,20 +460,7 @@ static klj_val klj_AudioManager_isBluetoothA2dpOn(void *env, void *self,
     return (klj_val){.j = 0};
 }
 
-// The other two of the game's once-a-second audio-route poll. Both answered
-// the way a headset with no Bluetooth route answers: no SCO link, and
-// isMusicActive false - the poll is asking about OTHER apps' playback, which
-// does not exist here.
-static klj_val klj_AudioManager_isBluetoothScoOn(void *env, void *self,
-                                                 const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
-    return (klj_val){.j = 0};
-}
-static klj_val klj_AudioManager_isMusicActive(void *env, void *self,
-                                              const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
-    return (klj_val){.j = 0};
-}
+// (isBluetoothScoOn / isMusicActive: answered false in kl_jni_android.c.)
 
 // ---------------------------------------------------------- window insets
 //
@@ -865,6 +949,9 @@ const klj_binding klj_bind_window[] = {
     {"android/os/BatteryManager", "isCharging", "()Z", klj_BatteryManager_isCharging},
     {"android/os/BatteryManager", "getIntProperty", "(I)I", klj_BatteryManager_getIntProperty},
     {"android/view/InputDevice", "getDeviceIds", "()[I", klj_InputDevice_getDeviceIds},
+    // Pinball FX's own helper over that same enumeration — see the note above it.
+    {"com/zenstudios/PinballFX_VR/BluetoothHelper", "getConnectedInputDevices",
+     "()[Ljava/lang/String;", klj_ZenBT_getConnectedInputDevices},
     {"android/view/InputDevice", "getDevice", "(I)Landroid/view/InputDevice;", klj_InputDevice_getDevice},
     {"android/view/InputDevice", "getName", "()Ljava/lang/String;", klj_InputDevice_getName},
     {"android/view/InputDevice", "getId", "()I", klj_InputDevice_getId},
@@ -882,15 +969,18 @@ const klj_binding klj_bind_window[] = {
      klj_InputManager_getInputDeviceIds},
     {"android/hardware/input/InputManager", "getInputDevice",
      "(I)Landroid/view/InputDevice;", klj_InputManager_getInputDevice},
+    {"android/hardware/input/InputManager", "unregisterInputDeviceListener",
+     "(Landroid/hardware/input/InputManager$InputDeviceListener;)V",
+     klj_InputManager_unregisterListener},
+    {"android/view/InputDevice", "hasKeys", "([I)[Z", klj_InputDevice_hasKeys},
     {"android/media/AudioManager", "getStreamVolume", "(I)I", klj_AudioManager_getStreamVolume},
     {"android/media/AudioManager", "getStreamMinVolume", "(I)I", klj_AudioManager_getStreamMinVolume},
     {"android/media/AudioManager", "getStreamMaxVolume", "(I)I", klj_AudioManager_getStreamMaxVolume},
     {"android/media/AudioManager", "setStreamVolume", "(III)V", klj_AudioManager_setStreamVolume},
     {"com/unity3d/player/UnityPlayer", "getLaunchURL", "()Ljava/lang/String;", klj_UnityPlayer_getLaunchURL},
+    {"com/unity3d/player/UnityPlayer", "getView", "()Landroid/view/View;", klj_UnityPlayer_getView},
     {"android/media/AudioManager", "getProperty", "(Ljava/lang/String;)Ljava/lang/String;", klj_AudioManager_getProperty},
     {"android/media/AudioManager", "isBluetoothA2dpOn", "()Z", klj_AudioManager_isBluetoothA2dpOn},
-    {"android/media/AudioManager", "isBluetoothScoOn", "()Z", klj_AudioManager_isBluetoothScoOn},
-    {"android/media/AudioManager", "isMusicActive", "()Z", klj_AudioManager_isMusicActive},
     // Unity 2018.4 reads the device's audio configuration off the hidden
     // AudioSystem class instead of AudioManager.getProperty(). Same numbers.
     {"android/media/AudioSystem", "getPrimaryOutputSamplingRate", "()I", klj_AudioSystem_getPrimaryOutputSamplingRate},

@@ -172,6 +172,7 @@ klj_val     klj_appinfo_splitSourceDirs(void);
 klj_val     klj_Uri_EMPTY(void);
 klj_val     klj_metaData_field(void);
 klj_val     klj_currentActivity_field(void);
+klj_val     klj_mUnityPlayer_field(void);
 klj_val     klj_porterduff_clear(void);
 
 // ---------------------------------------------------------------- the tables

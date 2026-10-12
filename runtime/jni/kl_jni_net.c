@@ -408,6 +408,34 @@ static klj_val klj_Settings_Secure_getString(void *env, void *self, const klj_va
     return (klj_val){.l = NULL};
 }
 
+// Settings.Global and Settings.System are the other two tables behind the same
+// ContentResolver, and a guest that misses a key in one asks the next: Unity's
+// own device-name lookup walks Global then Secure. So all three share this
+// implementation rather than deciding separately — a "device_name" that is null
+// in one table and a string in another is the group-answer mistake, and here it
+// would surface as a device that renames itself depending on which door was
+// used.
+//
+// The typed getters honour the caller's default, which is what Android does for
+// an absent key. The no-default overloads throw SettingNotFoundException on
+// Android; nothing here can throw, so they answer 0 and say so.
+static klj_val klj_Settings_getInt(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *key = n > 1 ? klj_str(a[1].l) : NULL;
+    kl_jint dflt = n > 2 ? (kl_jint)a[2].j : 0;
+    KLJ_LOG("Settings.getInt(\"%s\") -> %d (%s)", key ? key : "(null)", (int)dflt,
+            n > 2 ? "the caller's default; not a setting we serve"
+                  : "no default was offered and nothing here throws");
+    return (klj_val){.j = (uint64_t)(int64_t)dflt};
+}
+static klj_val klj_Settings_getFloat(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *key = n > 1 ? klj_str(a[1].l) : NULL;
+    double dflt = n > 2 ? a[2].d : 0.0;
+    KLJ_LOG("Settings.getFloat(\"%s\") -> %f (the caller's default)", key ? key : "(null)", dflt);
+    return (klj_val){.d = dflt};
+}
+
 // Thread.start(). This one is deliberately not a plain no-op, because a no-op
 // here is the one shape that lies: if the thread carried a guest Runnable, doing
 // nothing means its run() never happens and the guest waits forever for work that
@@ -605,6 +633,18 @@ const klj_binding klj_bind_net[] = {
     {"com/unity3d/player/UnityPlayer", "applyWindowUIChanges", "(Z)V", klj_void_noop},
     {"android/content/Context", "getContentResolver", "()Landroid/content/ContentResolver;", klj_Context_getContentResolver},
     {"android/provider/Settings$Secure", "getString", "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;", klj_Settings_Secure_getString},
+    // Same three tables, same answers — see klj_Settings_getInt.
+    {"android/provider/Settings$Global", "getString", "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;", klj_Settings_Secure_getString},
+    {"android/provider/Settings$System", "getString", "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;", klj_Settings_Secure_getString},
+#define KLJ_SETTING_TABLE(T) \
+    {"android/provider/Settings$" T, "getInt",   "(Landroid/content/ContentResolver;Ljava/lang/String;I)I", klj_Settings_getInt}, \
+    {"android/provider/Settings$" T, "getInt",   "(Landroid/content/ContentResolver;Ljava/lang/String;)I",  klj_Settings_getInt}, \
+    {"android/provider/Settings$" T, "getFloat", "(Landroid/content/ContentResolver;Ljava/lang/String;F)F", klj_Settings_getFloat}, \
+    {"android/provider/Settings$" T, "getFloat", "(Landroid/content/ContentResolver;Ljava/lang/String;)F",  klj_Settings_getFloat}
+    KLJ_SETTING_TABLE("Secure"),
+    KLJ_SETTING_TABLE("Global"),
+    KLJ_SETTING_TABLE("System"),
+#undef KLJ_SETTING_TABLE
     {"android/media/AudioManager", "getDevices", "(I)[Landroid/media/AudioDeviceInfo;", klj_AudioManager_getDevices},
     // The four the Meta XR Audio Wwise sink resolves, plus the two any caller
     // that got a device will reach for next.

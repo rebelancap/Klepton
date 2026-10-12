@@ -86,6 +86,17 @@ void *kl_jni_class(const char *name);
 // defaults to UnityPlayerActivity; the SDL3 target overrides it.
 void *kl_jni_activity(void);
 void kl_jni_set_activity_class(const char *cls);
+
+// The one UnityPlayer instance, for exactly the same reason the activity is a
+// singleton. kl_driver.c used to make a fresh `new UnityPlayer` per
+// lifecycle call — initJni got one, the nativeRecreateGfxState/Resume/Render
+// sequence got another — which real Android never does:
+// UnityPlayerActivity.onCreate constructs ONE and keeps it in mUnityPlayer
+// (UnityPlayerActivity.smali:121). A guest that reaches the player through
+// the activity's field and compares it with the `thiz` it was called on gets
+// two different objects, and a guest that reads that field at all needs it to
+// point at something. Both kl_driver.c call sites take their `thiz` from here.
+void *kl_jni_unity_player(void);
 void *kl_jni_new_string(const char *utf8);
 // A java/lang/String[] — what SDL3's nativeRunMain takes as argv, and what the
 // real SteamLink activity fills from the launching intent's "sArgs" extra.

@@ -2190,6 +2190,20 @@ static const klj_field g_fields[] = {
     // for one field again — the declared type and libunity's erased one.
     KLJ_FFN("com/unity3d/player/UnityPlayer", "currentContext", "Landroid/content/Context;", klj_currentActivity_field),
     KLJ_FFN("com/unity3d/player/UnityPlayer", "currentContext", "Ljava/lang/Object;", klj_currentActivity_field),
+    // The other direction: the activity's handle on the player it constructed.
+    // UnityPlayerActivity.smali declares
+    //   .field protected mUnityPlayer:Lcom/unity3d/player/UnityPlayer;
+    // and sets it in onCreate. A C# plugin reaching the player does
+    //   UnityPlayer.currentActivity.Get<AndroidJavaObject>("mUnityPlayer")
+    // which arrives here through ReflectionHelper.getFieldID with the ERASED
+    // Ljava/lang/Object; — the same two-spellings-of-one-field shape as
+    // currentActivity above, so both are listed and both call one function.
+    // Paint the Town Red stops here on its first guest frame without it, one
+    // read after registerInputDeviceListener.
+    KLJ_FFN("com/unity3d/player/UnityPlayerActivity", "mUnityPlayer",
+            "Lcom/unity3d/player/UnityPlayer;", klj_mUnityPlayer_field),
+    KLJ_FFN("com/unity3d/player/UnityPlayerActivity", "mUnityPlayer",
+            "Ljava/lang/Object;", klj_mUnityPlayer_field),
     KLJ_FFN("android/graphics/PorterDuff$Mode", "CLEAR", "Landroid/graphics/PorterDuff$Mode;", klj_porterduff_clear),
 
     KLJ_FFN("android/content/pm/PackageItemInfo", "metaData", "Landroid/os/Bundle;", klj_metaData_field),
@@ -2307,6 +2321,12 @@ static const klj_field g_fields[] = {
     KLJ_FINT("android/media/MediaRouter", "ROUTE_TYPE_LIVE_AUDIO", 1),
     KLJ_FINT("android/media/MediaRouter", "ROUTE_TYPE_LIVE_VIDEO", 2),
     KLJ_FINT("android/media/MediaRouter", "ROUTE_TYPE_USER",       8388608),
+
+    // Unity's internetReachability compares getActiveNetworkInfo().getType()
+    // against these two to decide LocalAreaNetwork vs CarrierDataNetwork.
+    // android-34 android.jar values, like the MediaRouter block above.
+    KLJ_FINT("android/net/ConnectivityManager", "TYPE_MOBILE", 0),
+    KLJ_FINT("android/net/ConnectivityManager", "TYPE_WIFI",   1),
 
     KLJ_FSTR("android/provider/Settings$Secure", "ANDROID_ID", "android_id"),
 
@@ -2442,7 +2462,7 @@ static void klj_init(void) {
     // given, so this covers the case where nothing set them.
     g_assets_dir     = klj_abspath(g_assets_dir);
     (void)kl_jni_files_dir();   // resolve now, so the report below prints it
-    g_apk_path       = klj_abspath(g_apk_path);
+    (void)kl_jni_apk_path();    // resolves KL_APK / the default, absolutised
     g_native_lib_dir = klj_abspath(g_native_lib_dir);
     // Raw opens of "<apk>/assets/..." (Unity's split assets) are served from
     // the unpacked tree: g_assets_dir points at "<unpacked>/assets", so the
