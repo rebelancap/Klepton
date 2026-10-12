@@ -21,6 +21,8 @@
 #include "kl_aaudio.h"
 #include "kl_obbmap.h"
 #include "kl_opensl.h"
+#include "kl_env.h"
+#include "kl_vulkan.h"
 
 // The library the chain ENDS at — "libUE4.so" for every UE4 title, and
 // "libUnreal.so" for UE5, which renamed the monolith and its Java package in
@@ -864,12 +866,133 @@ void kl_ue4_start(FILE *out) {
 }
 void kl_ue4_stop(FILE *out)  { kl_na_stop(out); }
 
+// ------------------------------------------------------- mobile multiview
+//
+// UE4's OpenGL RHI decides mobile multiview ONCE, into two exported globals,
+// and every later decision reads them:
+//
+//   FOpenGLES::bSupportsMobileMultiView   set in FOpenGLES::ProcessExtensions,
+//                                         true only when the GL_EXTENSIONS
+//                                         string names GL_OVR_multiview,
+//                                         GL_OVR_multiview2 AND
+//                                         GL_OVR_multiview_multisampled_-
+//                                         render_to_texture, and both
+//                                         glFramebufferTexture*MultiviewOVR
+//                                         resolve through eglGetProcAddress
+//   GSupportsMobileMultiView              copied from it during RHI init
+//
+// GSupportsMobileMultiView is what GLSLToDeviceCompatibleGLSL branches on when
+// it rewrites every cooked shader (read at libUE4+0x9f0a620 in Tetris Effect):
+//
+//   true  -> it PREPENDS "#extension GL_OVR_multiview2 : enable" and
+//            "layout(num_views = 2) in;" to the shader
+//   false -> it prepends "#define gl_ViewID_OVR 0" instead
+//
+// That false branch is UE4's OWN fallback for a device without the extension,
+// and it turns the identical cooked shader into ordinary single-view ES 3.0.
+// So the multiview wall this gateway hits — ANGLE's Metal backend implements
+// no multiview at all, so every such shader fails to compile, the link fails,
+// and UE4 turns the Fatal into a ForceQuit — is not a wall that has to be
+// climbed. It only has to be told the truth.
+//
+// This gateway does NOT name any of the three extensions and does NOT serve
+// the two entry points, so the honest value of both flags is 0. Writing them
+// is belt-and-braces against a path that sets them from something other than
+// the extension string; when they are already 0 this costs one byte read per
+// pump tick and says nothing.
+//
+// EVERY WORD ABOVE IS ABOUT OPENGL ES, so the clear is gated on the guest
+// actually using the GL gateway (kl_vulkan_guest_active(), inside the
+// function). A Vulkan RHI rewrites no cooked GLSL and never reads an ANGLE
+// extension string; clearing there only forces UE4's two-sequential-view
+// DoubleWide mobile stereo path: on Into the Radius (Vulkan) that path makes
+// static meshes vanish and reappear as the head moves.
+//
+// KL_UE4_MULTIVIEW is a TRI-STATE override of that decision: unset = decide
+// from the RHI, 1 = never clear (the A/B, and the way back if a future ANGLE
+// grows GL_OVR_multiview2), 0 = always clear (also on Vulkan, the way back if a
+// Vulkan guest is ever found that needs the clear).
+static void ue4_no_multiview(void) {
+    static uint8_t *gsupports, *bsupports;
+    static int looked, said, said_vk, ever_vk;
+    static uint8_t saved_g, saved_b;
+    if (!g_ue4) return;
+    // TRI-STATE, and the unset state is the interesting one:
+    //   unset -> decide from the RHI the guest actually brought up (below);
+    //   1     -> always leave the guest's answer alone;
+    //   0     -> always clear, even on Vulkan — the way back if a Vulkan guest
+    //            is ever found that needs the clear.
+    const char *knob = kl_env_str("KL_UE4_MULTIVIEW", NULL);
+    int force_keep  = knob && kl_env_on("KL_UE4_MULTIVIEW", 0);
+    int force_clear = knob && !force_keep;
+    if (force_keep) return;
+    if (!looked) {
+        looked = 1;
+        gsupports = ue4_native_symbol("GSupportsMobileMultiView");
+        bsupports = ue4_native_symbol("_ZN9FOpenGLES24bSupportsMobileMultiViewE");
+    }
+    // THE CLEAR IS A STATEMENT ABOUT THE GL GATEWAY, so it may only be made
+    // about a guest that is using it. ANGLE names no GL_OVR_multiview
+    // extension, UE4 prepends `layout(num_views = 2) in;` to every cooked
+    // shader when the flag is true, and the compile failure becomes a
+    // ForceQuit — that is a real wall for a GL guest and the reason this
+    // function exists. A VULKAN RHI rewrites no cooked GLSL and ANGLE is not in
+    // the picture: clearing there buys nothing and forces UE4 onto the
+    // two-sequential-view DoubleWide mobile stereo path the title never shipped
+    // with — on Into the Radius, static meshes that vanish as the head moves.
+    //
+    // kl_vulkan_guest_active() is the honest test rather than a renderer enum:
+    // it is a measurement of what the guest DID (resolved vk* symbols AND
+    // created a VkDevice through us, i.e. it is inside FVulkanDynamicRHI::Init)
+    // rather than a guess. It goes true before the first shader compile reads
+    // the flag, but AFTER some number of pump ticks — so an early tick can
+    // clear a flag the Vulkan RHI set moments earlier. Hence save-and-restore
+    // rather than merely declining future clears.
+    // Sticky: once a Vulkan device has been seen, the guest is a Vulkan guest
+    // for good — at quit vkDestroyDevice leaves none, and a tick after that
+    // would otherwise clear (and announce clearing) a flag nothing reads any
+    // more.
+    if (kl_vulkan_guest_active()) ever_vk = 1;
+    if (!force_clear && ever_vk) {
+        if (saved_g && gsupports) *gsupports = saved_g;
+        if (saved_b && bsupports) *bsupports = saved_b;
+        saved_g = saved_b = 0;
+        if (!said_vk) {
+            said_vk = 1;
+            fprintf(stderr, "  [ue4] mobile multiview left alone — this guest "
+                            "brought up a VULKAN device, so no cooked GLSL is "
+                            "rewritten and the GL gateway's extension string "
+                            "decides nothing. KL_UE4_MULTIVIEW=0 forces the "
+                            "clear back on.\n");
+        }
+        return;
+    }
+    int was = (gsupports && *gsupports) || (bsupports && *bsupports);
+    if (gsupports && *gsupports) saved_g = *gsupports;
+    if (bsupports && *bsupports) saved_b = *bsupports;
+    if (gsupports) *gsupports = 0;
+    if (bsupports) *bsupports = 0;
+    if (was && !said) {
+        said = 1;
+        fprintf(stderr, "  [ue4] mobile multiview was ON — cleared "
+                        "(GSupportsMobileMultiView / FOpenGLES::"
+                        "bSupportsMobileMultiView). The GL gateway names no "
+                        "GL_OVR_multiview extension, so UE4's own non-multiview "
+                        "shader path is the correct one; KL_UE4_MULTIVIEW=1 "
+                        "leaves the guest's answer alone.\n");
+    }
+}
+
 double kl_ue4_pump(double seconds, const volatile int *quit) {
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     double elapsed = 0;
     for (unsigned t = 0; (quit ? !*quit : 1) && (seconds < 0 || elapsed < seconds); t++) {
         kl_ndk_pump_looper(100);
+        // Cheap and idempotent: the RHI decides multiview during its own init,
+        // which is somewhere inside this pump, and the answer is read much
+        // later at the first shader compile.
+        ue4_no_multiview();
         // The UI thread's task queue and the frame clock, on the same thread
         // that turns the looper — which is what makes it the UI thread by the
         // only definition that matters: "am I the UI thread" is answered by
