@@ -2443,6 +2443,7 @@ const klj_binding *const klj_binding_tables[] = {
     klj_bind_electra,
     klj_bind_fmod,
     klj_bind_jkxr,
+    klj_bind_haptics,
     NULL,
 };
 
@@ -2640,4 +2641,196 @@ static void klj_build_tables(void) {
     VM(GetEnv,                      klj_GetEnv);
     VM(DestroyJavaVM,               klj_DestroyJavaVM);
 #undef VM
+}
+
+// ---------------------------------------------- the object-lifetime gate
+// `make jniobj`, in `make check`. Milliseconds, no guest, no window.
+//
+// Two facts about the object model, both learned the expensive way — each was
+// a boot that died hundreds of lines from the binding that actually caused it:
+//
+//  1. A binding that CACHES its answer in a host static must pin it. The
+//     object is allocated inside whatever local frame the first caller had
+//     open; that frame's pop retires the slot, the static keeps the pointer,
+//     and the next caller is handed a jobject we no longer recognise. Paint
+//     the Town Red VR's boot aborted in GetObjectClass on exactly that
+//     pointer — the int[] from InputDevice.getDeviceIds(), four calls after it
+//     was built.
+//
+//  2. Unity's C# side asks for these methods with ERASED spellings, and the
+//     erased call must produce the same tagged object the exact one does.
+//     `AndroidJavaObject.CallStatic<AndroidJavaObject>("getDeviceIds")` spells
+//     the return `Ljava/lang/Object;`; the same call with a null or
+//     object-typed argument erases that end too. All three spellings resolve
+//     to one binding, so all three must come back with the same identity.
+//
+// The subject is the InputDevice family because it is where both defects were
+// found and because it exercises every return shape at once: a primitive
+// array, an object, a string, an int and a boolean.
+int kl_jni_object_lifetime_selftest(FILE *out) {
+    int fails = 0, checks = 0;
+#define OBJ_CHECK(cond, ...) do { \
+        checks++; \
+        if (!(cond)) { fprintf(out, "  FAIL: " __VA_ARGS__); fprintf(out, "\n"); fails++; } \
+    } while (0)
+
+    void *env = kl_jni_env();
+    void *cls = klj_class_object("android/view/InputDevice");
+
+    // ---- 1. the cached int[] outlives the frame it was built in ----
+    void *mid_exact = klj_want(cls, "getDeviceIds", "()[I", 'M');
+    klj_PushLocalFrame(env, 16);
+    klj_val r1 = klj_call_a(env, cls, mid_exact, NULL, 'L');
+    klj_PopLocalFrame(env, NULL);
+    OBJ_CHECK(klj_as_object(r1.l) != NULL,
+              "the int[] from getDeviceIds()[I did not survive the local frame it "
+              "was built in — a host static holding a jobject must go through "
+              "klj_host_cache, or the next caller gets a retired slot");
+
+    // ---- 2. the ERASED return answers with the SAME object ----
+    void *mid_er = klj_want(cls, "getDeviceIds", "()Ljava/lang/Object;", 'M');
+    klj_val r2 = klj_call_a(env, cls, mid_er, NULL, 'L');
+    OBJ_CHECK(klj_as_object(r2.l) != NULL,
+              "getDeviceIds()Ljava/lang/Object; — the erased spelling Unity's C# "
+              "uses — did not return a tagged jobject");
+    OBJ_CHECK(r2.l == r1.l,
+              "the erased and exact spellings of getDeviceIds returned DIFFERENT "
+              "objects; Unity keys its joystick slots on that identity");
+
+    // ...and it is an int[], which is what GetObjectClass has to be able to say:
+    // Unity builds its AndroidJavaObject wrapper out of exactly this answer.
+    if (klj_as_object(r2.l)) {
+        void *k = klj_GetObjectClass(env, r2.l);
+        const char *kn = klj_class_name(k);
+        OBJ_CHECK(strcmp(kn, "[I") == 0,
+                  "GetObjectClass on the int[] said \"%s\", not \"[I\"", kn);
+        OBJ_CHECK(klj_GetArrayLength(env, r2.l) == 2,
+                  "the device-id array is %d long, not 2 (the two Touch controllers)",
+                  (int)klj_GetArrayLength(env, r2.l));
+        int32_t ids[2] = {0, 0};
+        klj_GetIntArrayRegion(env, r2.l, 0, 2, ids);
+        OBJ_CHECK(ids[0] == 8 && ids[1] == 9,
+                  "the device ids read back as [%d, %d], not [8, 9] — the ids are "
+                  "stable on purpose", ids[0], ids[1]);
+    }
+
+    // ---- 3. getDevice(int) through the erased return, across a frame ----
+    void *mid_dev = klj_want(cls, "getDevice", "(I)Ljava/lang/Object;", 'M');
+    klj_jvalue av[2];
+    av[0].i = 8;
+    klj_PushLocalFrame(env, 16);
+    klj_val dev = klj_call_a(env, cls, mid_dev, av, 'L');
+    klj_PopLocalFrame(env, NULL);
+    OBJ_CHECK(klj_as_object(dev.l) != NULL,
+              "getDevice(8) through the erased return did not survive its frame");
+
+    if (klj_as_object(dev.l)) {
+        const char *dn = klj_class_name(klj_GetObjectClass(env, dev.l));
+        OBJ_CHECK(strcmp(dn, "android/view/InputDevice") == 0,
+                  "getDevice(8) answered an object of class \"%s\"", dn);
+
+        // Everything Rewired asks the device afterwards, in the spellings C#
+        // produces: a String return erased to Object, and the primitives, which
+        // cannot be erased and so must still match exactly.
+        void *mid_name = klj_want(cls, "getName", "()Ljava/lang/Object;", 'm');
+        klj_val nm = klj_call_a(env, dev.l, mid_name, NULL, 'L');
+        const char *nms = klj_str(nm.l);
+        OBJ_CHECK(nms && strcmp(nms, "Oculus Touch Controller - Left") == 0,
+                  "getName() erased to Object answered \"%s\"", nms ? nms : "(null)");
+
+        void *mid_desc = klj_want(cls, "getDescriptor", "()Ljava/lang/Object;", 'm');
+        klj_val ds = klj_call_a(env, dev.l, mid_desc, NULL, 'L');
+        const char *dss = klj_str(ds.l);
+        OBJ_CHECK(dss && strcmp(dss, "klepton-touch-l") == 0,
+                  "getDescriptor() erased to Object answered \"%s\"", dss ? dss : "(null)");
+
+        void *mid_pid = klj_want(cls, "getProductId", "()I", 'm');
+        void *mid_vid = klj_want(cls, "getVendorId",  "()I", 'm');
+        void *mid_vrt = klj_want(cls, "isVirtual",    "()Z", 'm');
+        OBJ_CHECK((int32_t)klj_call_a(env, dev.l, mid_pid, NULL, 'I').j == 0,
+                  "getProductId() is not 0 — the Touch controllers are not USB devices");
+        OBJ_CHECK((int32_t)klj_call_a(env, dev.l, mid_vid, NULL, 'I').j == 0,
+                  "getVendorId() is not 0");
+        OBJ_CHECK((klj_call_a(env, dev.l, mid_vrt, NULL, 'Z').j & 1) == 0,
+                  "isVirtual() is true — these are physical controllers");
+
+        // hasKeys, with BOTH ends erased: the argument spelled Ljava/lang/Object;
+        // (an int[] held in an `object`) and the return spelled the same. That is
+        // the one call needing the argument tier and the return tier at once.
+        void *keys = klj_new_array('I', NULL, 3);
+        ((int32_t *)klj_arr(keys)->data)[0] = 96;    // BUTTON_A
+        ((int32_t *)klj_arr(keys)->data)[1] = 97;    // BUTTON_B
+        ((int32_t *)klj_arr(keys)->data)[2] = 99;    // BUTTON_X
+        void *mid_keys = klj_want(cls, "hasKeys",
+                                  "(Ljava/lang/Object;)Ljava/lang/Object;", 'm');
+        av[0].l = keys;
+        klj_val hk = klj_call_a(env, dev.l, mid_keys, av, 'L');
+        OBJ_CHECK(klj_as_object(hk.l) != NULL,
+                  "hasKeys() with the argument AND the return erased to Object did "
+                  "not resolve — the loose tier wants identical arguments and the "
+                  "assignability tier wanted an identical return, and this call "
+                  "needs both relaxations at once");
+        if (klj_as_object(hk.l)) {
+            const char *hn = klj_class_name(klj_GetObjectClass(env, hk.l));
+            OBJ_CHECK(strcmp(hn, "[Z") == 0,
+                      "hasKeys() answered an object of class \"%s\", not \"[Z\"", hn);
+            OBJ_CHECK(klj_GetArrayLength(env, hk.l) == 3,
+                      "hasKeys() answered %d flags for 3 keys — Rewired indexes it "
+                      "positionally", (int)klj_GetArrayLength(env, hk.l));
+            uint8_t flags[3] = {1, 1, 1};
+            klj_GetBooleanArrayRegion(env, hk.l, 0, 3, flags);
+            OBJ_CHECK(!flags[0] && !flags[1] && !flags[2],
+                      "hasKeys() claimed a Touch controller carries an Android "
+                      "keymap; Rewired reads that as a DualShock 4");
+        }
+    }
+
+    // ---- 4. the lookup the guest made with NO signature ----
+    //
+    // Unity's AndroidJNIHelper.GetMethodID has an optional `signature`
+    // parameter, and bHaptics' Unity wrapper omits it for five of its methods.
+    // The id must still come back carrying the REAL signature, or the call it
+    // is used for has no return kind and no argument list.
+    void *bh = klj_class_object("com/bhaptics/bhapticsunity/BhapticsManagerWrapper");
+
+    void *mid_nosig = klj_want(bh, "refreshPairing", "", 'm');
+    OBJ_CHECK(strcmp(((klj_wanted *)mid_nosig)->sig, "()V") == 0,
+              "refreshPairing asked with NO signature was issued with sig \"%s\", "
+              "not \"()V\" — the call would decode no arguments and report return "
+              "kind '?'", ((klj_wanted *)mid_nosig)->sig);
+
+    // ...and it interns to the SAME id as the fully-spelled lookup, so a guest
+    // that asks both ways does not get two entries for one method.
+    OBJ_CHECK(klj_want(bh, "refreshPairing", "()V", 'm') == mid_nosig,
+              "the signed and unsigned spellings of refreshPairing were issued as "
+              "two different jmethodIDs");
+
+    // The call itself: through the 'V' slot, which is the one that warned.
+    klj_call_a(env, bh, mid_nosig, NULL, 'V');
+
+    void *mid_user = klj_want(bh, "isBhapticsUser", "", 'm');
+    OBJ_CHECK(strcmp(((klj_wanted *)mid_user)->sig, "()Z") == 0,
+              "isBhapticsUser asked with NO signature was issued with sig \"%s\"",
+              ((klj_wanted *)mid_user)->sig);
+    OBJ_CHECK((klj_call_a(env, bh, mid_user, NULL, 'Z').j & 1) == 0,
+              "isBhapticsUser() answered true — there is no bHaptics hardware here");
+
+    // An overloaded name is REFUSED rather than guessed: isPlayingByEventId is
+    // declared for both int and String, and marshalling one as the other is how
+    // a name-only lookup turns into a wrong answer instead of a stop.
+    void *mid_amb = klj_want(bh, "isPlayingByEventId", "", 'm');
+    OBJ_CHECK(((klj_wanted *)mid_amb)->sig[0] == 0,
+              "isPlayingByEventId asked with NO signature resolved to \"%s\"; it is "
+              "overloaded and must be refused, not picked by table order",
+              ((klj_wanted *)mid_amb)->sig);
+
+    // A name nothing implements resolves to nothing, and stays empty.
+    void *mid_none = klj_want(bh, "stopInt", "", 'm');
+    OBJ_CHECK(((klj_wanted *)mid_none)->sig[0] == 0,
+              "an unbound name asked with NO signature was given sig \"%s\"",
+              ((klj_wanted *)mid_none)->sig);
+
+    fprintf(out, "  %d checks, %d failed\n", checks, fails);
+#undef OBJ_CHECK
+    return fails == 0;
 }

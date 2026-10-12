@@ -193,6 +193,7 @@ extern const klj_binding klj_bind_electra[];
 extern const klj_binding klj_bind_fmod[];
 extern const klj_binding klj_bind_jkxr[];
 extern const klj_binding klj_bind_services[];
+extern const klj_binding klj_bind_haptics[];
 extern const klj_binding *const klj_binding_tables[];
 
 
